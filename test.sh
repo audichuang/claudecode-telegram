@@ -463,6 +463,33 @@ print('OK')
     fi
 }
 
+test_handle_callback_navigates() {
+    info "Testing callback_query navigation + selection..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+root = Path(tempfile.mkdtemp())
+(root / 'web').mkdir()
+bridge.TOPIC_ROOT = str(root)
+calls = {'edit': 0, 'opened': None}
+bridge.telegram_api = lambda m, p: calls.__setitem__('edit', calls['edit'] + (1 if m=='editMessageReplyMarkup' else 0)) or {'ok': True}
+cr = bridge.command_router
+cr.open_topic_session = lambda chat_id, thread_id, cwd, pending_text=None: calls.__setitem__('opened', (chat_id, thread_id, cwd))
+def upd(data):
+    return {'callback_query': {'data': data, 'id': 'q', 'message': {'message_id': 7, 'chat': {'id': 555}, 'message_thread_id': 4321}}}
+cr.handle_callback(upd('cd:' + str(root / 'web')))
+assert calls['edit'] >= 1, 'cd should edit the keyboard'
+cr.handle_callback(upd('use:' + str(root / 'web')))
+assert calls['opened'] == (555, 4321, str(root / 'web')), calls['opened']
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "callback navigation works"
+    else
+        fail "callback navigation test failed"
+    fi
+}
+
 test_message_splitting() {
     info "Testing message splitting (short, newlines, hard, HTML-aware)..."
     if python3 -c "
@@ -18679,6 +18706,7 @@ run_unit_tests() {
     run_test test_send_text_includes_thread_id
     run_test test_topic_session_identity
     run_test test_folder_navigator_keyboard
+    run_test test_handle_callback_navigates
     run_test test_message_splitting
     run_test test_sandbox_docker_cmd
     # Unit tests - Markdown conversion

@@ -3075,6 +3075,11 @@ def find_topic_session(chat_id, thread_id, registered):
     return None
 
 
+# Pending first message per (chat_id, thread_id), captured when the folder
+# picker is shown and consumed when a folder is selected (Task 5).
+_pending_topic_text = {}
+
+
 def get_manager_chat_id(name: str) -> Optional[int]:
     """Resolve manager chat ID for worker notifications.
 
@@ -6150,6 +6155,47 @@ class CommandRouter:
             lines.append(f"Sandbox: {Path.home()} → /workspace")
 
         self.reply(chat_id, "\n".join(lines))
+
+    def handle_callback(self, update):
+        """Handle a Telegram callback_query from the folder navigator keyboard.
+
+        ``cd:<path>`` edits the message's inline keyboard to browse ``<path>``;
+        ``use:<path>`` records the chosen cwd and opens the topic session.
+        Paths are clamped under TOPIC_ROOT via ``_norm_under_root``. The
+        callback spinner is always cleared via ``answerCallbackQuery``.
+        """
+        cq = update.get("callback_query", {})
+        data = cq.get("data", "") or ""
+        cq_id = cq.get("id")
+        msg = cq.get("message", {}) or {}
+        chat_id = msg.get("chat", {}).get("id")
+        message_id = msg.get("message_id")
+        thread_id = msg.get("message_thread_id")
+
+        try:
+            if data.startswith("cd:"):
+                path = _norm_under_root(data[3:])
+                telegram_api(
+                    "editMessageReplyMarkup",
+                    {
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "reply_markup": {"inline_keyboard": build_folder_keyboard(path)},
+                    },
+                )
+            elif data.startswith("use:"):
+                path = _norm_under_root(data[4:])
+                pending = _pending_topic_text.pop((chat_id, thread_id), None)
+                self.open_topic_session(
+                    chat_id, thread_id, cwd=path, pending_text=pending
+                )
+        finally:
+            # Always clear the spinner on the tapped button.
+            if cq_id is not None:
+                try:
+                    telegram_api("answerCallbackQuery", {"callback_query_id": cq_id})
+                except Exception:
+                    pass
 
     def handle_message(self, update):
         global admin_chat_id
@@ -10391,6 +10437,12 @@ class Handler(BaseHTTPRequestHandler):
             if "message" in update:
                 threading.Thread(
                     target=command_router.handle_message,
+                    args=(update,),
+                    daemon=True,
+                ).start()
+            if "callback_query" in update:
+                threading.Thread(
+                    target=command_router.handle_callback,
                     args=(update,),
                     daemon=True,
                 ).start()
