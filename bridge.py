@@ -2983,6 +2983,61 @@ def get_chat_id_file(name):
     return get_session_dir(name) / "chat_id"
 
 
+# Root directory the folder navigator is confined to (topic-session feature).
+TOPIC_ROOT = os.path.expanduser(os.environ.get("TOPIC_ROOT", "~"))
+
+
+def _norm_under_root(path):
+    """Clamp a path to within TOPIC_ROOT.
+
+    Returns the realpath of ``path`` if it is TOPIC_ROOT or a descendant;
+    otherwise returns TOPIC_ROOT itself (no escaping above the root).
+    """
+    root = os.path.realpath(TOPIC_ROOT)
+    try:
+        real = os.path.realpath(path)
+    except Exception:
+        return root
+    if real == root or real.startswith(root + os.sep):
+        return real
+    return root
+
+
+def build_folder_keyboard(path):
+    """Build a Telegram inline_keyboard for browsing folders under TOPIC_ROOT.
+
+    - One button per immediate subdirectory (callback_data ``cd:<path>``).
+    - An ``⬆️ 上一層`` button (callback_data ``cd:<parent>``) only when ``path``
+      is strictly inside TOPIC_ROOT (i.e. not the root itself).
+    - A ``✅ 用這層`` button (callback_data ``use:<path>``), always present.
+    """
+    here = _norm_under_root(path)
+    root = os.path.realpath(TOPIC_ROOT)
+    rows = []
+
+    subdirs = []
+    try:
+        for entry in os.scandir(here):
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    subdirs.append(entry)
+            except OSError:
+                continue
+    except OSError:
+        subdirs = []
+    subdirs.sort(key=lambda e: e.name)
+
+    for entry in subdirs[:30]:
+        rows.append([{"text": f"📁 {entry.name}", "callback_data": f"cd:{entry.path}"}])
+
+    if here != root:
+        parent = _norm_under_root(os.path.dirname(here))
+        rows.append([{"text": "⬆️ 上一層", "callback_data": f"cd:{parent}"}])
+
+    rows.append([{"text": "✅ 用這層", "callback_data": f"use:{here}"}])
+    return rows
+
+
 def topic_session_name(thread_id):
     """Session name for a forum Topic thread (e.g. 4321 -> 't4321')."""
     return f"t{int(thread_id)}"

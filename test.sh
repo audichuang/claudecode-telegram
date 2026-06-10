@@ -433,6 +433,36 @@ print('OK')
     fi
 }
 
+test_folder_navigator_keyboard() {
+    info "Testing folder navigator keyboard + root confinement..."
+    if python3 -c "
+import tempfile, os, json
+from pathlib import Path
+import bridge
+root = Path(tempfile.mkdtemp())
+(root / 'web').mkdir(); (root / 'api').mkdir(); (root / 'f.txt').write_text('x')
+bridge.TOPIC_ROOT = str(root)
+
+kb = bridge.build_folder_keyboard(str(root))
+flat = [b for row in kb for b in row]
+labels = [b['text'] for b in flat]
+cbs = [b['callback_data'] for b in flat]
+# folders listed (not the file), and a 'use here' button
+assert any('web' in l for l in labels), labels
+assert any('api' in l for l in labels), labels
+assert not any('f.txt' in l for l in labels), labels
+assert any(c.startswith('use:') for c in cbs), cbs
+# at root, no escaping above root via up-button
+ups = [c for c in cbs if c.startswith('cd:') and bridge._norm_under_root(c[3:]) == c[3:]]
+assert bridge._norm_under_root(str(root.parent)) == str(root), 'must clamp to root'
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "folder navigator keyboard works"
+    else
+        fail "folder navigator test failed"
+    fi
+}
+
 test_message_splitting() {
     info "Testing message splitting (short, newlines, hard, HTML-aware)..."
     if python3 -c "
@@ -18648,6 +18678,7 @@ run_unit_tests() {
     run_test test_formatting
     run_test test_send_text_includes_thread_id
     run_test test_topic_session_identity
+    run_test test_folder_navigator_keyboard
     run_test test_message_splitting
     run_test test_sandbox_docker_cmd
     # Unit tests - Markdown conversion
