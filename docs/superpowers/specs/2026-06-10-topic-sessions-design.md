@@ -38,13 +38,20 @@ Telegram 群組 (forum / 話題 enabled), bot = admin
   the same 話題** (via the Stop hook).
 - **Switch sessions:** tap a different 話題 (native Telegram). The bridge does
   nothing special — there is no "current/active" state to manage.
-- **Open a session (default):** create a new 話題 and send the first message in it.
-  The bridge sees an unknown `message_thread_id` → spawns a session bound to it.
+- **Open a session:** create a new 話題 and send the first message in it. The
+  bridge sees an unknown `message_thread_id` and, before spawning, replies with an
+  **inline-keyboard folder navigator** (see below) so you pick the workspace by
+  tapping. Once a folder is chosen, the session is spawned there and the first
+  message is delivered.
 - **Close a session:** `/close` inside the 話題 (or closing/deleting the 話題) →
   bridge ends that session.
-- **Project directory:** a session starts in a default base dir; set/switch with
-  `/cd <path>` in the 話題 (or by saying it in the first message). The 話題 title
-  may be shown for reference but is not required to match a path.
+- **Workspace selection (folder navigator):** instead of typing paths (painful on
+  mobile), the bridge shows folders as **inline-keyboard buttons**: tap a folder to
+  descend, `⬆️ 上一層` to go up, `✅ 用這層` to choose the current directory. Driven
+  by Telegram `callback_query`. Navigation is rooted at a configurable base
+  (default `$HOME`) so the picker starts somewhere sane. `/cd` in a 話題 re-opens
+  the navigator to change a running session's folder (typed `/cd <path>` also
+  accepted as a shortcut).
 
 ### Kept vs removed
 
@@ -64,8 +71,15 @@ Reuse the proven low-level primitives, replace only the routing/identity layer.
 - **Inbound:** Telegram → (existing poll forwarder *or* webhook) → bridge HTTP `POST /`.
   A new **topic router** keys on `message.message_thread_id`:
   - known thread → deliver text to that session's tmux (existing `tmux send-keys`).
-  - unknown thread → create a session for it, then deliver.
+  - unknown thread → show the folder navigator; on selection, create a session for
+    that thread (rooted at the chosen folder), then deliver the pending first message.
   - command (`/close`, `/cd`, `/restart`) → handle for that thread's session.
+- **Folder navigator (new capability):** the bridge must handle Telegram
+  `callback_query` updates (button taps). Each folder button carries a callback
+  payload (target path + the thread it belongs to); the handler lists that path's
+  subdirectories, edits the message's inline keyboard in place, and on `✅ 用這層`
+  records the chosen cwd for the thread and proceeds to spawn. The poll forwarder
+  already forwards full updates, so `callback_query` arrives the same way as messages.
 - **Session:** a tmux session running `claude` (reuse existing creation primitives).
   Internal tmux name is derived from the thread id (e.g. `claude-<node>-t<thread_id>`);
   the user never sees or types it.
@@ -115,12 +129,16 @@ matching the existing `test.sh` style, plus integration where it matters:
 
 | Behavior | Test |
 |---|---|
-| unknown thread → opens a session bound to that thread | unit: feed an update with a new `message_thread_id`, assert a session record is created for it |
+| unknown thread → shows folder navigator (no session yet) | unit: feed an update with a new `message_thread_id`, assert a navigator keyboard is produced and no session is spawned until a folder is chosen |
+| navigator lists subdirectories as buttons | unit: given a temp dir tree, assert the callback handler returns the child folders |
+| navigator stays within the configured root | unit: `⬆️` at the root does not escape it; no path outside root is reachable |
+| selecting a folder spawns the session there + delivers the pending message | unit/integration |
 | known thread → routes to the right session | unit: two threads → two sessions; a message goes only to its thread's session |
 | reply targets the originating 話題 | unit: outbound carries the stored `message_thread_id` |
 | `/close` ends that thread's session and nothing else | unit |
+| `/cd` re-opens the navigator (or accepts a typed path) for a running session | unit |
 | non-forum chat → single default session | unit |
-| end-to-end open → talk → reply in topic | integration |
+| end-to-end open → pick folder → talk → reply in topic | integration |
 
 Regression guard: full `FAST=1` suite green (against the documented pre-existing
 baseline) after each increment.
@@ -135,8 +153,12 @@ connectors, sandbox, watchdog. The legacy bot may keep existing for power use, b
 is out of scope here. No security/auth hardening (trusted single-user). Not an
 upstream contribution.
 
-## Open question for review
+## Resolved decisions
 
-- Open-session trigger defaults to **(a) user creates a 話題 + first message
-  auto-opens**. Alternative **(b)** a `/new` command where the bot creates the 話題
-  via `createForumTopic`. (a) is the current design; switchable at review.
+- **Open-session trigger: (a)** the user creates a 話題 and sends the first message;
+  the bridge then shows the folder navigator and spawns on selection. (Rejected (b)
+  a `/new` bot-creates-topic command — less natural for the owner.)
+- **Workspace selection: inline-keyboard folder navigator** (native buttons, no
+  HTTPS), not a Mini App webview. Rooted at a configurable base (default `$HOME`).
+- **Topic lifecycle = session lifecycle:** new 話題 ⇒ open; close/delete 話題 (or
+  `/close`) ⇒ end the session.
