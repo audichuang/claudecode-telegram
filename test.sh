@@ -441,6 +441,7 @@ from pathlib import Path
 import bridge
 root = Path(tempfile.mkdtemp())
 (root / 'web').mkdir(); (root / 'api').mkdir(); (root / 'f.txt').write_text('x')
+(root / '.hidden').mkdir()
 bridge.TOPIC_ROOT = str(root)
 
 kb = bridge.build_folder_keyboard(str(root))
@@ -451,6 +452,7 @@ cbs = [b['callback_data'] for b in flat]
 assert any('web' in l for l in labels), labels
 assert any('api' in l for l in labels), labels
 assert not any('f.txt' in l for l in labels), labels
+assert not any('.hidden' in l for l in labels), ('hidden dirs must be skipped', labels)
 assert any(c.startswith('use:') for c in cbs), cbs
 # at root, no escaping above root via up-button
 ups = [c for c in cbs if c.startswith('cd:') and bridge._norm_under_root(c[3:]) == c[3:]]

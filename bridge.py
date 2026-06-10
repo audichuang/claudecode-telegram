@@ -3024,7 +3024,9 @@ def build_folder_keyboard(path):
     try:
         for entry in os.scandir(here):
             try:
-                if entry.is_dir(follow_symlinks=False):
+                # Skip hidden (dot) directories so real project folders aren't
+                # crowded out of the button cap by ~/.cache, ~/.config, etc.
+                if entry.is_dir(follow_symlinks=False) and not entry.name.startswith("."):
                     subdirs.append(entry)
             except OSError:
                 continue
