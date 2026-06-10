@@ -551,6 +551,37 @@ print('OK')
     fi
 }
 
+test_topic_close_and_cd() {
+    info "Testing /close and /cd in a topic..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.TOPIC_MODE = True; bridge.TOPIC_ROOT = str(tmp)
+(tmp / 't4321').mkdir(parents=True, exist_ok=True); bridge.save_topic_meta('t4321', 555, 4321)
+bridge.worker_manager.get_registered_sessions = lambda registered=None: {'t4321': {}}
+ended = {}; pickers = {'n': 0}
+bridge.worker_manager.end = lambda name: ended.update({'name': name}) or (True, None)
+cr = bridge.command_router
+cr.reply = lambda chat_id, text, **k: None
+cr.transport = bridge.transport
+cr._send_folder_picker = lambda chat_id, thread_id: pickers.__setitem__('n', pickers['n']+1)
+def msg(tid, text):
+    return {'message': {'text': text, 'chat': {'id': 555}, 'message_id': 1, 'message_thread_id': tid}}
+cr.handle_message(msg(4321, '/close'))
+assert ended.get('name') == 't4321', ended
+cr.handle_message(msg(4321, '/cd'))
+assert pickers['n'] == 1, 'bare /cd should reopen picker'
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/close and /cd work"
+    else
+        fail "/close /cd test failed"
+    fi
+}
+
 test_message_splitting() {
     info "Testing message splitting (short, newlines, hard, HTML-aware)..."
     if python3 -c "
@@ -18770,6 +18801,7 @@ run_unit_tests() {
     run_test test_handle_callback_navigates
     run_test test_open_topic_session_spawns_in_cwd
     run_test test_topic_routing_known_and_unknown
+    run_test test_topic_close_and_cd
     run_test test_message_splitting
     run_test test_sandbox_docker_cmd
     # Unit tests - Markdown conversion

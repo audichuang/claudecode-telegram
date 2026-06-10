@@ -6249,6 +6249,41 @@ class CommandRouter:
             # General (non-thread) message: default-session handling (Task 8).
             return
         registered = self.workers.get_registered_sessions()
+
+        # Parse a leading command token the same way handle_command does:
+        # split on whitespace, lowercase, and strip any @botname suffix so the
+        # command matches EXACTLY (groups send "/cd@mybot /path").
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lower() if parts else ""
+        if "@" in cmd:
+            cmd = cmd.split("@")[0]
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        # /close — end this thread's session.
+        if cmd == "/close":
+            name = find_topic_session(chat_id, thread_id, registered)
+            if name:
+                self.workers.end(name)
+                self.reply(chat_id, f"已關閉這個話題的工作階段（{name}）。")
+            else:
+                self.reply(chat_id, "這個話題還沒有工作階段。")
+            return
+
+        # /cd — change this thread's folder. With a path arg, set the cwd and
+        # restart in place; bare /cd reopens the folder picker.
+        if cmd == "/cd":
+            if arg:
+                name = find_topic_session(chat_id, thread_id, registered)
+                if name:
+                    _set_worker_cwd(name, arg)
+                    self.workers.restart(name)
+                    self.reply(chat_id, f"已切換資料夾並重啟：{arg}")
+                else:
+                    self.open_topic_session(chat_id, thread_id, cwd=arg)
+            else:
+                self._send_folder_picker(chat_id, thread_id)
+            return
+
         name = find_topic_session(chat_id, thread_id, registered)
         if name:
             self.route_message(name, text, chat_id, msg_id)
