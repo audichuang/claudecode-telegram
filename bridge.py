@@ -5754,6 +5754,8 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
     # For teleported workers, skip local file existence check during parsing
     # (files are on the remote host, not local) — validate after fetching
     host = get_worker_host(name)
+    # If this session is bound to a forum Topic, route the reply back into it.
+    _, topic_thread_id = load_topic_meta(name)
     if host:
         _accept_all = lambda p: (True, Path(p))
         clean_text, images = _parse_media_tags(text, "image", _accept_all)
@@ -5801,7 +5803,8 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
 
             result = transport.send_text(
                 chat_id, part, parse_mode="HTML",
-                reply_to=prev_msg_id if prev_msg_id else None
+                reply_to=prev_msg_id if prev_msg_id else None,
+                message_thread_id=topic_thread_id
             )
             if result and result.get("ok"):
                 prev_msg_id = result.get("result", {}).get("message_id")
@@ -5821,7 +5824,8 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
                     plain_text = plain_text.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
                     result = transport.send_text(
                         chat_id, plain_text,
-                        reply_to=prev_msg_id if prev_msg_id else None
+                        reply_to=prev_msg_id if prev_msg_id else None,
+                        message_thread_id=topic_thread_id
                     )
                     if result and result.get("ok"):
                         prev_msg_id = result.get("result", {}).get("message_id")

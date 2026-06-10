@@ -582,6 +582,27 @@ print('OK')
     fi
 }
 
+test_hook_reply_targets_thread() {
+    info "Testing hook reply carries message_thread_id..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+(tmp / 't4321').mkdir(parents=True, exist_ok=True); bridge.save_topic_meta('t4321', 555, 4321)
+sent = {}
+bridge.transport.send_text = lambda chat_id, text, parse_mode=None, reply_to=None, message_thread_id=None: sent.update({'chat': chat_id, 'thread': message_thread_id, 'text': text}) or {'ok': True}
+bridge.send_response_to_telegram('t4321', 'done', 555)
+assert sent.get('thread') == 4321, sent
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "hook reply targets thread"
+    else
+        fail "hook reply thread test failed"
+    fi
+}
+
 test_message_splitting() {
     info "Testing message splitting (short, newlines, hard, HTML-aware)..."
     if python3 -c "
@@ -18802,6 +18823,7 @@ run_unit_tests() {
     run_test test_open_topic_session_spawns_in_cwd
     run_test test_topic_routing_known_and_unknown
     run_test test_topic_close_and_cd
+    run_test test_hook_reply_targets_thread
     run_test test_message_splitting
     run_test test_sandbox_docker_cmd
     # Unit tests - Markdown conversion
