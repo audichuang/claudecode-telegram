@@ -1306,7 +1306,7 @@ class MessageTransport:
     def name(self) -> str:
         raise NotImplementedError
 
-    def send_text(self, chat_id, text, parse_mode=None, reply_to=None) -> dict | None:
+    def send_text(self, chat_id, text, parse_mode=None, reply_to=None, message_thread_id=None) -> dict | None:
         raise NotImplementedError
 
     def send_photo(self, chat_id, photo_path, caption=None) -> bool:
@@ -1409,19 +1409,21 @@ class TelegramAPI:
 class TelegramTransport(MessageTransport):
     """Transport that sends messages via Telegram Bot API."""
 
-    def __init__(self, token: str):
+    def __init__(self, token: str = ""):
         self._api = TelegramAPI(token)
 
     @property
     def name(self) -> str:
         return "telegram"
 
-    def send_text(self, chat_id, text, parse_mode=None, reply_to=None) -> dict | None:
+    def send_text(self, chat_id, text, parse_mode=None, reply_to=None, message_thread_id=None) -> dict | None:
         payload = {"chat_id": chat_id, "text": text}
         if parse_mode:
             payload["parse_mode"] = parse_mode
         if reply_to:
             payload["reply_to_message_id"] = reply_to
+        if message_thread_id is not None:
+            payload["message_thread_id"] = message_thread_id
         # Use module-level telegram_api so tests can mock bridge.telegram_api
         return telegram_api("sendMessage", payload)
 
@@ -1722,7 +1724,7 @@ class LocalTransport(MessageTransport):
             with open(self._log_file, "a") as f:
                 f.write(msg + "\n")
 
-    def send_text(self, chat_id, text, parse_mode=None, reply_to=None) -> dict | None:
+    def send_text(self, chat_id, text, parse_mode=None, reply_to=None, message_thread_id=None) -> dict | None:
         self._log("send_text", chat_id, text=text[:200], parse_mode=parse_mode)
         return {"ok": True, "result": {"message_id": 1}}
 
@@ -5980,7 +5982,7 @@ class _LegacyTransportAdapter(MessageTransport):
     def name(self) -> str:
         return "legacy-adapter"
 
-    def send_text(self, chat_id, text, parse_mode=None, reply_to=None) -> dict | None:
+    def send_text(self, chat_id, text, parse_mode=None, reply_to=None, message_thread_id=None) -> dict | None:
         result = self._legacy.send_message(chat_id, text)
         return result if result else {"ok": True, "result": {"message_id": 1}}
 

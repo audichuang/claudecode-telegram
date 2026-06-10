@@ -33,7 +33,7 @@ Full FAST suite (regression guard — run with `TMUX_PREFIX=claude-test-` set, e
 Let outbound messages target a forum Topic. No behavior change when thread id is None.
 
 **Files:**
-- Modify: `bridge.py` — `MessageTransport.send_text` / `send_message` and `TelegramTransport.send_text` to accept `message_thread_id=None` and include it in the `sendMessage` payload when set.
+- Modify: `bridge.py` — `MessageTransport.send_text` / `send_message` and `TelegramTransport.send_text` to accept `message_thread_id=None` and include it in the `sendMessage` payload when set; give `TelegramTransport.__init__` a `token: str = ""` default (backward-compatible) so the test can construct it argument-free.
 - Test: `test.sh` — add `test_send_text_includes_thread_id`.
 
 - [ ] **Step 1: Write the failing test**
@@ -70,7 +70,7 @@ Register `run_test test_send_text_includes_thread_id` in `run_unit_tests`.
 
 - [ ] **Step 2: Run → FAIL** (`send_text` has no `message_thread_id` param → TypeError → no OK).
 
-- [ ] **Step 3: Implement.** Add `message_thread_id=None` to the `send_text` signatures (base `MessageTransport.send_text`, `TelegramTransport.send_text`) and to `send_message`. In `TelegramTransport.send_text`, after building `payload = {"chat_id": chat_id, "text": text}`, add `if message_thread_id is not None: payload["message_thread_id"] = message_thread_id` before `telegram_api("sendMessage", payload)`. Keep `reply_to`/`parse_mode` handling unchanged. (Other transports may accept and ignore the kwarg.)
+- [ ] **Step 3: Implement.** Add `message_thread_id=None` to the `send_text` signatures (base `MessageTransport.send_text`, `TelegramTransport.send_text`) and to `send_message`. In `TelegramTransport.send_text`, after building `payload = {"chat_id": chat_id, "text": text}`, add `if message_thread_id is not None: payload["message_thread_id"] = message_thread_id` before `telegram_api("sendMessage", payload)`. Keep `reply_to`/`parse_mode` handling unchanged. (Other transports may accept and ignore the kwarg.) Also give `TelegramTransport.__init__` a `token: str = ""` default so the Step 1 test can construct `bridge.TelegramTransport()` with no argument; this stays backward compatible with the positional caller `TelegramTransport(BOT_TOKEN)`.
 
 - [ ] **Step 4: Run → PASS**, then full FAST suite (baseline only).
 

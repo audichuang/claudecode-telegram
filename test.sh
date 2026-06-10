@@ -379,6 +379,33 @@ print('OK')
     fi
 }
 
+test_send_text_includes_thread_id() {
+    info "Testing send path passes message_thread_id..."
+    if python3 -c "
+import bridge
+captured = {}
+def fake_api(method, payload):
+    captured['method'] = method
+    captured['payload'] = dict(payload)
+    return {'ok': True, 'result': {'message_id': 1}}
+bridge.telegram_api = fake_api
+t = bridge.TelegramTransport()
+t.send_text(12345, 'hi', message_thread_id=99)
+assert captured['method'] == 'sendMessage', captured
+assert captured['payload'].get('chat_id') == 12345
+assert captured['payload'].get('message_thread_id') == 99, captured['payload']
+# absent when not given
+captured.clear()
+t.send_text(12345, 'hi')
+assert 'message_thread_id' not in captured['payload'], captured['payload']
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "send_text passes message_thread_id"
+    else
+        fail "send_text thread_id test failed"
+    fi
+}
+
 test_message_splitting() {
     info "Testing message splitting (short, newlines, hard, HTML-aware)..."
     if python3 -c "
@@ -18592,6 +18619,7 @@ run_unit_tests() {
     # Unit tests (no bridge needed)
     log "── Unit Tests ──────────────────────────────────────────────────────────"
     run_test test_formatting
+    run_test test_send_text_includes_thread_id
     run_test test_message_splitting
     run_test test_sandbox_docker_cmd
     # Unit tests - Markdown conversion
