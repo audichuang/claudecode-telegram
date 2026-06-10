@@ -6493,6 +6493,41 @@ print('OK')
     fi
 }
 
+test_restart_clears_pending() {
+    info "Testing restart clears pending for interactive worker..."
+
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp
+bridge.worker_manager.sessions_dir = tmp
+bridge.worker_manager.tmux_prefix = 'claude-test-'
+bridge.worker_manager.get_registered_sessions = lambda registered=None: {
+    'alice': {'tmux': 'claude-test-alice', 'backend': 'claude'}
+}
+bridge.get_worker_host = lambda name: None
+# Force the dead-worker path and stub it, so restart() returns right after the
+# (hoisted) clear_pending without doing real tmux work.
+bridge.tmux_exists = lambda *a, **k: False
+bridge.worker_manager._restart_dead_worker = lambda *a, **k: (True, None)
+
+bridge.set_pending('alice', 12345)
+assert bridge.get_pending_file('alice').exists(), 'pending should exist before restart'
+
+ok, err = bridge.worker_manager.restart('alice')
+assert not bridge.get_pending_file('alice').exists(), 'pending must be cleared by restart'
+
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "restart clears pending"
+    else
+        fail "restart clears pending test failed"
+    fi
+}
+
 test_end_clears_session_id_for_interactive() {
     info "Testing /end clears session id + cwd for interactive workers..."
 
@@ -18566,6 +18601,7 @@ run_unit_tests() {
     run_test test_pause_kills_adapter
     run_test test_end_kills_adapter
     run_test test_end_clears_pending
+    run_test test_restart_clears_pending
     run_test test_end_clears_session_id_for_interactive
     run_test test_focus_helpers
     run_test test_get_registered_sessions_no_autopick

@@ -5212,6 +5212,10 @@ class WorkerManager:
         backend = get_backend(backend_name)
         tmux_name = session.get("tmux", f"{self.tmux_prefix}{name}")
 
+        # A restart abandons any in-flight request, so always release pending
+        # (covers live-session, dead-worker, resume, relaunch and clean modes).
+        clear_pending(name)
+
         if not tmux_exists(tmux_name):
             # Dead worker recovery: re-create tmux session if worker is in registry
             return self._restart_dead_worker(name, backend_name, backend, tmux_name, mode)
@@ -5242,7 +5246,6 @@ class WorkerManager:
         if not backend.is_interactive:
             session_dir.mkdir(parents=True, exist_ok=True)
             ensure_worker_pipe(name)
-            clear_pending(name)
         elif is_claude_running(tmux_name):
             # Kill running claude first, then restart (resume keeps session ID, relaunch clears it)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, "C-c", ""])
