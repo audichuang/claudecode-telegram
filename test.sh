@@ -406,6 +406,33 @@ print('OK')
     fi
 }
 
+test_topic_session_identity() {
+    info "Testing topic-session identity helpers..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp
+bridge.worker_manager.sessions_dir = tmp
+
+name = bridge.topic_session_name(4321)
+assert name == 't4321', name
+sd = tmp / name; sd.mkdir(parents=True, exist_ok=True)
+bridge.save_topic_meta(name, 555, 4321)
+cid, tid = bridge.load_topic_meta(name)
+assert cid == 555 and tid == 4321, (cid, tid)
+# find by (chat_id, thread_id)
+assert bridge.find_topic_session(555, 4321, {name: {}}) == name
+assert bridge.find_topic_session(555, 9999, {name: {}}) is None
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "topic-session identity works"
+    else
+        fail "topic-session identity test failed"
+    fi
+}
+
 test_message_splitting() {
     info "Testing message splitting (short, newlines, hard, HTML-aware)..."
     if python3 -c "
@@ -18620,6 +18647,7 @@ run_unit_tests() {
     log "── Unit Tests ──────────────────────────────────────────────────────────"
     run_test test_formatting
     run_test test_send_text_includes_thread_id
+    run_test test_topic_session_identity
     run_test test_message_splitting
     run_test test_sandbox_docker_cmd
     # Unit tests - Markdown conversion

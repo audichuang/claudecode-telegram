@@ -2983,6 +2983,43 @@ def get_chat_id_file(name):
     return get_session_dir(name) / "chat_id"
 
 
+def topic_session_name(thread_id):
+    """Session name for a forum Topic thread (e.g. 4321 -> 't4321')."""
+    return f"t{int(thread_id)}"
+
+
+def save_topic_meta(name, chat_id, thread_id):
+    """Persist (chat_id, message_thread_id) for a topic session (0600 files)."""
+    sd = get_session_dir(name)
+    sd.mkdir(parents=True, exist_ok=True)
+    cf = sd / "chat_id"
+    cf.write_text(str(int(chat_id)))
+    cf.chmod(0o600)
+    tf = sd / "message_thread_id"
+    tf.write_text(str(int(thread_id)))
+    tf.chmod(0o600)
+
+
+def load_topic_meta(name):
+    """Read back (chat_id, message_thread_id) ints, or (None, None) if absent."""
+    sd = get_session_dir(name)
+    try:
+        cid = int((sd / "chat_id").read_text().strip())
+        tid = int((sd / "message_thread_id").read_text().strip())
+        return cid, tid
+    except Exception:
+        return None, None
+
+
+def find_topic_session(chat_id, thread_id, registered):
+    """Return the registered session name whose stored (chat_id, thread_id) matches."""
+    for name in registered:
+        cid, tid = load_topic_meta(name)
+        if cid == int(chat_id) and tid == int(thread_id):
+            return name
+    return None
+
+
 def get_manager_chat_id(name: str) -> Optional[int]:
     """Resolve manager chat ID for worker notifications.
 
