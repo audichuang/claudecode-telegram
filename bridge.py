@@ -5786,6 +5786,19 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
         threading.Thread(target=_tts_and_send, daemon=True).start()
 
 
+def deliver_hook_response(session_name, text, chat_id, log_prefix="Response"):
+    """Send a worker's response to Telegram and ALWAYS release the worker.
+
+    pending + hook-event are cleared in `finally`, so a failed Telegram send
+    never leaves the worker stuck 'pending' until the watchdog timeout.
+    """
+    try:
+        send_response_to_telegram(session_name, text, int(chat_id), log_prefix=log_prefix)
+    finally:
+        clear_pending(session_name)
+        mark_hook_event(session_name)
+
+
 def handle_grpc_worker_response(name: str, text: str, payload: bytes = b""):
     """Route a gRPC worker response through the same Telegram path as hooks."""
     try:
@@ -10391,12 +10404,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-            # Send response using shared helper
-            send_response_to_telegram(session_name, text, int(chat_id), log_prefix="Response")
-
-            # Clear pending
-            clear_pending(session_name)
-            mark_hook_event(session_name)
+            # Send response and always release pending (even if the send raises).
+            deliver_hook_response(session_name, text, int(chat_id), log_prefix="Response")
 
             self.send_response(200)
             self.end_headers()

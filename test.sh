@@ -6493,6 +6493,41 @@ print('OK')
     fi
 }
 
+test_hook_response_clears_pending_on_send_failure() {
+    info "Testing hook response clears pending even when Telegram send fails..."
+
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp
+bridge.worker_manager.sessions_dir = tmp
+
+def boom(*a, **k):
+    raise RuntimeError('telegram down')
+bridge.send_response_to_telegram = boom
+bridge.mark_hook_event = lambda n: None
+
+bridge.set_pending('alice', 999)
+assert bridge.get_pending_file('alice').exists(), 'pending should exist before delivery'
+
+try:
+    bridge.deliver_hook_response('alice', 'hi', 123)
+except RuntimeError:
+    pass  # send failure is expected to propagate
+
+assert not bridge.get_pending_file('alice').exists(), 'pending must be cleared even when send fails'
+
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "hook response clears pending on send failure"
+    else
+        fail "hook response pending-on-failure test failed"
+    fi
+}
+
 test_restart_clears_pending() {
     info "Testing restart clears pending for interactive worker..."
 
@@ -18601,6 +18636,7 @@ run_unit_tests() {
     run_test test_pause_kills_adapter
     run_test test_end_kills_adapter
     run_test test_end_clears_pending
+    run_test test_hook_response_clears_pending_on_send_failure
     run_test test_restart_clears_pending
     run_test test_end_clears_session_id_for_interactive
     run_test test_focus_helpers
