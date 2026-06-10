@@ -340,6 +340,36 @@ This prevents other users on multi-user systems from reading chat IDs or session
 
 ## Changelog
 
+### Topic Sessions (TOPIC_MODE) — forum threads as sessions
+
+**What:** When enabled, each Telegram forum **Topic (話題)** maps to its own
+Claude session. Sending into a thread routes to that thread's worker; opening a
+new thread shows a root-confined folder picker to choose the session's cwd.
+Hook replies are delivered back into the originating thread. `/quota` reports
+subscriber rate-limit usage; `/close` ends the thread's session; `/cd` changes
+its folder (with a path arg) or reopens the picker (bare).
+
+**Non-forum fallback:** A plain DM with no `message_thread_id` maps to one fixed
+default session named `tmain` (stored as thread `0`), using the same open/route
+logic keyed by chat only. This lets the feature work in a regular DM chat, not
+just forum groups.
+
+**Setup:**
+
+1. **Enable the mode.** Set `TOPIC_MODE=1` in the node's environment. It is
+   **default OFF**; legacy single-chat behavior is unchanged when unset.
+2. **Confine the folder picker (optional).** Set `TOPIC_ROOT` to the directory
+   the picker is rooted at (default `~`). The navigator cannot escape above this
+   root — `cd:`/`use:` paths are clamped via `_norm_under_root`.
+3. **Forum group + bot admin.** Convert the Telegram group to a **forum**
+   (Topics enabled) and make the bot an **admin** so it can read
+   `message_thread_id` and post into specific threads. Each Topic then drives an
+   independent session.
+4. **`/quota` data (optional).** Point claude-hud's `externalUsageWritePath` at
+   the bridge's `CC_USAGE_FILE` (default `~/.claude/cc-usage.json`) so `/quota`
+   can render the 5h / 7d subscriber usage bars. Stale snapshots (>10 min) and a
+   missing file both fall back to an "unavailable" message.
+
 ### v0.30.1 - Caller-aware `/workers?from=<name>` for cross-machine sends
 
 **Problem:** `/workers` returned a bridge-POV `send_example` (e.g., `tmux paste-buffer ...`) that fails when the caller lives on a different machine than the bridge. Example: kai (Mac Mini) queried `/workers` for mon (VPS/bridge), got a bare tmux command, tried to run it locally, and hit "session not found" — because mon's tmux lives on VPS, not Mac Mini.

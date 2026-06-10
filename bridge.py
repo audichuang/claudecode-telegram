@@ -3044,7 +3044,13 @@ def build_folder_keyboard(path):
 
 
 def topic_session_name(thread_id):
-    """Session name for a forum Topic thread (e.g. 4321 -> 't4321')."""
+    """Session name for a forum Topic thread (e.g. 4321 -> 't4321').
+
+    Thread ``0`` is the non-forum fallback: a plain DM (no message_thread_id)
+    maps to one fixed default session named ``tmain``.
+    """
+    if int(thread_id) == 0:
+        return "tmain"
     return f"t{int(thread_id)}"
 
 
@@ -6284,6 +6290,11 @@ class CommandRouter:
         chat_id = msg.get("chat", {}).get("id")
         message_id = msg.get("message_id")
         thread_id = msg.get("message_thread_id")
+        if thread_id is None:
+            # Symmetric to _handle_topic_message: a non-forum DM carries no
+            # message_thread_id, so normalize to the default thread (0 -> 'tmain')
+            # so the pending-text key and open_topic_session line up.
+            thread_id = 0
 
         try:
             if data.startswith("cd:"):
@@ -6347,15 +6358,17 @@ class CommandRouter:
     def _handle_topic_message(self, msg, text, chat_id, msg_id):
         """Route an inbound message by forum thread (話題) when TOPIC_MODE is on.
 
-        - No thread (general chat) → handled by the default-session path (Task 8).
+        - No thread (plain DM / general chat) → fixed default session (thread 0,
+          named ``tmain``), using the same open/route logic keyed by chat only.
         - Known thread → deliver to its bound session.
         - Unknown thread → stash the text and show the folder picker so the user
           can open a new session there.
         """
         thread_id = msg.get("message_thread_id")
         if thread_id is None:
-            # General (non-thread) message: default-session handling (Task 8).
-            return
+            # Non-forum fallback: a plain DM with no message_thread_id maps to
+            # one default session keyed by chat only (thread 0 -> 'tmain').
+            thread_id = 0
         registered = self.workers.get_registered_sessions()
 
         # Parse a leading command token the same way handle_command does:

@@ -582,6 +582,30 @@ print('OK')
     fi
 }
 
+test_topic_non_forum_fallback() {
+    info "Testing non-forum (no thread) → single default session..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.TOPIC_MODE = True; bridge.TOPIC_ROOT = str(tmp)
+(tmp / 'tmain').mkdir(parents=True, exist_ok=True); bridge.save_topic_meta('tmain', 555, 0)
+bridge.worker_manager.get_registered_sessions = lambda registered=None: {'tmain': {}}
+routed = {}
+cr = bridge.command_router
+cr.route_message = lambda name, text, chat_id, msg_id, one_off=False: routed.update({'name': name, 'text': text})
+cr.handle_message({'message': {'text': 'hi', 'chat': {'id': 555}, 'message_id': 1}})  # no message_thread_id
+assert routed.get('name') == 'tmain', routed
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "non-forum fallback works"
+    else
+        fail "non-forum fallback test failed"
+    fi
+}
+
 test_hook_reply_targets_thread() {
     info "Testing hook reply carries message_thread_id..."
     if python3 -c "
@@ -18848,6 +18872,7 @@ run_unit_tests() {
     run_test test_open_topic_session_spawns_in_cwd
     run_test test_topic_routing_known_and_unknown
     run_test test_topic_close_and_cd
+    run_test test_topic_non_forum_fallback
     run_test test_hook_reply_targets_thread
     run_test test_quota_render
     run_test test_message_splitting
