@@ -608,6 +608,40 @@ print('OK')
     fi
 }
 
+test_topic_title_naming() {
+    info "Testing topic title becomes the session name (with t<id> fallback)..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.TOPIC_MODE = True
+bridge._topic_titles.clear()
+
+# sanitize: ascii -> slug; pure-unicode -> empty (so we fall back)
+assert bridge._sanitize_topic_name('TEST') == 'test', bridge._sanitize_topic_name('TEST')
+assert bridge._sanitize_topic_name('My Proj 2') == 'my-proj-2', bridge._sanitize_topic_name('My Proj 2')
+assert bridge._sanitize_topic_name('我的專案') == '', repr(bridge._sanitize_topic_name('我的專案'))
+
+# a forum_topic_created service message captures the title for that thread
+bridge.worker_manager.get_registered_sessions = lambda registered=None: {}
+cr = bridge.command_router
+cr.handle_message({'message': {'chat': {'id': 555}, 'message_id': 7, 'message_thread_id': 7, 'forum_topic_created': {'name': 'TEST'}}})
+assert bridge._topic_titles.get((555, 7)) == 'TEST', bridge._topic_titles
+
+# resolve: captured title -> slug; name taken or no title -> t<id> fallback
+assert bridge.resolve_topic_session_name(555, 7, {}) == 'test'
+assert bridge.resolve_topic_session_name(555, 7, {'test': {}}) == 't7'
+assert bridge.resolve_topic_session_name(555, 99, {}) == 't99'
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "topic title naming works"
+    else
+        fail "topic title naming test failed"
+    fi
+}
+
 test_hook_reply_targets_thread() {
     info "Testing hook reply carries message_thread_id..."
     if python3 -c "
@@ -18875,6 +18909,7 @@ run_unit_tests() {
     run_test test_topic_routing_known_and_unknown
     run_test test_topic_close_and_cd
     run_test test_topic_non_forum_fallback
+    run_test test_topic_title_naming
     run_test test_hook_reply_targets_thread
     run_test test_quota_render
     run_test test_message_splitting

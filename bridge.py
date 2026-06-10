@@ -3056,6 +3056,27 @@ def topic_session_name(thread_id):
     return f"t{int(thread_id)}"
 
 
+# 話題 titles captured from `forum_topic_created` events, keyed by
+# (chat_id, message_thread_id), so a session can be named after its Topic.
+_topic_titles = {}
+
+
+def _sanitize_topic_name(title):
+    """Slugify a 話題 title into a tmux/dir-safe worker name, or '' when nothing
+    usable remains (e.g. a CJK-only title) so the caller falls back to t<id>."""
+    return re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+
+
+def resolve_topic_session_name(chat_id, thread_id, registered):
+    """Worker name for a topic: the slugified 話題 title when usable and not
+    already taken, else the stable ``t<thread_id>`` (or ``tmain``) fallback."""
+    fallback = topic_session_name(thread_id)
+    slug = _sanitize_topic_name(_topic_titles.get((int(chat_id), int(thread_id)), ""))
+    if slug and slug != "tmain" and slug not in (registered or {}):
+        return slug
+    return fallback
+
+
 def save_topic_meta(name, chat_id, thread_id):
     """Persist (chat_id, message_thread_id) for a topic session (0600 files)."""
     sd = get_session_dir(name)
@@ -6333,7 +6354,9 @@ class CommandRouter:
         forwards ``pending_text`` (the message captured when the picker was
         shown) to it.
         """
-        name = topic_session_name(thread_id)
+        name = resolve_topic_session_name(
+            chat_id, thread_id, self.workers.get_registered_sessions()
+        )
         # Set startup cwd before launch so the worker starts in the chosen folder.
         _set_worker_cwd(name, cwd)
         create_session(name, chat_id=chat_id)
@@ -6371,6 +6394,15 @@ class CommandRouter:
             # Non-forum fallback: a plain DM with no message_thread_id maps to
             # one default session keyed by chat only (thread 0 -> 'tmain').
             thread_id = 0
+
+        # A forum_topic_created service message carries the 話題 title; capture
+        # it (keyed by the topic's thread id) so the session is named after it.
+        created = msg.get("forum_topic_created")
+        if created:
+            tid = msg.get("message_thread_id") or msg.get("message_id") or thread_id
+            _topic_titles[(int(chat_id), int(tid))] = created.get("name", "")
+            return
+
         registered = self.workers.get_registered_sessions()
 
         # Parse a leading command token the same way handle_command does:
