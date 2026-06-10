@@ -519,6 +519,38 @@ print('OK')
     fi
 }
 
+test_topic_routing_known_and_unknown() {
+    info "Testing TOPIC_MODE inbound routing..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.TOPIC_MODE = True; bridge.TOPIC_ROOT = str(tmp)
+# known thread t4321 already registered + bound
+(tmp / 't4321').mkdir(parents=True, exist_ok=True)
+bridge.save_topic_meta('t4321', 555, 4321)
+bridge.worker_manager.get_registered_sessions = lambda registered=None: {'t4321': {}}
+routed = {}; pickers = {'n': 0}
+cr = bridge.command_router
+cr.route_message = lambda name, text, chat_id, msg_id, one_off=False: routed.update({'name': name, 'text': text})
+cr._send_folder_picker = lambda chat_id, thread_id: pickers.__setitem__('n', pickers['n']+1)
+def msg(tid, text):
+    return {'message': {'text': text, 'chat': {'id': 555}, 'message_id': 1, 'message_thread_id': tid}}
+cr.handle_message(msg(4321, 'do it'))
+assert routed == {'name': 't4321', 'text': 'do it'}, routed
+cr.handle_message(msg(8888, 'new one'))
+assert pickers['n'] == 1, 'unknown thread should show picker'
+assert bridge._pending_topic_text.get((555, 8888)) == 'new one', bridge._pending_topic_text
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "topic routing works"
+    else
+        fail "topic routing test failed"
+    fi
+}
+
 test_message_splitting() {
     info "Testing message splitting (short, newlines, hard, HTML-aware)..."
     if python3 -c "
@@ -18737,6 +18769,7 @@ run_unit_tests() {
     run_test test_folder_navigator_keyboard
     run_test test_handle_callback_navigates
     run_test test_open_topic_session_spawns_in_cwd
+    run_test test_topic_routing_known_and_unknown
     run_test test_message_splitting
     run_test test_sandbox_docker_cmd
     # Unit tests - Markdown conversion

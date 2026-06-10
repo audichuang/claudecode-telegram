@@ -2986,6 +2986,11 @@ def get_chat_id_file(name):
 # Root directory the folder navigator is confined to (topic-session feature).
 TOPIC_ROOT = os.path.expanduser(os.environ.get("TOPIC_ROOT", "~"))
 
+# Topic-session routing mode. When on, inbound messages are routed by forum
+# thread (話題) instead of the legacy @mention/focus model. Default OFF so
+# legacy behavior is fully preserved.
+TOPIC_MODE = os.environ.get("TOPIC_MODE", "0") == "1"
+
 
 def _norm_under_root(path):
     """Clamp a path to within TOPIC_ROOT.
@@ -6215,6 +6220,42 @@ class CommandRouter:
         if pending_text:
             self.route_message(name, pending_text, chat_id, None)
 
+    def _send_folder_picker(self, chat_id, thread_id):
+        """Show the root-confined folder navigator in a 話題 thread.
+
+        Sends an inline keyboard rooted at TOPIC_ROOT into ``thread_id`` so the
+        user can pick the cwd for a new topic session.
+        """
+        telegram_api(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": "選擇這個話題要在哪個資料夾開工：",
+                "message_thread_id": thread_id,
+                "reply_markup": {"inline_keyboard": build_folder_keyboard(TOPIC_ROOT)},
+            },
+        )
+
+    def _handle_topic_message(self, msg, text, chat_id, msg_id):
+        """Route an inbound message by forum thread (話題) when TOPIC_MODE is on.
+
+        - No thread (general chat) → handled by the default-session path (Task 8).
+        - Known thread → deliver to its bound session.
+        - Unknown thread → stash the text and show the folder picker so the user
+          can open a new session there.
+        """
+        thread_id = msg.get("message_thread_id")
+        if thread_id is None:
+            # General (non-thread) message: default-session handling (Task 8).
+            return
+        registered = self.workers.get_registered_sessions()
+        name = find_topic_session(chat_id, thread_id, registered)
+        if name:
+            self.route_message(name, text, chat_id, msg_id)
+        else:
+            _pending_topic_text[(chat_id, thread_id)] = text
+            self._send_folder_picker(chat_id, thread_id)
+
     def handle_message(self, update):
         global admin_chat_id
 
@@ -6222,6 +6263,9 @@ class CommandRouter:
         text = msg.get("text", "") or msg.get("caption", "")
         chat_id = msg.get("chat", {}).get("id")
         msg_id = msg.get("message_id")
+
+        if TOPIC_MODE and chat_id:
+            return self._handle_topic_message(msg, text, chat_id, msg_id)
 
         photo = msg.get("photo")
         document = msg.get("document")
