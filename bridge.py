@@ -5150,16 +5150,24 @@ class WorkerManager:
         backend = get_backend(backend_name)
         tmux_name = session.get("tmux", f"{self.tmux_prefix}{name}")
 
-        # Clean non-interactive metadata (backend file, session IDs, pending)
+        # Clear conversation state for ALL backends so re-hiring a name starts fresh.
+        session_dir = self.sessions_dir / name
+        try:
+            for session_id_file in session_dir.glob("*_session_id"):
+                session_id_file.unlink()
+            cwd_file = session_dir / "claude_session_cwd"
+            if cwd_file.exists():
+                cwd_file.unlink()
+        except Exception as e:
+            return False, f"Failed to clean session state: {e}"
+
+        # Clean non-interactive-only metadata (adapter + backend file).
         if not backend.is_interactive:
             kill_adapter(name)
-            session_dir = self.sessions_dir / name
             backend_file = session_dir / "backend"
             try:
                 if backend_file.exists():
                     backend_file.unlink()
-                for session_id_file in session_dir.glob("*_session_id"):
-                    session_id_file.unlink()
             except Exception as e:
                 return False, f"Failed to clean non-interactive metadata: {e}"
 

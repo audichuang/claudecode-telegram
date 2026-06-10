@@ -6493,6 +6493,43 @@ print('OK')
     fi
 }
 
+test_end_clears_session_id_for_interactive() {
+    info "Testing /end clears session id + cwd for interactive workers..."
+
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp
+bridge.FILE_INBOX_ROOT = tmp / 'inbox'
+bridge.WORKER_PIPE_ROOT = tmp / 'pipes'
+bridge.worker_manager.sessions_dir = tmp
+bridge.worker_manager.tmux_prefix = 'claude-test-'
+bridge.worker_manager.get_registered_sessions = lambda registered=None: {
+    'alice': {'tmux': 'claude-test-alice', 'backend': 'claude'}
+}
+
+session_dir = tmp / 'alice'
+session_dir.mkdir()
+(session_dir / 'claude_session_id').write_text('old-session-123')
+(session_dir / 'claude_session_cwd').write_text('/some/old/dir')
+
+bridge.state['active'] = 'alice'
+ok, err = bridge.worker_manager.end('alice')
+assert ok is True, f'end failed: {err}'
+assert not (session_dir / 'claude_session_id').exists(), 'session id must be cleared on /end'
+assert not (session_dir / 'claude_session_cwd').exists(), 'session cwd must be cleared on /end'
+
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/end clears session id + cwd for interactive workers"
+    else
+        fail "/end session-id-clear test failed"
+    fi
+}
+
 
 test_focus_helpers() {
     info "Testing set_focus/clear_focus/reconcile_startup_focus..."
@@ -18529,6 +18566,7 @@ run_unit_tests() {
     run_test test_pause_kills_adapter
     run_test test_end_kills_adapter
     run_test test_end_clears_pending
+    run_test test_end_clears_session_id_for_interactive
     run_test test_focus_helpers
     run_test test_get_registered_sessions_no_autopick
     run_test test_end_focused_worker_clears_focus
