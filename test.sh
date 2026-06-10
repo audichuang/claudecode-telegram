@@ -490,6 +490,35 @@ print('OK')
     fi
 }
 
+test_open_topic_session_spawns_in_cwd() {
+    info "Testing open_topic_session spawns + binds + delivers..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+tmp = Path(tempfile.mkdtemp()); cwd = tmp / 'proj'; cwd.mkdir()
+bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+created = {}
+bridge.create_session = lambda name, **k: created.update({'name': name, 'kw': k}) or (True, None)
+routed = {}
+cr = bridge.command_router
+cr.route_message = lambda name, text, chat_id, msg_id, one_off=False: routed.update({'name': name, 'text': text})
+bridge._set_worker_cwd = lambda name, c: created.update({'cwd': c})
+(tmp / 't4321').mkdir(parents=True, exist_ok=True)
+cr.open_topic_session(555, 4321, str(cwd), pending_text='hello')
+assert created.get('name') == 't4321', created
+assert created.get('cwd') == str(cwd), created
+assert routed.get('text') == 'hello', routed
+cid, tid = bridge.load_topic_meta('t4321')
+assert cid == 555 and tid == 4321, (cid, tid)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "open_topic_session works"
+    else
+        fail "open_topic_session test failed"
+    fi
+}
+
 test_message_splitting() {
     info "Testing message splitting (short, newlines, hard, HTML-aware)..."
     if python3 -c "
@@ -18707,6 +18736,7 @@ run_unit_tests() {
     run_test test_topic_session_identity
     run_test test_folder_navigator_keyboard
     run_test test_handle_callback_navigates
+    run_test test_open_topic_session_spawns_in_cwd
     run_test test_message_splitting
     run_test test_sandbox_docker_cmd
     # Unit tests - Markdown conversion

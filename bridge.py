@@ -6197,6 +6197,24 @@ class CommandRouter:
                 except Exception:
                     pass
 
+    def open_topic_session(self, chat_id, thread_id, cwd, pending_text=None):
+        """Spawn the session for a forum Topic thread in ``cwd`` and deliver
+        the pending first message.
+
+        Names the worker ``topic_session_name(thread_id)`` (e.g. ``t4321``),
+        sets its startup cwd before launch (reusing the ``/checkin`` cwd path),
+        creates it, persists the ``(chat_id, message_thread_id)`` binding, and
+        forwards ``pending_text`` (the message captured when the picker was
+        shown) to it.
+        """
+        name = topic_session_name(thread_id)
+        # Set startup cwd before launch so the worker starts in the chosen folder.
+        _set_worker_cwd(name, cwd)
+        create_session(name, chat_id=chat_id)
+        save_topic_meta(name, chat_id, thread_id)
+        if pending_text:
+            self.route_message(name, pending_text, chat_id, None)
+
     def handle_message(self, update):
         global admin_chat_id
 
