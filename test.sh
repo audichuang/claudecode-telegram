@@ -6494,6 +6494,40 @@ print('OK')
 }
 
 
+test_focus_helpers() {
+    info "Testing set_focus/clear_focus/reconcile_startup_focus..."
+
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+
+bridge.LAST_ACTIVE_FILE = Path(tempfile.mkdtemp()) / 'last_active'
+bridge.NODE_DIR = bridge.LAST_ACTIVE_FILE.parent
+
+# set_focus sets state and persists
+bridge.set_focus('alice')
+assert bridge.state['active'] == 'alice', 'set_focus did not set active'
+assert bridge.LAST_ACTIVE_FILE.read_text() == 'alice', 'set_focus did not persist'
+
+# clear_focus clears, never auto-picks
+bridge.clear_focus()
+assert bridge.state['active'] is None, 'clear_focus did not clear active'
+
+# reconcile_startup_focus: restore only if still registered
+assert bridge.reconcile_startup_focus('bob', {'bob': {}}) == 'bob'
+assert bridge.reconcile_startup_focus('gone', {'bob': {}}) is None
+assert bridge.reconcile_startup_focus(None, {'bob': {}}) is None
+
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "focus helpers work"
+    else
+        fail "focus helpers test failed"
+    fi
+}
+
+
 test_adapter_stderr_logging() {
     info "Testing adapter stderr is logged to per-worker adapter.log..."
 
@@ -18429,6 +18463,7 @@ run_unit_tests() {
     run_test test_pause_kills_adapter
     run_test test_end_kills_adapter
     run_test test_end_clears_pending
+    run_test test_focus_helpers
     run_test test_adapter_stderr_logging
     run_test test_poisoned_detection
     run_test test_poisoned_hook_signal_file

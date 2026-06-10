@@ -1142,6 +1142,24 @@ def load_last_active():
     return None
 
 
+def set_focus(name):
+    """Set the active (focused) worker and persist it for restart."""
+    state["active"] = name
+    save_last_active(name)
+
+
+def clear_focus():
+    """Clear focus. Never auto-picks a replacement worker."""
+    state["active"] = None
+
+
+def reconcile_startup_focus(last_active, registered):
+    """Focus to restore on startup: last_active only if it still exists, else None."""
+    if last_active and last_active in registered:
+        return last_active
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistent Worker Registry
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5114,8 +5132,7 @@ class WorkerManager:
         else:
             self.send(name, welcome)
 
-        state["active"] = name
-        save_last_active(name)
+        set_focus(name)
         _registry_add(name, backend, chat_id)
 
         if not backend_obj.is_interactive:
@@ -5873,8 +5890,7 @@ def switch_session(name):
     if name not in registered:
         return False, f"Worker '{name}' not found"
 
-    state["active"] = name
-    save_last_active(name)
+    set_focus(name)
     return True, None
 
 
@@ -6244,8 +6260,7 @@ class CommandRouter:
                     _last_mention["target"] = target
                     _last_mention["count"] = 1
                 if _last_mention["count"] >= 2 and state["active"] != target:
-                    state["active"] = target
-                    save_last_active(target)
+                    set_focus(target)
                     self.reply(chat_id, f"Switched to {target} (you mentioned them twice).")
             else:
                 # Multi-mention resets streak
@@ -6357,8 +6372,7 @@ class CommandRouter:
         registered = self.workers.get_registered_sessions()
         if worker_name in registered:
             prev_focus = state["active"]
-            state["active"] = worker_name
-            save_last_active(worker_name)
+            set_focus(worker_name)
             if not arg:
                 self.reply(chat_id, f"Now talking to {worker_name.capitalize()}.")
                 return True
@@ -6873,8 +6887,7 @@ class CommandRouter:
                 registered = self.workers.get_registered_sessions()
                 if len(registered) == 1:
                     name = next(iter(registered))
-                    state["active"] = name
-                    save_last_active(name)
+                    set_focus(name)
                 else:
                     self.reply(chat_id, "No one assigned.")
                     return True
@@ -6892,8 +6905,7 @@ class CommandRouter:
             return True
 
         if name_arg:
-            state["active"] = name
-            save_last_active(name)
+            set_focus(name)
 
         # Guard: skip restart if worker is already running (unless --force)
         host = get_worker_host(name)
