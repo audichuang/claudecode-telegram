@@ -162,3 +162,52 @@ upstream contribution.
   HTTPS), not a Mini App webview. Rooted at a configurable base (default `$HOME`).
 - **Topic lifecycle = session lifecycle:** new 話題 ⇒ open; close/delete 話題 (or
   `/close`) ⇒ end the session.
+
+## Add-on feature: usage/quota display (`/quota`)
+
+Show the same usage the Claude Code statusline shows: the **5-hour** window, the
+**7-day/weekly** window (used % + reset time), and **session context** usage.
+
+**Data source (verified, not guessed).** This data is NOT available from any
+Anthropic API — its only source is the JSON Claude Code pipes to the statusline
+command (`rate_limits.five_hour/seven_day`, `context_window`). The owner already
+runs **claude-hud** (0.1.0) as their statusline, which has a built-in machine-
+readable export.
+
+**Integration (zero-clobber).** Do NOT touch `~/.claude/settings.json` statusLine.
+Instead merge ONE key into the existing `display` block of
+`~/.claude/plugins/claude-hud/config.json`:
+`"externalUsageWritePath": "/home/<user>/.claude/cc-usage.json"`. claude-hud then
+atomically writes (mode 0600, ≥30s throttle) a snapshot:
+```json
+{ "updated_at": "<ISO8601>",
+  "five_hour": { "used_percentage": <int 0-100>, "resets_at": "<ISO8601>" },
+  "seven_day": { "used_percentage": <int 0-100>, "resets_at": "<ISO8601>" } }
+```
+The bot reads that file. `used_percentage` is percent **used** (remaining = 100−x).
+
+**Context usage** is not in that file (it lives only in live stdin). Treat it as
+**best-effort**: read claude-hud's internal
+`context-cache/<sha256(realpath(transcript_path))>.json`
+(`used_percentage`, `current_usage.{input,output,cache_creation,cache_read}_input_tokens`,
+`context_window_size`) opportunistically, or omit it. (A self-owned statusline
+forwarder that chains into claude-hud could capture context-% reliably, but that
+risks the single-`statusLine`-slot clobber, so it is out of scope unless needed.)
+
+**Account caveat.** `rate_limits` is populated only for Claude.ai **Pro/Max**
+accounts (and is null until the first model response). API-key accounts get no
+5h/7d data → the snapshot file is not written. The bot must fall back to a clear
+message ("usage unavailable — no subscriber rate-limit data reported") rather than
+showing 0%.
+
+**`/quota` output** (compact, one line per window with a 10-char bar, remaining =
+100−used, relative reset): `5h`, `7d`, and (if available) `ctx`. Null window →
+`n/a`.
+
+**Tests:** parse the snapshot (ISO timestamps + integer %), staleness via
+`updated_at`, missing-file/null-window fallback message, bar rendering, and the
+remaining = 100−used conversion.
+
+**Precondition:** verify the installed claude-hud version supports
+`externalUsageWritePath` (0.1.0 does). Enabling the key is the one config change
+this feature makes; everything else is read-only.
