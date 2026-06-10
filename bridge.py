@@ -4855,8 +4855,6 @@ class WorkerManager:
 
         if state["active"] and state["active"] not in registered:
             state["active"] = None
-        if registered and not state["active"]:
-            state["active"] = list(registered.keys())[0]
 
         return registered
 
@@ -5178,8 +5176,7 @@ class WorkerManager:
         _registry_remove(name)
 
         if state["active"] == name:
-            state["active"] = None
-            self.get_registered_sessions()
+            clear_focus()
 
         return True, None
 
@@ -11322,13 +11319,13 @@ def main():
             if tmux_exists(tmux_name, host=host):
                 export_hook_env(tmux_name, backend_name, host=host)
 
-    # Load last active worker from file (if still exists)
+    # Restore focus only to a still-existing worker; otherwise leave it cleared.
     last_active = load_last_active()
-    if last_active and last_active in registered:
-        state["active"] = last_active
-        print(f"Restored last active worker: {last_active}")
+    state["active"] = reconcile_startup_focus(last_active, registered)
+    if state["active"]:
+        print(f"Restored last active worker: {state['active']}")
     elif last_active:
-        print(f"Last active worker '{last_active}' no longer exists")
+        print(f"Last active worker '{last_active}' no longer exists; no focus set")
 
     # Log team dir and checkin note status
     if os.path.isdir(TEAM_DIR):

@@ -6527,6 +6527,72 @@ print('OK')
     fi
 }
 
+test_get_registered_sessions_no_autopick() {
+    info "Testing get_registered_sessions does not auto-pick focus..."
+
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp
+bridge.worker_manager.sessions_dir = tmp
+bridge.worker_manager.tmux_prefix = 'claude-test-'
+bridge.worker_manager.scan_tmux_sessions = lambda: {'bob': {'tmux': 'claude-test-bob', 'backend': 'claude'}}
+bridge._registry_bootstrap = lambda reg: None
+bridge._load_registry = lambda: {'workers': {}}
+
+bridge.state['active'] = None
+reg = bridge.worker_manager.get_registered_sessions()
+assert 'bob' in reg, 'bob should be registered'
+assert bridge.state['active'] is None, 'focus must stay None, not be auto-picked'
+
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "get_registered_sessions does not auto-pick"
+    else
+        fail "get_registered_sessions auto-pick test failed"
+    fi
+}
+
+test_end_focused_worker_clears_focus() {
+    info "Testing /end of focused worker clears focus (no silent re-focus)..."
+
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp
+bridge.FILE_INBOX_ROOT = tmp / 'inbox'
+bridge.WORKER_PIPE_ROOT = tmp / 'pipes'
+bridge.worker_manager.sessions_dir = tmp
+bridge.worker_manager.tmux_prefix = 'claude-test-'
+# Use the REAL get_registered_sessions so the pre-fix auto-pick path can fire on
+# /end (mocking it would hide the B1 bug and the test could never go RED). Stub
+# only the scan + registry layers so no real tmux/registry is needed.
+bridge.worker_manager.scan_tmux_sessions = lambda: {
+    'alice': {'tmux': 'claude-test-alice', 'backend': 'claude'},
+    'bob': {'tmux': 'claude-test-bob', 'backend': 'claude'},
+}
+bridge._registry_bootstrap = lambda reg: None
+bridge._load_registry = lambda: {'workers': {}}
+
+bridge.state['active'] = 'alice'
+ok, err = bridge.worker_manager.end('alice')
+assert ok is True, f'end failed: {err}'
+assert bridge.state['active'] is None, f'focus should be None, got {bridge.state[\"active\"]!r}'
+
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/end of focused worker clears focus"
+    else
+        fail "/end focus-clear test failed"
+    fi
+}
+
 
 test_adapter_stderr_logging() {
     info "Testing adapter stderr is logged to per-worker adapter.log..."
@@ -18464,6 +18530,8 @@ run_unit_tests() {
     run_test test_end_kills_adapter
     run_test test_end_clears_pending
     run_test test_focus_helpers
+    run_test test_get_registered_sessions_no_autopick
+    run_test test_end_focused_worker_clears_focus
     run_test test_adapter_stderr_logging
     run_test test_poisoned_detection
     run_test test_poisoned_hook_signal_file
