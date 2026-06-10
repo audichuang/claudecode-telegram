@@ -3085,6 +3085,110 @@ def find_topic_session(chat_id, thread_id, registered):
 _pending_topic_text = {}
 
 
+# External usage snapshot written by claude-hud (subscriber rate-limit data).
+USAGE_FILE = os.path.expanduser(os.environ.get("CC_USAGE_FILE", "~/.claude/cc-usage.json"))
+
+
+def read_usage_snapshot():
+    """Read claude-hud's external usage snapshot.
+
+    Returns the parsed dict, or None if the file is missing/unreadable or its
+    ``updated_at`` timestamp is older than ~10 minutes (stale → None).
+    """
+    try:
+        with open(USAGE_FILE) as f:
+            snap = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(snap, dict):
+        return None
+    updated_at = snap.get("updated_at")
+    if updated_at:
+        try:
+            from datetime import datetime, timezone
+            ts = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+            if age > 600:
+                return None
+        except Exception:
+            return None
+    return snap
+
+
+def _quota_bar(pct):
+    """Render a 10-char usage bar for an integer percent (0-100)."""
+    try:
+        p = max(0, min(100, int(pct)))
+    except Exception:
+        return "n/a"
+    filled = round(p / 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
+def _quota_reset_label(resets_at):
+    """Relative reset label (e.g. ``重置 in 2h`` ), best-effort; never raises."""
+    if not resets_at:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        ts = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        delta = (ts - datetime.now(timezone.utc)).total_seconds()
+        if delta <= 0:
+            return "重置 soon"
+        if delta < 3600:
+            return f"重置 in {int(delta // 60)}m"
+        if delta < 86400:
+            return f"重置 in {int(delta // 3600)}h"
+        return f"重置 in {int(delta // 86400)}d"
+    except Exception:
+        return ""
+
+
+def _quota_window_line(label, window):
+    """Render one window line: ``<label> <bar> <remaining>% (used <used>%) <reset>``.
+
+    A null/absent ``used_percentage`` renders as ``n/a``.
+    """
+    window = window or {}
+    used = window.get("used_percentage")
+    if used is None:
+        return f"{label} n/a"
+    bar = _quota_bar(used)
+    try:
+        remaining = 100 - int(used)
+    except Exception:
+        remaining = "n/a"
+    reset = _quota_reset_label(window.get("resets_at"))
+    line = f"{label} {bar} {used}% used, {remaining}% left"
+    if reset:
+        line += f" · {reset}"
+    return line
+
+
+def format_quota(snap):
+    """Render the usage snapshot for /quota.
+
+    None → clear unavailable fallback. Otherwise render 5h / 7d windows
+    (null window → ``n/a``) plus best-effort context. Does not depend on the
+    wall clock for the percent/label values it asserts on.
+    """
+    if not snap:
+        return "usage unavailable — no subscriber rate-limit data"
+    lines = ["📊 用量"]
+    lines.append(_quota_window_line("5h", snap.get("five_hour")))
+    lines.append(_quota_window_line("7d", snap.get("seven_day")))
+    ctx = snap.get("context")
+    if isinstance(ctx, dict):
+        cused = ctx.get("used_percentage")
+        if cused is not None:
+            lines.append(f"context {_quota_bar(cused)} {cused}% used")
+    return "\n".join(lines)
+
+
 def get_manager_chat_id(name: str) -> Optional[int]:
     """Resolve manager chat ID for worker notifications.
 
@@ -6263,6 +6367,11 @@ class CommandRouter:
             cmd = cmd.split("@")[0]
         arg = parts[1].strip() if len(parts) > 1 else ""
 
+        # /quota — show subscriber usage; works with or without a thread session.
+        if cmd == "/quota":
+            self.reply(chat_id, format_quota(read_usage_snapshot()))
+            return
+
         # /close — end this thread's session.
         if cmd == "/close":
             name = find_topic_session(chat_id, thread_id, registered)
@@ -6626,6 +6735,8 @@ class CommandRouter:
             return self.cmd_teleport(arg, chat_id, check_only=True)
         elif cmd == "/teleback":
             return self.cmd_teleback(arg, chat_id)
+        elif cmd == "/quota":
+            return self.cmd_quota(chat_id)
         elif cmd in BLOCKED_COMMANDS:
             self.reply(chat_id, f"{cmd} is interactive and not supported here.", outcome="Needs decision")
             return True
@@ -6644,6 +6755,11 @@ class CommandRouter:
             return True
 
         return False
+
+    def cmd_quota(self, chat_id):
+        """Show subscriber usage (5h/7d) from claude-hud's external snapshot."""
+        self.reply(chat_id, format_quota(read_usage_snapshot()))
+        return True
 
     def cmd_hire(self, name, chat_id):
         if not name:

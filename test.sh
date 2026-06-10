@@ -603,6 +603,31 @@ print('OK')
     fi
 }
 
+test_quota_render() {
+    info "Testing /quota rendering + fallback..."
+    if python3 -c "
+import bridge
+snap = {'updated_at': '2026-06-10T12:00:00+00:00',
+        'five_hour': {'used_percentage': 31, 'resets_at': '2026-06-10T14:00:00+00:00'},
+        'seven_day': {'used_percentage': 82, 'resets_at': '2026-06-12T00:00:00+00:00'}}
+out = bridge.format_quota(snap)
+assert '5h' in out and '31%' in out, out
+assert '7d' in out and '82%' in out, out
+# fallback when no data
+none_out = bridge.format_quota(None)
+assert 'unavailable' in none_out.lower() or '無' in none_out, none_out
+# null window
+half = {'updated_at': '2026-06-10T12:00:00+00:00', 'five_hour': {'used_percentage': None, 'resets_at': None}, 'seven_day': {'used_percentage': 50, 'resets_at': '2026-06-12T00:00:00+00:00'}}
+ho = bridge.format_quota(half)
+assert 'n/a' in ho.lower() and '50%' in ho, ho
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/quota render works"
+    else
+        fail "/quota render test failed"
+    fi
+}
+
 test_message_splitting() {
     info "Testing message splitting (short, newlines, hard, HTML-aware)..."
     if python3 -c "
@@ -18824,6 +18849,7 @@ run_unit_tests() {
     run_test test_topic_routing_known_and_unknown
     run_test test_topic_close_and_cd
     run_test test_hook_reply_targets_thread
+    run_test test_quota_render
     run_test test_message_splitting
     run_test test_sandbox_docker_cmd
     # Unit tests - Markdown conversion
