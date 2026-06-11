@@ -5451,7 +5451,10 @@ class WorkerManager:
             # Echo welcome to tmux (visible for debugging) but don't call backend
             # to avoid triggering a codex API call on hire
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, f"echo '{welcome[:200]}...'", "Enter"])
-        else:
+        elif not TOPIC_MODE:
+            # In TOPIC_MODE the welcome is delivered folded into the topic's first
+            # message by open_topic_session (one turn -> one reply), so skip the
+            # standalone greeting here to avoid a duplicate "你好" reply.
             self.send(name, welcome)
 
         set_focus(name)
@@ -6547,8 +6550,13 @@ class CommandRouter:
         save_topic_meta(name, chat_id, thread_id)
         # Session is bound now — stop treating typed replies as folder-pick attempts.
         _awaiting_folder.discard((chat_id, thread_id))
-        if pending_text:
-            self.route_message(name, pending_text, chat_id, None)
+        # hire() skips the standalone welcome in TOPIC_MODE; deliver it here folded
+        # into the first message so the worker replies ONCE (not a greeting to the
+        # welcome plus a reply to the first message). route_message keeps the
+        # typing/request tracking.
+        welcome = self.workers._build_welcome(name, get_backend(DEFAULT_BACKEND))
+        first = f"{welcome}\n\n{pending_text}" if pending_text else welcome
+        self.route_message(name, first, chat_id, None)
 
     def _send_folder_picker(self, chat_id, thread_id):
         """Show the root-confined folder navigator in a 話題 thread.

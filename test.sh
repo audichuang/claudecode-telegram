@@ -521,7 +521,9 @@ bridge._set_worker_cwd = lambda name, c: created.update({'cwd': c})
 cr.open_topic_session(555, 4321, str(cwd), pending_text='hello')
 assert created.get('name') == 't4321', created
 assert created.get('cwd') == str(cwd), created
-assert routed.get('text') == 'hello', routed
+# The first message now folds the welcome in (single reply), so assert the
+# pending text is delivered within it rather than equality.
+assert 'hello' in routed.get('text', ''), routed
 cid, tid = bridge.load_topic_meta('t4321')
 assert cid == 555 and tid == 4321, (cid, tid)
 print('OK')
@@ -1062,6 +1064,34 @@ print('OK')
         success "topic welcome drops multi-worker framing"
     else
         fail "topic welcome test failed"
+    fi
+}
+
+test_topic_welcome_folded_into_first_message() {
+    info "Testing open_topic_session sends ONE combined welcome+first-message (no double greeting)..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge.resolve_topic_session_name = lambda c, t, r: 'tZ'
+bridge._set_worker_cwd = lambda n, c: None
+bridge.create_session = lambda name, chat_id=None: None
+bridge.save_topic_meta = lambda n, c, t: None
+cr.workers.get_registered_sessions = lambda registered=None: {}
+cr.workers._build_welcome = lambda n, b: 'WELCOME-TEXT'
+routed = []
+cr.route_message = lambda name, text, chat_id, msg_id: routed.append(text)
+cr.open_topic_session(555, 4321, '/tmp', 'do the thing')
+assert len(routed) == 1, ('expected one combined send, got:', routed)
+assert 'WELCOME-TEXT' in routed[0] and 'do the thing' in routed[0], routed
+routed.clear()
+cr.open_topic_session(555, 4322, '/tmp', None)
+assert routed == ['WELCOME-TEXT'], routed
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "welcome folded into first message (single reply)"
+    else
+        fail "topic welcome-fold test failed"
     fi
 }
 
@@ -19382,6 +19412,7 @@ run_unit_tests() {
     run_test test_topic_global_command_delegated
     run_test test_topic_command_menu_is_slim
     run_test test_topic_welcome_drops_multiworker_framing
+    run_test test_topic_welcome_folded_into_first_message
     run_test test_topic_typing_targets_thread
     run_test test_hook_reply_targets_thread
     run_test test_quota_render
