@@ -642,6 +642,193 @@ print('OK')
     fi
 }
 
+test_topic_reaction_mapping() {
+    info "Testing worker-state → reaction emoji mapping + stalled predicate..."
+    if python3 -c "
+import bridge
+# working states → ✍ (the 'it's actively thinking/running' signal)
+for s in ('BUSY_THINKING', 'BUSY_TOOL', 'UNTRACKED_BUSY'):
+    assert bridge.topic_reaction_for_state(s) == bridge.TOPIC_REACTION_WORKING, s
+# just received, no clear activity yet → 👀
+assert bridge.topic_reaction_for_state('WAITING') == bridge.TOPIC_REACTION_RECEIVED
+# not making progress → 😴
+for s in ('STUCK', 'POISONED', 'DEAD', 'OFFLINE', 'EXITED'):
+    assert bridge.topic_reaction_for_state(s) == bridge.TOPIC_REACTION_STALLED, s
+# idle/ready and unknown → don't override (None)
+assert bridge.topic_reaction_for_state('READY') is None
+assert bridge.topic_reaction_for_state('WAITING_INPUT') is None
+# stalled predicate (drives typing stop): true only for non-progress states
+assert bridge.topic_request_stalled('STUCK') is True
+assert bridge.topic_request_stalled('DEAD') is True
+assert bridge.topic_request_stalled('BUSY_THINKING') is False
+assert bridge.topic_request_stalled('WAITING') is False
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "reaction mapping + stalled predicate work"
+    else
+        fail "reaction mapping test failed"
+    fi
+}
+
+test_topic_reaction_updates() {
+    info "Testing _update_topic_reaction sets emoji per state + dedups..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+bridge._topic_request_msg.clear(); bridge._topic_reaction_set.clear()
+calls = []
+bridge.transport.set_reaction = lambda chat_id, msg_id, reaction: calls.append((chat_id, msg_id, reaction[0]['emoji']))
+
+# no tracked request → no-op
+bridge._update_topic_reaction('t7', 'BUSY_THINKING')
+assert calls == [], calls
+
+# track an in-flight request, then drive states
+bridge._topic_request_msg['t7'] = (555, 7)
+bridge._update_topic_reaction('t7', 'BUSY_THINKING')
+assert calls == [(555, 7, bridge.TOPIC_REACTION_WORKING)], calls
+# same state again → deduped (no extra API call)
+bridge._update_topic_reaction('t7', 'BUSY_TOOL')
+assert len(calls) == 1, calls
+# transition to stalled → 😴
+bridge._update_topic_reaction('t7', 'STUCK')
+assert calls[-1] == (555, 7, bridge.TOPIC_REACTION_STALLED), calls
+# READY → None → leaves reaction as-is (no call)
+bridge._update_topic_reaction('t7', 'READY')
+assert len(calls) == 2, calls
+
+# TOPIC_MODE off → never reacts
+bridge.TOPIC_MODE = False
+bridge._update_topic_reaction('t7', 'BUSY_THINKING')
+assert len(calls) == 2, calls
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "reaction updates + dedup work"
+    else
+        fail "reaction update test failed"
+    fi
+}
+
+test_topic_reaction_done_on_delivery() {
+    info "Testing delivery sets 👍 on the request message and clears tracking..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+bridge._topic_request_msg.clear(); bridge._topic_reaction_set.clear()
+bridge._topic_request_msg['t7'] = (555, 7)
+bridge._topic_reaction_set['t7'] = bridge.TOPIC_REACTION_WORKING
+calls = []
+bridge.transport.set_reaction = lambda chat_id, msg_id, reaction: calls.append((chat_id, msg_id, reaction[0]['emoji']))
+# don't actually hit Telegram for the text body
+bridge.send_response_to_telegram = lambda *a, **k: None
+bridge.deliver_hook_response('t7', 'all done', 555)
+assert calls == [(555, 7, bridge.TOPIC_REACTION_DONE)], calls
+# tracking cleared so late watchdog ticks won't clobber the 👍
+assert 't7' not in bridge._topic_request_msg, bridge._topic_request_msg
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "done reaction on delivery works"
+    else
+        fail "done reaction test failed"
+    fi
+}
+
+test_topic_typing_stops_when_stalled() {
+    info "Testing typing indicator keeps the feel but stops when stalled..."
+    if python3 -c "
+import bridge
+bridge.time.sleep = lambda *a, **k: None  # no real waiting in test
+
+# Happy path: pending + a working state → keeps typing (the one-on-one feel).
+# is_pending flips True→False so the loop runs exactly one tick then exits.
+bridge._worker_states['t7'] = ('BUSY_THINKING', '', 0)
+seq = [True, False]
+bridge.is_pending = lambda name: seq.pop(0) if seq else False
+typed = []
+bridge.transport.send_chat_action = lambda chat_id, action, message_thread_id=None: typed.append(action)
+bridge.send_typing_loop(555, 't7')
+assert typed == ['typing'], typed
+
+# Stalled: pending stays True but worker is STUCK → break immediately, 0 typing.
+# is_pending returns True a few times as a safety net (no hang if break broke).
+bridge._worker_states['t7'] = ('STUCK', '', 0)
+calls = {'n': 0}
+def fake_pending(name):
+    calls['n'] += 1
+    return calls['n'] <= 5
+bridge.is_pending = fake_pending
+typed2 = []
+bridge.transport.send_chat_action = lambda chat_id, action, message_thread_id=None: typed2.append(action)
+bridge.send_typing_loop(555, 't7')
+assert typed2 == [], typed2
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "typing stops when stalled, keeps going when working"
+    else
+        fail "typing stall test failed"
+    fi
+}
+
+test_topic_route_tracks_request() {
+    info "Testing route_message tracks the in-flight request message (TOPIC_MODE)..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp
+bridge.TOPIC_MODE = True
+bridge._topic_request_msg.clear(); bridge._topic_reaction_set.clear()
+bridge.is_pending = lambda name: False          # typing thread exits at once
+bridge.worker_set_pending = lambda name, chat_id: None
+bridge.get_worker_backend = lambda name, session: 'claude'
+bridge.tmux_prompt_empty = lambda tmux, host=None: True
+bridge.get_worker_host = lambda name: None
+cr = bridge.command_router
+cr.workers.get_registered_sessions = lambda registered=None: {'t7': {'tmux': 'claude-test-t7'}}
+cr.workers.is_online = lambda name, session=None: True
+cr.workers.send = lambda name, text, chat_id, session: True
+reacts = []
+cr.transport.set_reaction = lambda chat_id, msg_id, reaction: reacts.append((chat_id, msg_id, reaction[0]['emoji']))
+cr.route_message('t7', 'hello', 555, 99)
+assert bridge._topic_request_msg.get('t7') == (555, 99), bridge._topic_request_msg
+assert bridge._topic_reaction_set.get('t7') == bridge.TOPIC_REACTION_RECEIVED, bridge._topic_reaction_set
+assert reacts == [(555, 99, bridge.TOPIC_REACTION_RECEIVED)], reacts
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "route_message tracks in-flight request"
+    else
+        fail "route tracking test failed"
+    fi
+}
+
+test_topic_typing_targets_thread() {
+    info "Testing typing indicator is sent into the topic thread, not General..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.TOPIC_MODE = True
+(tmp / 't7').mkdir(parents=True, exist_ok=True)
+bridge.save_topic_meta('t7', 555, 4321)
+bridge.time.sleep = lambda *a, **k: None
+bridge._worker_states.pop('t7', None)
+seq = [True, False]
+bridge.is_pending = lambda name: seq.pop(0) if seq else False
+rec = []
+bridge.transport.send_chat_action = lambda chat_id, action, message_thread_id=None: rec.append((chat_id, action, message_thread_id))
+bridge.send_typing_loop(555, 't7')
+assert rec == [(555, 'typing', 4321)], rec
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "typing targets the topic thread"
+    else
+        fail "typing thread-target test failed"
+    fi
+}
+
 test_hook_reply_targets_thread() {
     info "Testing hook reply carries message_thread_id..."
     if python3 -c "
@@ -18910,6 +19097,12 @@ run_unit_tests() {
     run_test test_topic_close_and_cd
     run_test test_topic_non_forum_fallback
     run_test test_topic_title_naming
+    run_test test_topic_reaction_mapping
+    run_test test_topic_reaction_updates
+    run_test test_topic_reaction_done_on_delivery
+    run_test test_topic_typing_stops_when_stalled
+    run_test test_topic_route_tracks_request
+    run_test test_topic_typing_targets_thread
     run_test test_hook_reply_targets_thread
     run_test test_quota_render
     run_test test_message_splitting

@@ -1330,7 +1330,7 @@ class MessageTransport:
     def send_sticker(self, chat_id, sticker_path) -> bool:
         raise NotImplementedError
 
-    def send_chat_action(self, chat_id, action) -> None:
+    def send_chat_action(self, chat_id, action, message_thread_id=None) -> None:
         raise NotImplementedError
 
     def set_reaction(self, chat_id, message_id, reaction) -> None:
@@ -1402,8 +1402,11 @@ class TelegramAPI:
         payload = {"chat_id": chat_id, "message_id": message_id, "reaction": reaction}
         return self.api("setMessageReaction", payload)
 
-    def send_chat_action(self, chat_id: int, action: str):
-        return self.api("sendChatAction", {"chat_id": chat_id, "action": action})
+    def send_chat_action(self, chat_id: int, action: str, message_thread_id=None):
+        payload = {"chat_id": chat_id, "action": action}
+        if message_thread_id is not None:
+            payload["message_thread_id"] = message_thread_id
+        return self.api("sendChatAction", payload)
 
 
 class TelegramTransport(MessageTransport):
@@ -1634,8 +1637,11 @@ class TelegramTransport(MessageTransport):
             return False
         return self._send_media_multipart(chat_id, sticker_path, "sticker", "sendSticker")
 
-    def send_chat_action(self, chat_id, action) -> None:
-        telegram_api("sendChatAction", {"chat_id": chat_id, "action": action})
+    def send_chat_action(self, chat_id, action, message_thread_id=None) -> None:
+        payload = {"chat_id": chat_id, "action": action}
+        if message_thread_id is not None:
+            payload["message_thread_id"] = message_thread_id
+        telegram_api("sendChatAction", payload)
 
     def set_reaction(self, chat_id, message_id, reaction) -> None:
         telegram_api("setMessageReaction", {"chat_id": chat_id, "message_id": message_id, "reaction": reaction})
@@ -1756,8 +1762,8 @@ class LocalTransport(MessageTransport):
         self._log("send_sticker", chat_id, path=sticker_path)
         return True
 
-    def send_chat_action(self, chat_id, action) -> None:
-        self._log("send_chat_action", chat_id, action=action)
+    def send_chat_action(self, chat_id, action, message_thread_id=None) -> None:
+        self._log("send_chat_action", chat_id, action=action, message_thread_id=message_thread_id)
 
     def set_reaction(self, chat_id, message_id, reaction) -> None:
         self._log("set_reaction", chat_id, message_id=message_id)
@@ -4161,6 +4167,9 @@ def watchdog_loop():
 
                 since = _record_worker_state(name, state, reason, now)
                 _handle_watchdog_transition(name, state, reason, since, now=now)
+                # Surface live state to the topic user as an evolving reaction
+                # (✍ working / 😴 stalled) on their in-flight message.
+                _update_topic_reaction(name, state)
 
             with _watchdog_lock:
                 for name in list(_worker_states.keys()):
@@ -6038,6 +6047,26 @@ def deliver_hook_response(session_name, text, chat_id, log_prefix="Response"):
     finally:
         clear_pending(session_name)
         mark_hook_event(session_name)
+        _mark_topic_request_done(session_name)
+
+
+def _mark_topic_request_done(name):
+    """Stamp the in-flight request message as done (👍) and stop tracking it.
+
+    Clearing the tracking is what prevents a later watchdog tick from clobbering
+    the 👍 with a stale state emoji.
+    """
+    if not TOPIC_MODE:
+        return
+    rec = _topic_request_msg.pop(name, None)
+    _topic_reaction_set.pop(name, None)
+    if not rec:
+        return
+    chat_id, msg_id = rec
+    try:
+        transport.set_reaction(chat_id, msg_id, [{"type": "emoji", "emoji": TOPIC_REACTION_DONE}])
+    except Exception as e:
+        print(f"[topic] done set_reaction failed for {name}: {e}")
 
 
 def handle_grpc_worker_response(name: str, text: str, payload: bytes = b""):
@@ -6163,13 +6192,90 @@ def switch_session(name):
 # ============================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Typing indicator
+# Typing indicator + per-request liveness reaction (TOPIC_MODE)
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# The typing indicator alone is a lie: it is driven purely by the `pending`
+# file flag (set on receipt, cleared only by the Stop hook), so a dead or stuck
+# worker shows "typing…" forever and the user cannot tell "thinking hard" from
+# "never coming back". We already compute a precise worker state every 4s in the
+# watchdog (compute_state → BUSY_THINKING / WAITING / STUCK / DEAD / …); surface
+# it on the triggering message as an evolving emoji reaction, and stop the typing
+# indicator once the worker is no longer making progress.
+#
+# Only emojis from Telegram's default allowed reaction set are used.
+TOPIC_REACTION_RECEIVED = "👀"   # received & pasted into the pane, no clear work yet
+TOPIC_REACTION_WORKING = "✍"    # claude is actively thinking / running tools
+TOPIC_REACTION_STALLED = "😴"    # stuck / poisoned / dead — not making progress
+TOPIC_REACTION_DONE = "👍"       # response delivered
+
+# session_name -> (chat_id, msg_id) of the in-flight request message
+_topic_request_msg = {}
+# session_name -> last reaction emoji we set (dedup, avoid redundant API calls)
+_topic_reaction_set = {}
+
+
+def topic_reaction_for_state(state):
+    """Map a watchdog worker state to a reaction emoji (or None to leave as-is)."""
+    if state in ("BUSY_THINKING", "BUSY_TOOL", "UNTRACKED_BUSY"):
+        return TOPIC_REACTION_WORKING
+    if state == "WAITING":
+        return TOPIC_REACTION_RECEIVED
+    if state in ("STUCK", "POISONED", "DEAD", "OFFLINE", "EXITED"):
+        return TOPIC_REACTION_STALLED
+    return None  # READY / WAITING_INPUT / unknown — don't override
+
+
+def topic_request_stalled(state):
+    """True when an in-flight request is no longer making progress.
+
+    Used to stop the typing indicator: a dead/stuck worker should not keep
+    pretending to type.
+    """
+    return state in ("STUCK", "POISONED", "DEAD", "OFFLINE", "EXITED")
+
+
+def _update_topic_reaction(name, state):
+    """Surface a worker's live state as a reaction on its in-flight request.
+
+    No-op unless TOPIC_MODE is on and the session has a tracked request message.
+    Dedups so the Telegram API is only called when the emoji actually changes.
+    """
+    if not TOPIC_MODE:
+        return
+    rec = _topic_request_msg.get(name)
+    if not rec:
+        return
+    emoji = topic_reaction_for_state(state)
+    if not emoji or _topic_reaction_set.get(name) == emoji:
+        return
+    chat_id, msg_id = rec
+    try:
+        transport.set_reaction(chat_id, msg_id, [{"type": "emoji", "emoji": emoji}])
+        _topic_reaction_set[name] = emoji
+    except Exception as e:
+        print(f"[topic] set_reaction failed for {name}: {e}")
+
 
 def send_typing_loop(chat_id, session_name):
-    """Send typing indicator while request is pending."""
+    """Send typing indicator while a request is pending AND still progressing.
+
+    Keeps the familiar one-on-one "typing…" feel, but breaks out the moment the
+    watchdog marks the worker stalled/dead so it never types into the void.
+
+    In TOPIC_MODE the action MUST carry the topic's message_thread_id, otherwise
+    Telegram shows "typing…" in the group's General view instead of inside the
+    話題 the user is actually chatting in. (thread 0 = non-forum/General → omit.)
+    """
+    thread_id = None
+    if TOPIC_MODE:
+        _, tid = load_topic_meta(session_name)
+        thread_id = tid or None
     while is_pending(session_name):
-        transport.send_chat_action(chat_id, "typing")
+        st = _worker_states.get(session_name)
+        if st and topic_request_stalled(st[0]):
+            break
+        transport.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
         time.sleep(4)
 
 
@@ -6246,7 +6352,7 @@ class _LegacyTransportAdapter(MessageTransport):
     def send_sticker(self, chat_id, sticker_path) -> bool:
         return False
 
-    def send_chat_action(self, chat_id, action) -> None:
+    def send_chat_action(self, chat_id, action, message_thread_id=None) -> None:
         pass
 
     def set_reaction(self, chat_id, message_id, reaction) -> None:
@@ -8893,6 +8999,12 @@ class CommandRouter:
             host = get_worker_host(session_name)
             if not backend.is_interactive or tmux_prompt_empty(session.get("tmux", ""), host=host):
                 self.transport.set_reaction(chat_id, msg_id, [{"type": "emoji", "emoji": "👀"}])
+                if TOPIC_MODE:
+                    _topic_reaction_set[session_name] = TOPIC_REACTION_RECEIVED
+            # Track the in-flight request so the watchdog can evolve this message's
+            # reaction (✍ working → 😴 stalled) and delivery can stamp it 👍 done.
+            if TOPIC_MODE:
+                _topic_request_msg[session_name] = (chat_id, msg_id)
 
 
 command_router = CommandRouter(transport, worker_manager)

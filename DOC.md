@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 0.30.1
+> Version: 0.31.0
 
 ## Current Philosophy (Summary)
 
@@ -339,6 +339,37 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v0.31.0 - Liveness reactions + typing inside the right topic (TOPIC_MODE)
+
+**Problem:** The user could see "已讀" and "正在打字…" but had no way to tell a
+*thinking* worker from a *dead/stuck* one. Both signals were driven purely by the
+`pending` file flag (set on receipt, cleared only by the Stop hook), so a crashed
+or hung worker showed "typing…" forever. Worse, the typing indicator was sent at
+chat level with no `message_thread_id`, so it appeared in the group's **General**
+view instead of inside the 話題 the user was actually chatting in.
+
+**What:** The bridge already computes a precise per-worker state every 4s
+(`compute_state` → `BUSY_THINKING` / `WAITING` / `STUCK` / `DEAD` / …) but only used
+it for admin alerts. TOPIC_MODE now surfaces that state to the user as an evolving
+reaction on their triggering message, and keeps the familiar one-on-one typing feel:
+
+| State | Reaction | Typing |
+|-------|----------|--------|
+| received & pasted | 👀 | on |
+| actively thinking / running tools | ✍ | on |
+| stuck / poisoned / dead | 😴 | **stops** |
+| response delivered | 👍 | off |
+
+- `topic_reaction_for_state()` / `topic_request_stalled()` — pure state→emoji /
+  stop-typing mapping (only Telegram's default allowed reaction emojis are used).
+- `_update_topic_reaction()` is called from the watchdog each tick; it dedups so the
+  Telegram API is hit only when the emoji actually changes.
+- `route_message` records the in-flight `(chat_id, msg_id)`; `deliver_hook_response`
+  stamps it 👍 and stops tracking so a late watchdog tick can't clobber it.
+- `send_chat_action` now carries `message_thread_id` across all transports, and
+  `send_typing_loop` resolves the topic thread via `load_topic_meta` so "typing…"
+  lands **inside the 話題** (thread `0`/non-forum → omitted, shows in the main chat).
 
 ### Topic Sessions (TOPIC_MODE) — forum threads as sessions
 
