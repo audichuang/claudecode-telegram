@@ -1082,6 +1082,26 @@ BOT_COMMANDS = [
     {"command": "end", "description": "Offboard a worker: /end <name>"},
 ]
 
+# Topic-native command surface (used when TOPIC_MODE): one 話題 = one session, so
+# the multi-worker orchestration commands below are meaningless inside a topic.
+TOPIC_LEGACY_CMDS = {
+    "/hire", "/focus", "/team", "/end", "/progress", "/pause", "/restart",
+    "/teleport", "/teleport-check", "/teleback",
+}
+# Global commands that behave the same inside a 話題 — delegated to handle_command.
+TOPIC_GLOBAL_CMDS = {"/memory", "/voice", "/settings", "/rewind", "/pr", "/pilot"}
+# The slimmed command menu advertised to users in TOPIC_MODE.
+TOPIC_BOT_COMMANDS = [
+    {"command": "cd", "description": "切換這個話題的工作資料夾: /cd <path>"},
+    {"command": "close", "description": "結束這個話題的工作階段"},
+    {"command": "memory", "description": "搜尋團隊記憶: /memory <query>"},
+    {"command": "quota", "description": "顯示用量"},
+    {"command": "voice", "description": "切換語音回覆: /voice on|off"},
+    {"command": "settings", "description": "顯示設定"},
+    {"command": "rewind", "description": "逐字稿檢視: /rewind"},
+    {"command": "pr", "description": "PR 檢視: /pr <github_pr_url>"},
+]
+
 BLOCKED_COMMANDS = [
     "/mcp", "/help", "/config", "/model", "/compact", "/cost",
     "/doctor", "/init", "/login", "/logout", "/permissions",
@@ -2945,6 +2965,13 @@ def setup_bot_commands():
 
 def update_bot_commands():
     """Update bot commands including dynamic worker shortcuts."""
+    if TOPIC_MODE:
+        # Topic-native: a slim, fixed menu — no per-worker /<name> shortcuts and
+        # no multi-worker orchestration commands, since each 話題 is its own session.
+        transport.setup_commands(list(TOPIC_BOT_COMMANDS))
+        print(f"Bot commands updated ({len(TOPIC_BOT_COMMANDS)} topic commands)")
+        return
+
     commands = list(BOT_COMMANDS)  # Copy static commands
 
     # Add worker shortcuts (e.g., /lee, /chen)
@@ -5283,17 +5310,32 @@ class WorkerManager:
 
     def _build_welcome(self, name: str, backend_obj) -> str:
         """Build welcome/instructions message for a worker."""
-        welcome = (
-            "You are connected to Telegram via claudecode-telegram bridge. "
-            "RECEIVING FILES: Manager sends files (images, PDFs, documents) — they appear as local paths you can read directly. "
-            "SENDING FILES: Use [[image:/path/to/photo.png|caption]] for images (jpg/png/webp/bmp) and animations (gif/mp4), or [[file:/path/to/file|caption]] for documents, video (mp4/mov/avi — shows player), audio (mp3/m4a/flac — shows player), and voice (ogg/opus — voice bubble). "
-            f"MESSAGING WORKERS: Run `curl -s \"$BRIDGE_URL/workers?from={name}\"` to discover other workers — returns JSON with a `send_example` field containing ready-to-use send commands wrapped correctly for your machine (auto-adds ssh when a peer lives elsewhere). Always call /workers?from={name} before messaging, never guess addresses. "
-            f"NAME PREFIX: Always prefix your name in messages (e.g., '{name}: your message'). "
-            f"REFRESH INSTRUCTIONS: Run `curl -s $BRIDGE_URL/checkin?name={name}` to re-read these instructions anytime. "
-            f"WORKING DIRECTORY: To switch project directory (reloads CLAUDE.md), run `curl -s \"$BRIDGE_URL/checkin?name={name}&cwd=/path/to/project\"`. "
-            "BRIDGE API: Available endpoints: GET /workers, GET /checkin. Messages from manager arrive as prompts — there is NO polling endpoint. "
-            "WARNING: Do NOT output worker messages normally — they go to Telegram. Use the send commands from /workers instead."
-        )
+        if TOPIC_MODE:
+            # Topic-native: one 話題 = one dedicated session, so drop the
+            # multi-worker framing (/workers discovery, name prefixing,
+            # worker-to-worker messaging).
+            welcome = (
+                "You are connected to Telegram via claudecode-telegram. This 話題 (topic) is your "
+                "dedicated session: the manager's messages arrive as prompts and your replies go "
+                "straight back into this topic. "
+                "RECEIVING FILES: Manager-sent files (images, PDFs, documents) appear as local paths you can read directly. "
+                "SENDING FILES: Use [[image:/path/to/photo.png|caption]] for images (jpg/png/webp/bmp) and animations (gif/mp4), or [[file:/path/to/file|caption]] for documents, video (mp4/mov/avi — shows player), audio (mp3/m4a/flac — shows player), and voice (ogg/opus — voice bubble). "
+                "WORKING DIRECTORY: the manager switches your project folder from Telegram with /cd <path> (reloads CLAUDE.md). "
+                f"REFRESH INSTRUCTIONS: run `curl -s $BRIDGE_URL/checkin?name={name}` to re-read these instructions anytime. "
+                "Messages from the manager arrive as prompts — there is NO polling endpoint."
+            )
+        else:
+            welcome = (
+                "You are connected to Telegram via claudecode-telegram bridge. "
+                "RECEIVING FILES: Manager sends files (images, PDFs, documents) — they appear as local paths you can read directly. "
+                "SENDING FILES: Use [[image:/path/to/photo.png|caption]] for images (jpg/png/webp/bmp) and animations (gif/mp4), or [[file:/path/to/file|caption]] for documents, video (mp4/mov/avi — shows player), audio (mp3/m4a/flac — shows player), and voice (ogg/opus — voice bubble). "
+                f"MESSAGING WORKERS: Run `curl -s \"$BRIDGE_URL/workers?from={name}\"` to discover other workers — returns JSON with a `send_example` field containing ready-to-use send commands wrapped correctly for your machine (auto-adds ssh when a peer lives elsewhere). Always call /workers?from={name} before messaging, never guess addresses. "
+                f"NAME PREFIX: Always prefix your name in messages (e.g., '{name}: your message'). "
+                f"REFRESH INSTRUCTIONS: Run `curl -s $BRIDGE_URL/checkin?name={name}` to re-read these instructions anytime. "
+                f"WORKING DIRECTORY: To switch project directory (reloads CLAUDE.md), run `curl -s \"$BRIDGE_URL/checkin?name={name}&cwd=/path/to/project\"`. "
+                "BRIDGE API: Available endpoints: GET /workers, GET /checkin. Messages from manager arrive as prompts — there is NO polling endpoint. "
+                "WARNING: Do NOT output worker messages normally — they go to Telegram. Use the send commands from /workers instead."
+            )
         if not backend_obj.is_interactive:
             welcome += (
                 " NON-INTERACTIVE MODE: Your bridge URL is in $BRIDGE_URL env var. "
@@ -6587,6 +6629,20 @@ class CommandRouter:
                     self.open_topic_session(chat_id, thread_id, cwd=clamped)
             else:
                 self._send_folder_picker(chat_id, thread_id)
+            return
+
+        # One 話題 = one session: the multi-worker orchestration commands are
+        # meaningless here. Answer with a hint instead of leaking them to the
+        # worker as chat text.
+        if cmd in TOPIC_LEGACY_CMDS:
+            self.reply(chat_id,
+                       "話題模式不需要這個指令 —— 每個話題就是一個獨立的工作階段。\n"
+                       "用 /cd 換資料夾、/close 結束、/memory 搜尋記憶。")
+            return
+        # Global commands behave the same inside a 話題 — delegate to the shared
+        # dispatcher rather than leaking them to the worker.
+        if cmd in TOPIC_GLOBAL_CMDS:
+            self.handle_command(text, chat_id, msg_id)
             return
 
         name = find_topic_session(chat_id, thread_id, registered)

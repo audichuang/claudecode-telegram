@@ -928,6 +928,92 @@ print('OK')
     fi
 }
 
+test_topic_legacy_command_rejected() {
+    info "Testing legacy orchestration commands are intercepted in TOPIC_MODE (not leaked to worker)..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+cr.workers.get_registered_sessions = lambda registered=None: {}
+routed = []; replies = []
+cr.route_message = lambda *a, **k: routed.append(a)
+cr.reply = lambda chat_id, text, **kw: replies.append(text)
+for legacy in ('/focus foo', '/team', '/hire bar', '/pause'):
+    msg = {'message_thread_id': 4321, 'text': legacy, 'chat': {'id': 555}}
+    cr._handle_topic_message(msg, legacy, 555, 7)
+assert routed == [], ('legacy commands must not route to a worker:', routed)
+assert len(replies) == 4 and all('不需要' in r for r in replies), replies
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "legacy orchestration commands intercepted in topic mode"
+    else
+        fail "topic legacy-command intercept test failed"
+    fi
+}
+
+test_topic_global_command_delegated() {
+    info "Testing global commands (/memory) are delegated, not leaked to the worker..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+cr.workers.get_registered_sessions = lambda registered=None: {}
+delegated = []; routed = []
+cr.handle_command = lambda text, chat_id, msg_id: delegated.append(text)
+cr.route_message = lambda *a, **k: routed.append(a)
+msg = {'message_thread_id': 4321, 'text': '/memory otp bug', 'chat': {'id': 555}}
+cr._handle_topic_message(msg, '/memory otp bug', 555, 7)
+assert delegated == ['/memory otp bug'], delegated
+assert routed == [], routed
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "global commands delegated inside a topic"
+    else
+        fail "topic global-command delegation test failed"
+    fi
+}
+
+test_topic_command_menu_is_slim() {
+    info "Testing TOPIC_MODE advertises a slim command menu (no hire/focus/team, no per-worker shortcuts)..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+sent = {}
+bridge.transport.setup_commands = lambda cmds: sent.update({'cmds': cmds})
+bridge.get_registered_sessions = lambda: {'t9': {}}   # would add a /t9 shortcut in non-topic mode
+bridge.update_bot_commands()
+cmds = [c['command'] for c in sent['cmds']]
+assert 'cd' in cmds and 'close' in cmds and 'memory' in cmds, cmds
+for gone in ('focus', 'team', 'hire', 'progress', 'pause', 'restart', 'end', 't9'):
+    assert gone not in cmds, ('should be absent from topic menu:', gone, cmds)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "topic command menu is slim"
+    else
+        fail "topic slim-menu test failed"
+    fi
+}
+
+test_topic_welcome_drops_multiworker_framing() {
+    info "Testing TOPIC_MODE worker welcome drops the multi-worker framing..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+bridge.read_checkin_note = lambda: ''
+w = bridge.worker_manager._build_welcome('t9', bridge.get_backend('claude'))
+assert '/workers' not in w, 'topic welcome should not mention /workers'
+assert 'NAME PREFIX' not in w, 'topic welcome should not mention NAME PREFIX'
+assert '話題' in w and '/cd' in w, w[:120]
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "topic welcome drops multi-worker framing"
+    else
+        fail "topic welcome test failed"
+    fi
+}
+
 test_topic_typing_targets_thread() {
     info "Testing typing indicator is sent into the topic thread, not General..."
     if python3 -c "
@@ -19240,6 +19326,10 @@ run_unit_tests() {
     run_test test_topic_hire_starts_pane_in_picked_cwd
     run_test test_topic_typed_reply_during_pick_not_routed
     run_test test_topic_cd_rejects_bad_path
+    run_test test_topic_legacy_command_rejected
+    run_test test_topic_global_command_delegated
+    run_test test_topic_command_menu_is_slim
+    run_test test_topic_welcome_drops_multiworker_framing
     run_test test_topic_typing_targets_thread
     run_test test_hook_reply_targets_thread
     run_test test_quota_render
