@@ -813,6 +813,121 @@ print('OK')
     fi
 }
 
+test_topic_name_falls_back_for_nonascii() {
+    info "Testing topic session naming falls back to t<id> for non-faithful slugs..."
+    if python3 -c "
+import bridge
+s = bridge._sanitize_topic_name
+assert s('測試546') == '', repr(s('測試546'))
+assert s('PR 123') == 'pr-123', repr(s('PR 123'))
+assert s('café') == '', repr(s('café'))
+assert s('fix-bug') == 'fix-bug', repr(s('fix-bug'))
+r = bridge.resolve_topic_session_name
+bridge._topic_titles[(11, 546)] = '測試546'
+assert r(11, 546, {}) == 't546', r(11, 546, {})       # CJK dropped -> fallback
+bridge._topic_titles[(11, 777)] = '546'
+assert r(11, 777, {}) == 't777', r(11, 777, {})       # pure-numeric -> fallback
+bridge._topic_titles[(11, 888)] = 'team'
+assert r(11, 888, {}) == 't888', r(11, 888, {})       # reserved -> fallback
+bridge._topic_titles[(11, 999)] = 'cc-switch'
+assert r(11, 999, {}) == 'cc-switch', r(11, 999, {})  # plain ASCII kept
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "topic naming falls back to t<id> for non-ASCII/numeric/reserved"
+    else
+        fail "topic naming fallback test failed"
+    fi
+}
+
+test_topic_hire_starts_pane_in_picked_cwd() {
+    info "Testing hire starts the tmux pane in the picked cwd via -c (no cd-readback race)..."
+    if python3 -c "
+import tempfile, subprocess
+import bridge
+picked = tempfile.mkdtemp()            # a real dir so isdir() passes
+wm = bridge.worker_manager
+wm._sync_paths = lambda: None
+bridge.is_valid_backend = lambda b: True
+bridge._which_binary = lambda b: '/usr/bin/true'
+bridge.tmux_exists = lambda t: False
+wm._get_startup_cwd = lambda name: picked
+cap = {}
+class R:
+    returncode = 0; stdout = ''; stderr = b''
+def fake_run(cmd, *a, **k):
+    if isinstance(cmd, list) and 'new-session' in cmd:
+        cap['ns'] = cmd
+    return R()
+subprocess.run = fake_run
+saved = {}
+bridge.save_claude_session_cwd = lambda n, c: saved.__setitem__(n, c)
+bridge.export_hook_env = lambda *a, **k: None
+bridge.ensure_session_dir = lambda n: None
+bridge.time.sleep = lambda *a, **k: None
+try:
+    wm.hire('546', chat_id=11)         # later stages may no-op/raise; new-session runs first
+except Exception:
+    pass
+ns = cap.get('ns', [])
+assert '-c' in ns and picked in ns, ('new-session missing -c <picked>:', ns)
+assert saved.get('546') == picked, ('persisted cwd != picked:', saved)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "hire starts pane in picked cwd via -c and persists it"
+    else
+        fail "hire -c cwd test failed"
+    fi
+}
+
+test_topic_typed_reply_during_pick_not_routed() {
+    info "Testing a typed reply while awaiting folder pick is not routed to a worker..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear(); bridge._awaiting_folder.add((555, 4321))
+cr.workers.get_registered_sessions = lambda registered=None: {}
+routed = []; replies = []
+cr.route_message = lambda name, text, chat_id, msg_id: routed.append((name, text))
+cr.reply = lambda chat_id, text, **kw: replies.append(text)
+msg = {'message_thread_id': 4321, 'text': '2', 'chat': {'id': 555}}
+cr._handle_topic_message(msg, '2', 555, 7)
+assert routed == [], ('must not route while awaiting:', routed)
+assert replies and '按鈕' in replies[0], replies
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "typed reply during folder pick is not routed to a worker"
+    else
+        fail "awaiting-folder guard test failed"
+    fi
+}
+
+test_topic_cd_rejects_bad_path() {
+    info "Testing /cd rejects a nonexistent / out-of-root path..."
+    if python3 -c "
+import tempfile
+import bridge
+bridge.TOPIC_MODE = True
+bridge.TOPIC_ROOT = tempfile.mkdtemp()
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+cr.workers.get_registered_sessions = lambda registered=None: {}
+opened = []; replies = []
+cr.open_topic_session = lambda *a, **k: opened.append((a, k))
+cr.reply = lambda chat_id, text, **kw: replies.append(text)
+bad = bridge.TOPIC_ROOT + '/nope-xyz-123'
+msg = {'message_thread_id': 4321, 'text': '/cd ' + bad, 'chat': {'id': 555}}
+cr._handle_topic_message(msg, '/cd ' + bad, 555, 7)
+assert opened == [], ('must not open session for bad path:', opened)
+assert replies and ('找不到' in replies[0] or '範圍' in replies[0]), replies
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/cd rejects nonexistent/out-of-root path"
+    else
+        fail "/cd clamp test failed"
+    fi
+}
+
 test_topic_typing_targets_thread() {
     info "Testing typing indicator is sent into the topic thread, not General..."
     if python3 -c "
@@ -19121,6 +19236,10 @@ run_unit_tests() {
     run_test test_topic_reaction_done_on_delivery
     run_test test_topic_typing_stops_when_stalled
     run_test test_topic_route_tracks_request
+    run_test test_topic_name_falls_back_for_nonascii
+    run_test test_topic_hire_starts_pane_in_picked_cwd
+    run_test test_topic_typed_reply_during_pick_not_routed
+    run_test test_topic_cd_rejects_bad_path
     run_test test_topic_typing_targets_thread
     run_test test_hook_reply_targets_thread
     run_test test_quota_render

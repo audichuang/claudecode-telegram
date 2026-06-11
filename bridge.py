@@ -3067,9 +3067,21 @@ _topic_titles = {}
 
 
 def _sanitize_topic_name(title):
-    """Slugify a 話題 title into a tmux/dir-safe worker name, or '' when nothing
-    usable remains (e.g. a CJK-only title) so the caller falls back to t<id>."""
-    return re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    """Slugify a 話題 title into a tmux/dir-safe worker name, or '' when the slug
+    would not faithfully represent the title so the caller falls back to t<id>.
+
+    Returns '' when the title carries alphabetic letters outside [a-z] that
+    slugifying drops (CJK, accented Latin, …) — otherwise a title like "測試546"
+    silently becomes the misleading fragment "546". Pure-ASCII titles such as
+    "PR 123" -> "pr-123" are unaffected.
+    """
+    t = title or ""
+    slug = re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")
+    if not slug:
+        return ""
+    if any(c.isalpha() and not ("a" <= c.lower() <= "z") for c in t):
+        return ""
+    return slug
 
 
 def resolve_topic_session_name(chat_id, thread_id, registered):
@@ -3077,7 +3089,15 @@ def resolve_topic_session_name(chat_id, thread_id, registered):
     already taken, else the stable ``t<thread_id>`` (or ``tmain``) fallback."""
     fallback = topic_session_name(thread_id)
     slug = _sanitize_topic_name(_topic_titles.get((int(chat_id), int(thread_id)), ""))
-    if slug and slug != "tmain" and slug not in (registered or {}):
+    # Reject names that collide with the t<id>/tmain scheme, reserved command
+    # words, the digit-selection UX (pure-numeric), or an already-taken worker.
+    if (
+        slug
+        and slug != "tmain"
+        and not slug.isdigit()
+        and slug not in RESERVED_NAMES
+        and slug not in (registered or {})
+    ):
         return slug
     return fallback
 
@@ -3117,6 +3137,11 @@ def find_topic_session(chat_id, thread_id, registered):
 # Pending first message per (chat_id, thread_id), captured when the folder
 # picker is shown and consumed when a folder is selected (Task 5).
 _pending_topic_text = {}
+
+# Topics whose folder picker is open (or whose session is still being created).
+# While present, a typed reply must NOT be routed to a worker — it is a
+# mis-attempt to "pick option N". Cleared once the session is bound.
+_awaiting_folder = set()
 
 
 # External usage snapshot written by claude-hud (subscriber rate-limit data).
@@ -5312,23 +5337,27 @@ class WorkerManager:
         # Strip CLAUDECODE from env so new tmux shell doesn't inherit it
         # (Claude Code refuses to start if it detects a parent session)
         clean_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-        result = subprocess.run(
-            ["tmux", "new-session", "-d", "-s", tmux_name, "-x", "200", "-y", "50"],
-            capture_output=True, env=clean_env
-        )
+        # Root fix: start the pane directly in the worker's target cwd via `-c`.
+        # Resolving startup_cwd BEFORE new-session lets the shell be *born* in the
+        # right directory, so we never inject a `cd` keystroke and then race a
+        # pane-cwd readback (the old dance captured #{pane_current_path} mid-line
+        # while trust-prompt/welcome keystrokes interleaved, persisting corrupted
+        # paths like ".../cc-switch546"). startup_cwd is the RAM hint set by
+        # _set_worker_cwd before create_session.
+        startup_cwd = self._get_startup_cwd(name)
+        new_session = ["tmux", "new-session", "-d", "-s", tmux_name, "-x", "200", "-y", "50"]
+        if startup_cwd and os.path.isdir(startup_cwd):
+            new_session += ["-c", startup_cwd]
+        result = subprocess.run(new_session, capture_output=True, env=clean_env)
         if result.returncode != 0:
             return False, "Could not start the worker workspace"
 
-        time.sleep(0.5)
-        startup_cwd = self._get_startup_cwd(name)
+        # Pane is now born in startup_cwd — no cd keystroke, no readback, no race.
+        # Persist the authoritative cwd directly (matches restart()).
         if startup_cwd:
-            self._cd_tmux_to_cwd(tmux_name, startup_cwd)
+            save_claude_session_cwd(name, startup_cwd)
 
-        # After tmux new-session succeeds, capture the pane's cwd
-        pane_cwd = self._get_tmux_pane_cwd(tmux_name) or startup_cwd
-        if pane_cwd:
-            save_claude_session_cwd(name, pane_cwd)
-
+        time.sleep(0.5)  # let the pane shell finish init before injecting env
         export_hook_env(tmux_name, backend)
         time.sleep(0.3)
 
@@ -6466,6 +6495,8 @@ class CommandRouter:
         _set_worker_cwd(name, cwd)
         create_session(name, chat_id=chat_id)
         save_topic_meta(name, chat_id, thread_id)
+        # Session is bound now — stop treating typed replies as folder-pick attempts.
+        _awaiting_folder.discard((chat_id, thread_id))
         if pending_text:
             self.route_message(name, pending_text, chat_id, None)
 
@@ -6475,11 +6506,12 @@ class CommandRouter:
         Sends an inline keyboard rooted at TOPIC_ROOT into ``thread_id`` so the
         user can pick the cwd for a new topic session.
         """
+        _awaiting_folder.add((chat_id, thread_id))
         telegram_api(
             "sendMessage",
             {
                 "chat_id": chat_id,
-                "text": "選擇這個話題要在哪個資料夾開工：",
+                "text": "選擇這個話題要在哪個資料夾開工（請點下方按鈕，輸入數字無法選擇）：",
                 "message_thread_id": thread_id,
                 "reply_markup": {"inline_keyboard": build_folder_keyboard(TOPIC_ROOT)},
             },
@@ -6526,6 +6558,7 @@ class CommandRouter:
 
         # /close — end this thread's session.
         if cmd == "/close":
+            _awaiting_folder.discard((chat_id, thread_id))
             name = find_topic_session(chat_id, thread_id, registered)
             if name:
                 self.workers.end(name)
@@ -6538,19 +6571,33 @@ class CommandRouter:
         # restart in place; bare /cd reopens the folder picker.
         if cmd == "/cd":
             if arg:
+                # Clamp under TOPIC_ROOT and require a real dir: a relative arg
+                # would otherwise resolve against the bridge cwd and escape the
+                # root (e.g. "/cd ../cc-switch546" -> a phantom path).
+                clamped = _norm_under_root(os.path.expanduser(arg))
+                if not os.path.isdir(clamped):
+                    self.reply(chat_id, f"找不到資料夾（或超出允許範圍）：{arg}")
+                    return
                 name = find_topic_session(chat_id, thread_id, registered)
                 if name:
-                    _set_worker_cwd(name, arg)
+                    _set_worker_cwd(name, clamped)
                     self.workers.restart(name)
-                    self.reply(chat_id, f"已切換資料夾並重啟：{arg}")
+                    self.reply(chat_id, f"已切換資料夾並重啟：{clamped}")
                 else:
-                    self.open_topic_session(chat_id, thread_id, cwd=arg)
+                    self.open_topic_session(chat_id, thread_id, cwd=clamped)
             else:
                 self._send_folder_picker(chat_id, thread_id)
             return
 
         name = find_topic_session(chat_id, thread_id, registered)
-        if name:
+        if (chat_id, thread_id) in _awaiting_folder:
+            # Picker open / session still being created: never route a typed reply
+            # to a worker (it's a mis-attempt to "pick option N"). Keep the first
+            # message as the pending text and nudge the user to tap a button.
+            if not name:
+                _pending_topic_text.setdefault((chat_id, thread_id), text)
+            self.reply(chat_id, "請點上面的資料夾按鈕來選擇工作目錄（輸入文字無法選擇）。")
+        elif name:
             self.route_message(name, text, chat_id, msg_id)
         else:
             _pending_topic_text[(chat_id, thread_id)] = text
