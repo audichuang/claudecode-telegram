@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 0.32.0
+> Version: 0.33.0
 
 ## Current Philosophy (Summary)
 
@@ -339,6 +339,37 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v0.33.0 - Topic spawn fix + topic-native command surface
+
+**Spawn fix (the "測試546 → cwd cc-switch546" bug):**
+- A new topic's worker pane was started in the bridge's cwd, then `cd <pick>` was
+  injected and `#{pane_current_path}` read back 0.2s later — a fresh shell racing
+  trust-prompt/welcome keystrokes yielded a mangled path with the worker name stuck
+  on (`cc-switch546`). Root fix: `tmux new-session -c <cwd>` so the pane is **born**
+  in the picked dir — no cd injection, no readback, no race. Persist `startup_cwd`
+  directly (matches `restart()`).
+- Naming: `_sanitize_topic_name` dropped CJK/accented letters, so "測試546" became a
+  misleading "546". Now returns '' when meaningful non-ASCII letters are dropped, and
+  `resolve_topic_session_name` also rejects pure-numeric and reserved names → falls
+  back to `t<thread_id>`.
+- A typed reply (e.g. "2") while a topic's folder picker is open is no longer leaked
+  to the worker — `_awaiting_folder` guards it. `/cd <path>` is clamped under
+  TOPIC_ROOT and must be a real dir.
+
+**Topic-native command surface (slimdown):** one 話題 = one session, so the
+multi-worker orchestration surface is vestigial inside a topic.
+- Legacy commands (`/hire /focus /team /end /progress /pause /restart /teleport*`)
+  are intercepted with a "話題模式不需要" hint instead of leaking to the worker.
+- Global commands (`/memory /voice /settings /rewind /pr /pilot`) are delegated so
+  they actually work in a topic (they leaked before).
+- The Telegram command menu is a slim fixed set in TOPIC_MODE (no per-worker
+  `/<name>` shortcuts); the worker welcome drops the `/workers`/name-prefix/
+  cross-machine framing.
+- **Kept** (a deeper "C" decision, untouched): the session-spawn primitive,
+  watchdog/liveness reactions, remote/teleport, worker pipes.
+
+FAST suite: 358 passed / 0 failed.
 
 ### v0.32.0 - uv-managed toolchain, ruff lint, and a green test suite
 
