@@ -928,6 +928,57 @@ print('OK')
     fi
 }
 
+test_topic_hire_skips_trust_2_without_prompt() {
+    info "Testing hire only answers the trust dialog when it actually appears (no stray '2')..."
+    if python3 -c "
+import tempfile, subprocess
+import bridge
+wm = bridge.worker_manager
+wm._sync_paths = lambda: None
+bridge.is_valid_backend = lambda b: True
+bridge._which_binary = lambda b: '/usr/bin/true'
+bridge.tmux_exists = lambda t: False
+wm._get_startup_cwd = lambda name: tempfile.mkdtemp()
+bridge.save_claude_session_cwd = lambda n, c: None
+bridge.export_hook_env = lambda *a, **k: None
+bridge.ensure_session_dir = lambda n: None
+bridge.time.sleep = lambda *a, **k: None
+wm._build_welcome = lambda n, b: 'hi'
+wm.send = lambda *a, **k: True
+bridge.set_focus = lambda n: None
+sk = []
+class R:
+    returncode = 0; stdout = ''; stderr = b''
+def fake_run(cmd, *a, **k):
+    if isinstance(cmd, list) and 'send-keys' in cmd:
+        sk.append(cmd[4] if len(cmd) > 4 else '')
+    return R()
+subprocess.run = fake_run
+
+# Case A: no trust dialog on screen -> the stray '2' must NOT be sent.
+bridge._capture_pane_text = lambda t, lines=50, host=None: 'Claude Code v2\n> '
+try:
+    wm.hire('tA', chat_id=11)
+except Exception:
+    pass
+assert '2' not in sk, ('must not send a bare 2 when no trust dialog:', sk)
+
+# Case B: a real trust dialog -> '2' IS sent to answer it.
+sk.clear()
+bridge._capture_pane_text = lambda t, lines=50, host=None: 'Do you trust the files in this folder?\n1. Yes\n2. No'
+try:
+    wm.hire('tB', chat_id=11)
+except Exception:
+    pass
+assert '2' in sk, ('should answer a real trust dialog with 2:', sk)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "hire answers trust dialog only when present (no stray 2)"
+    else
+        fail "hire trust-2 guard test failed"
+    fi
+}
+
 test_topic_legacy_command_rejected() {
     info "Testing legacy orchestration commands are intercepted in TOPIC_MODE (not leaked to worker)..."
     if python3 -c "
@@ -19324,6 +19375,7 @@ run_unit_tests() {
     run_test test_topic_route_tracks_request
     run_test test_topic_name_falls_back_for_nonascii
     run_test test_topic_hire_starts_pane_in_picked_cwd
+    run_test test_topic_hire_skips_trust_2_without_prompt
     run_test test_topic_typed_reply_during_pick_not_routed
     run_test test_topic_cd_rejects_bad_path
     run_test test_topic_legacy_command_rejected

@@ -5428,10 +5428,18 @@ class WorkerManager:
                 start_cmd = f'cd {shlex.quote(startup_cwd)} && {start_cmd}'
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"])
             if backend_obj.is_interactive:
+                # Answer the backend's "Do you trust the files in this folder?"
+                # dialog — but ONLY if it actually appears. claude launches with
+                # --dangerously-skip-permissions (and already-trusted folders skip
+                # it too), so there is usually NO prompt; sending "2" unconditionally
+                # leaked it to the model as a stray prompt (-> "你傳了2"). Check the
+                # pane once (same 1.5s timing as before) and answer only a real dialog.
                 time.sleep(1.5)
-                subprocess.run(["tmux", "send-keys", "-t", tmux_name, "2"])
-                time.sleep(0.3)
-                subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+                pane = _capture_pane_text(tmux_name, lines=20).lower()
+                if any(m in pane for m in ("do you trust", "trust the files", "trust this folder")):
+                    subprocess.run(["tmux", "send-keys", "-t", tmux_name, "2"])
+                    time.sleep(0.3)
+                    subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
 
         if backend_obj.is_interactive:
             time.sleep(2.0 if not SANDBOX_ENABLED else 5.0)
