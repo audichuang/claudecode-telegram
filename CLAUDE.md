@@ -215,6 +215,29 @@ SESSIONS_DIR="$HOME/.claude/telegram/sessions"
 5. Ensure `start_bridge()` passes ALL required env vars, not just token/port
 6. Add explicit stop conditions (max retries or timeouts) and log when the watchdog gives up
 
+### Bridge processes MUST be setsid-detached (the 07:47 silent-death lesson)
+
+**Problem:** The dev bridge died silently twice (2026-06-10 20:21, 2026-06-11 07:47):
+last log line was a successful `POST /response`, then nothing — no shutdown banner,
+no traceback. Forensics ruled out OOM/kernel kills (journal readable & empty),
+graceful signals (SIGTERM/SIGINT print a banner since v0.4.0), the test suite
+(it only ever kills :8295/:8096), and manual kills (shell history + transcripts clean).
+
+**Root cause:** the bridge was launched under an interactive host — a foreground
+`./claudecode-telegram.sh run` whose parent was a terminal/Claude-session shell.
+When that host went away (terminal closed / session shell reclaimed), the whole
+process group got SIGHUP/SIGKILL, which Python dies from **silently** (no handler
+can run for SIGKILL; SIGHUP's default action prints nothing).
+
+**Rule:** ALWAYS launch the bridge fully detached so no host teardown can reach it:
+```bash
+setsid bash -c '... exec ./.venv/bin/python -u bridge.py >> "$NODE/bridge.log" 2>&1' \
+  </dev/null >/dev/null 2>&1 &
+```
+Verify afterwards: the bridge's PPID must be 1. Every setsid-launched restart since
+leaves a clean `Received SIGTERM` banner on shutdown — the silent-death mode is
+extinct unless someone launches it attached again.
+
 ### NEVER use pkill on multi-node setups
 
 **Problem:** `pkill -f cloudflared` or `pkill -f bridge.py` kills ALL matching processes across ALL nodes, not just the target node.
