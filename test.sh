@@ -40,6 +40,11 @@ PORT="${TEST_PORT:-8295}"
 TEST_SESSION_DIR="$TEST_NODE_DIR/sessions"
 TEST_PID_FILE="$TEST_NODE_DIR/pid"
 TEST_TMUX_PREFIX="claude-${TEST_NODE}-"
+# Default the env var too: unit tests import bridge.py, which derives its tmux
+# prefix AND /tmp namespace from TMUX_PREFIX. Without a default, the suite (a)
+# aborted under `set -u` at tests that reference $TMUX_PREFIX, and (b) could
+# collide with real `claude-` nodes on the same machine.
+export TMUX_PREFIX="${TMUX_PREFIX:-$TEST_TMUX_PREFIX}"
 BRIDGE_LOG="$TEST_NODE_DIR/bridge.log"
 TUNNEL_LOG="$TEST_NODE_DIR/tunnel.log"
 TEST_TEAM_DIR="$TEST_NODE_DIR/team"

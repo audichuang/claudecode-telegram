@@ -1,5 +1,22 @@
 # Claude Code Project Instructions
 
+## The Model (v1.0.0: topic-only)
+
+**One Telegram forum 話題 (topic) = one Claude Code session.** This is the ONLY
+model — the multi-worker era (`/hire /focus /team`, `@mention`, teleport,
+codex/gemini/opencode backends, gRPC, forge `/register`) was deleted in v1.0.0.
+
+```
+建話題(第一則訊息=純觸發) → 資料夾選單 → tmux 裡誕生 claude session
+話題內訊息/媒體 → bridge → tmux send → claude → Stop hook → POST /response → 回同一話題
+關閉話題 = 結束 session;刪除話題靠回覆彈回 thread-not-found 收屍(Telegram 無刪除事件)
+```
+
+- Addressing = which 話題 you type in. There is **no** focus/active state.
+- `TOPIC_MODE` is hardwired `True` in bridge.py; the env var is ignored.
+- Claude is the only backend. Watchdog liveness shows as emoji reactions (👀✍😴👍).
+- Spec: `docs/superpowers/specs/2026-06-1{0,1}-topic-*.md`; history: `DOC.md` changelog.
+
 ## Version Management
 
 When making changes that result in a new version:
@@ -96,9 +113,10 @@ Before coding, break the feature into an increment ladder:
 3. **REFACTOR** — Clean up if needed. Run filtered test to confirm still green.
 4. Move to next increment.
 
-**Mode gates (unchanged):**
+**Mode gates** (`test.sh` defaults `TMUX_PREFIX=claude-test-` so unit tests are
+namespaced away from real nodes; only override it to target a different test node):
 ```bash
-# While developing — run single test frequently  
+# While developing — run single test frequently
 TEST_FILTER=test_name FAST=1 TEST_BOT_TOKEN='...' ./test.sh
 
 # Per increment green — run FAST suite
@@ -187,15 +205,15 @@ SESSIONS_DIR="$HOME/.claude/telegram/sessions"
 
 **Why:** The agent (and future contributors) rely on these files as the source of truth.
 
-### Per-node pipe + inbox isolation
+### Per-node inbox isolation
 
-**Problem:** Pipes/inboxes under `/tmp` were shared across nodes, causing collisions between prod/dev/test.
+**Problem:** Inboxes under `/tmp` were shared across nodes, causing collisions between prod/dev/test.
 
 **Rule:** Namespace all `/tmp` paths by node (derived from `TMUX_PREFIX`):
 ```
-/tmp/claudecode-telegram/<node>/<worker>/in.pipe
-/tmp/claudecode-telegram/<node>/<worker>/inbox/
+/tmp/claudecode-telegram/<node>/<session>/inbox/   # incoming media files
 ```
+(The `in.pipe` worker-to-worker channel was removed with the multi-worker era in v1.0.0.)
 
 ### Watchdog for bridge requires careful testing
 
@@ -238,6 +256,11 @@ Verify afterwards: the bridge's PPID must be 1. Every setsid-launched restart si
 leaves a clean `Received SIGTERM` banner on shutdown — the silent-death mode is
 extinct unless someone launches it attached again.
 
+**Verifying a restart:** don't trust `curl` — the OLD bridge's graceful shutdown
+sends notifications over the network and holds the port for tens of seconds, so
+curl returns `000` while everything is fine. Poll `ss -ltnp | grep :<port>` for
+the NEW pid, then `tail bridge.log` for the startup banner.
+
 ### NEVER use pkill on multi-node setups
 
 **Problem:** `pkill -f cloudflared` or `pkill -f bridge.py` kills ALL matching processes across ALL nodes, not just the target node.
@@ -265,7 +288,7 @@ kill $(cat ~/.claude/telegram/nodes/prod/pid)
 
 **Problem:** Ran `lsof -ti :8271 | xargs kill` thinking it was dev node, but port 8271 = prod. Killed production bridge while team was working.
 
-**Default port assignments (overridable via `--port` or `PORT` env var):**
+**Script defaults (overridable via `--port` or `PORT` env var):**
 | Default Port | Node | Sandbox |
 |--------------|------|---------|
 | 8270 | sandbox (or custom) | `--sandbox` |
@@ -273,7 +296,12 @@ kill $(cat ~/.claude/telegram/nodes/prod/pid)
 | 8272 | dev | `--no-sandbox` |
 | 8295 | test (test.sh) | `--no-sandbox` |
 
-Ports are dynamic — always check the actual running port, not the defaults.
+Ports are dynamic — **the defaults lie in practice** (e.g. this Linux box runs
+the dev node on **8270**). Always check the live owner first:
+```bash
+ss -ltnp | grep ':82'           # who actually listens, with PID
+cat ~/.claude/telegram/nodes/*/port 2>/dev/null   # if port files exist
+```
 
 **Why `--no-sandbox` for prod/dev/test?** Docker overhead is too slow. Sandbox node is for untrusted/experimental code.
 
@@ -299,27 +327,11 @@ source ~/.config/claudecode-telegram/prod.env
 TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" ./claudecode-telegram.sh --node prod --no-sandbox run
 ```
 
-| File | Purpose |
-|------|---------|
-| `~/.config/claudecode-telegram/prod.env` | Prod bot token |
-| `~/.config/claudecode-telegram/test.env` | Test bot token |
+The pattern is `~/.config/claudecode-telegram/<node>.env` — one file per node
+that runs on that machine (this Linux box currently has only `dev.env`; a
+machine hosting prod has `prod.env`, etc.).
 
 **Why:** Faster, more reliable than extracting from running process memory. Works even if the bridge is already dead.
-
-### Use script commands or PID files to stop services
-
-**Problem:** Used pkill to restart bridge, caused production outage.
-
-**Fix:** Use the script's stop command or kill via PID file:
-```bash
-# RIGHT - use script command
-./claudecode-telegram.sh stop
-
-# RIGHT - use PID file
-kill $(cat ~/.claude/telegram/claudecode-telegram.pid)
-```
-
-**Why:** pkill is too broad and can kill processes unexpectedly, causing downtime.
 
 ### Always test on dev node before prod deployment
 
@@ -386,6 +398,8 @@ BRIDGE_PORT="__NODE_PORT__"
 3. Avoid GNU-specific extensions: `%N`, `stat -c`, `sed -i`, `grep -P`
 
 ### Test behavior, not scaffolding
+
+*(Examples below are from the deleted multi-worker era — the principle is unchanged.)*
 
 **Problem:** Tests verified structure (functions exist, HTTP returns OK) but not actual behavior. A non-interactive worker subprocess was dying immediately, but tests passed because they only checked:
 - `test_bridge_starts` → bridge starts
