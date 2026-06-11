@@ -204,6 +204,8 @@ fi
 
 # Forward to bridge (non-blocking with timeout)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Prefer the uv-managed venv interpreter (repo-root .venv); fall back to system python3.
+if [[ -x "$SCRIPT_DIR/../.venv/bin/python" ]]; then PY="$SCRIPT_DIR/../.venv/bin/python"; else PY="python3"; fi
 TMPFILE=$(mktemp)
 echo "$TEXT" > "$TMPFILE"
 
@@ -218,7 +220,7 @@ if ! command -v timeout &>/dev/null; then
     fi
 fi
 (
-    ${TIMEOUT_CMD:+$TIMEOUT_CMD 5} python3 "$SCRIPT_DIR/forward-to-bridge.py" "$TMPFILE" "$BRIDGE_SESSION" "$BRIDGE_ENDPOINT" "$SESSION_ID"
+    ${TIMEOUT_CMD:+$TIMEOUT_CMD 5} "$PY" "$SCRIPT_DIR/forward-to-bridge.py" "$TMPFILE" "$BRIDGE_SESSION" "$BRIDGE_ENDPOINT" "$SESSION_ID"
     rm -f "$TMPFILE"
 ) &
 

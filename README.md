@@ -161,21 +161,23 @@ tmux -V
 
 You should see output like: `tmux 3.4`.
 
-#### Step 5: Install Python 3
+#### Step 5: Install Python 3 and uv
 
-Why this matters: the bridge is written in Python.
+Why this matters: the bridge is written in Python (3.12+), and `uv` manages its
+dependencies and virtual environment (the launcher runs `uv sync` for you on start).
 
 ```bash
-brew install python
+brew install python uv
 ```
 
 Verification command:
 
 ```bash
-python3 --version
+python3 --version   # 3.12 or newer
+uv --version
 ```
 
-You should see output like: `Python 3.11.x`.
+You should see Python `3.12.x` (or newer) and a `uv` version.
 
 #### Step 6: Install jq
 
@@ -287,19 +289,23 @@ You should see output like: `1.0.x`.
 
 #### Step 4: Install tmux, jq, curl, and Python 3
 
-Why this matters: these are required by the bridge runtime and setup scripts.
+Why this matters: these are required by the bridge runtime and setup scripts. The
+bridge needs Python 3.12+ and `uv` (the launcher runs `uv sync` for you on start).
 
 ```bash
 sudo apt install -y tmux jq curl python3
+# uv (Python dependency/venv manager) is not in apt — install via the official script:
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 Verification command:
 
 ```bash
 tmux -V
+uv --version
 ```
 
-You should see output like: `tmux 3.3a`.
+You should see output like: `tmux 3.3a` and a `uv` version.
 
 Verification command:
 

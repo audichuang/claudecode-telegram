@@ -12,6 +12,11 @@
 
 set -uo pipefail
 
+# Prefer the uv-managed venv interpreter (repo-root .venv); fall back to system python3.
+# (This one-liner is stdlib-only, so the fallback is always functionally correct.)
+_HOOK_DIR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -x "$_HOOK_DIR_SELF/../.venv/bin/python" ]]; then PY="$_HOOK_DIR_SELF/../.venv/bin/python"; else PY="python3"; fi
+
 # Read hook payload from stdin
 PAYLOAD=$(cat)
 
@@ -41,7 +46,7 @@ NODE_NAME=$(echo "$TMUX_PREFIX" | sed 's/-$//' | sed 's/^claude-//')
 [ -z "$NODE_NAME" ] && NODE_NAME="default"
 
 # Extract tool name from JSON payload
-TOOL=$(echo "$PAYLOAD" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_name','unknown'))" 2>/dev/null || echo "unknown")
+TOOL=$(echo "$PAYLOAD" | "$PY" -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_name','unknown'))" 2>/dev/null || echo "unknown")
 
 # Write failure signal file (append)
 HOOK_DIR="/tmp/claudecode-telegram/${NODE_NAME}/${WORKER_NAME}/hooks"

@@ -16,6 +16,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Run tests against the uv-managed venv so inline `python3 -c` assertions exercise the
+# locked dependency set (markdown-it-py) instead of whatever sits in system site-packages.
+# Falls back silently to system python3 when uv/.venv are unavailable.
+if command -v uv &>/dev/null; then
+    ( cd "$SCRIPT_DIR" && uv sync --frozen --quiet ) 2>/dev/null || true
+fi
+if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+    export PATH="$SCRIPT_DIR/.venv/bin:$PATH"
+fi
+
 CHAT_ID="${TEST_CHAT_ID:-123456789}"
 BRIDGE_PID=""
 TUNNEL_PID=""
@@ -1626,6 +1637,8 @@ class FakeRouter:
         routed_messages.append(text)
     def reply(self, *args, **kwargs):
         pass
+    def _resolve_media_target(self, caption, msg):
+        return 'testworker'
     def _route_media_message(self, media_text, caption, chat_id, msg_id, msg=None):
         routed_messages.append(media_text)
 
@@ -1680,6 +1693,8 @@ class FakeRouter:
         routed_messages.append(text)
     def reply(self, *args, **kwargs):
         pass
+    def _resolve_media_target(self, caption, msg):
+        return 'testworker'
     def _route_media_message(self, media_text, caption, chat_id, msg_id, msg=None):
         routed_messages.append(media_text)
 
@@ -1821,6 +1836,7 @@ import bridge
 
 bridge.BOT_TOKEN = 'fake'
 bridge.admin_chat_id = 12345
+bridge.state['tts_enabled'] = True  # enable auto-TTS gate (defaults off)
 
 voice_sent = []
 text_sent = []
@@ -9614,6 +9630,8 @@ RESULT_FILE = sys.argv[1]
 EXPECTED = int(sys.argv[2])
 # Simulate TUI processing delay after paste (image path detection + rendering)
 RENDER_DELAY_MS = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+# Deadline scales with send count: serialized sends each carry a ~1s post-paste sleep
+DEADLINE_S = int(sys.argv[4]) if len(sys.argv) > 4 else 8
 
 sys.stdout.buffer.write(b'\033[?2004h')
 sys.stdout.buffer.flush()
@@ -9631,7 +9649,7 @@ rendering = False
 render_end_time = 0
 
 try:
-    deadline = time.time() + 8
+    deadline = time.time() + DEADLINE_S
     while time.time() < deadline:
         readable, _, _ = select.select([sys.stdin], [], [], 0.01)
         if readable:
@@ -9703,7 +9721,7 @@ TUITEST
     rm -f "$result_file"
 
     tmux new-session -d -s "$test_session" -x 200 -y 50 \
-        "python3 /tmp/tui-sim-imgcap-$$.py $result_file $chaos_count $render_delay_ms"
+        "python3 /tmp/tui-sim-imgcap-$$.py $result_file $chaos_count $render_delay_ms 30"
     sleep 1
 
     if ! tmux has-session -t "$test_session" 2>/dev/null; then
@@ -12973,6 +12991,7 @@ test_restart_remote_remaps_cwd_home() {
 
     if python3 -c "
 import json, tempfile, os
+os.environ['HOME'] = '/home/claude'  # pin VPS home so expanduser('~') matches the test's source cwd
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 import bridge

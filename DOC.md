@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 0.31.0
+> Version: 0.32.0
 
 ## Current Philosophy (Summary)
 
@@ -339,6 +339,48 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v0.32.0 - uv-managed toolchain, ruff lint, and a green test suite
+
+**What:** Migrated the project to [uv](https://docs.astral.sh/uv/) for dependency and
+interpreter management, added `ruff` as the linter, and drove the FAST test suite from
+10 failing to **0 failing** by fixing the real bugs and test-setup drift those failures
+were hiding.
+
+**uv migration (runtime + dev):**
+- `pyproject.toml` now declares the one real runtime dep (`markdown-it-py`) — it was
+  previously `dependencies = []`, a latent bug: a synced venv could not import the
+  bridge. Dev tools (`pytest`, `ruff`) live in a `[dependency-groups] dev` group.
+  `requires-python` bumped to `>=3.12` to match the f-string syntax already in the code.
+  `uv.lock` is committed; `package = false` (run-as-script, not installed).
+- A single `$PY` interpreter resolver — prefer the synced `.venv/bin/python`, fall back
+  to system `python3` — now backs **every** Python entry point: the bridge (foreground
+  + background launch), the poll-fallback forwarder, and both hooks
+  (`send-to-telegram.sh`, `on-tool-failure.sh`). Hooks use the venv interpreter directly
+  (not `uv run`) to avoid per-message resolution latency.
+- `cmd_run` does a one-time `uv sync --frozen` at node startup (idempotent; the lock is
+  read-only so concurrent multi-node starts never race), then points `$PY` at the venv.
+  Falls back to system `python3` when `uv` is absent. `test.sh` syncs and prepends
+  `.venv/bin` so tests exercise the locked dependency set, not system site-packages.
+
+**ruff:**
+- Conservative `[tool.ruff]` config (target `py312`, `select = E,F`, line-length 120,
+  ignoring `E402`/`E741`/`E501`). 35 safe autofixes applied (unused imports,
+  placeholder-less f-strings, multi-import splits). 6 findings (`F841`/`E722`/`E731`)
+  left as a deliberate follow-up rather than churning the 10k-line bridge.
+
+**Bugs fixed while getting to green:**
+
+| Fix | Was |
+|-----|-----|
+| `team_memory` package created (graceful, empty-until-indexed) | `/memory` crashed in prod — the package `bridge.py` imports never existed anywhere |
+| `cmd_webhook_info`: `\|\| true` on the grep pipelines | `set -euo pipefail` aborted the command on any no-match / error webhook response |
+| `\s` → `\\s` in transcript-HTML JS regex | invalid Python escape (`SyntaxWarning`; a hard error under `-W error`) |
+| removed dead `return page_html` | unreachable line referencing an undefined name |
+| test-setup drift | FakeRouter `_resolve_media_target` stub, `tts_enabled` toggle, pinned `$HOME`, imgcap pane deadline 8s→30s |
+
+**Result:** FAST suite **350 passed / 0 failed** (was 339 / 10). Multi-node safety
+preserved: shared `.venv`, `--frozen` lock, PID-based stop unchanged.
 
 ### v0.31.0 - Liveness reactions + typing inside the right topic (TOPIC_MODE)
 

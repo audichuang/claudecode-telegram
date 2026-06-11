@@ -4,9 +4,12 @@
 
 When making changes that result in a new version:
 
-1. **Update version** in `claudecode-telegram.sh`:
+1. **Update version** in BOTH `claudecode-telegram.sh` and `pyproject.toml` (keep them in sync):
    ```bash
+   # claudecode-telegram.sh
    VERSION="x.y.z"
+   # pyproject.toml
+   version = "x.y.z"
    ```
 
 2. **Update `DOC.md`** with:
@@ -29,13 +32,31 @@ When making changes that result in a new version:
 - **Minor (0.x.0)**: New features, backward-compatible changes
 - **Major (x.0.0)**: Breaking changes, architecture overhaul
 
+## Toolchain (uv)
+
+The project is **uv-managed**. `pyproject.toml` declares deps (`markdown-it-py` runtime;
+`pytest` + `ruff` in the `dev` group), `uv.lock` is committed, `requires-python >= 3.12`,
+`package = false` (the bridge runs as a script, not an installed package).
+
+- **Setup / deps:** `uv sync` creates `.venv` and installs the locked deps. Re-run after
+  editing `pyproject.toml`, and commit the updated `uv.lock`.
+- **Run anything:** `uv run python bridge.py`, `uv run ruff check .`, `uv run pytest`.
+- **Launch uses a `$PY` resolver:** `claudecode-telegram.sh` + both hooks prefer
+  `.venv/bin/python`, falling back to system `python3`. `cmd_run` runs `uv sync --frozen`
+  once at node startup — the lock stays read-only, so concurrent multi-node starts never
+  race to rewrite it. `test.sh` syncs and prepends `.venv/bin` automatically.
+- **Lint:** `uv run ruff check .` (config in `pyproject.toml`: `select = E,F`, py312).
+
 ## Key Files
 
 | File | Purpose |
 |------|---------|
 | `bridge.py` | Telegram webhook handler, session management |
-| `claudecode-telegram.sh` | CLI wrapper, tunnel/webhook setup |
+| `claudecode-telegram.sh` | CLI wrapper, tunnel/webhook setup, `$PY`/uv-sync launch |
 | `hooks/send-to-telegram.sh` | Claude Stop hook, sends responses |
+| `hooks/on-tool-failure.sh` | PostToolUseFailure hook (POISONED detection) |
+| `team_memory/` | `/memory` stack + search (graceful, empty until an index is built) |
+| `pyproject.toml` / `uv.lock` | uv dependency + interpreter management, ruff config |
 | `test.sh` | Automated acceptance tests |
 | `CLAUDE.md` | Project instructions + operational learnings (AGENTS.md symlink) |
 | `DOC.md` | Design philosophy, changelog |

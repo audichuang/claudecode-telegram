@@ -12,6 +12,11 @@ The test suite supports three modes:
 
 For workflow rules (when to run which mode), see `CLAUDE.md`.
 
+> **uv:** `test.sh` is uv-aware — it runs `uv sync --frozen` and prepends `.venv/bin`
+> to `PATH` at startup, so the inline `python3 -c` assertions exercise the locked
+> dependency set (`markdown-it-py`) rather than system site-packages. If `uv` is not
+> installed it falls back to system `python3` transparently. No manual step needed.
+
 ### What Each Mode Tests
 
 **FAST mode** (no bridge, no network):

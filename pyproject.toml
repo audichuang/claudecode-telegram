@@ -1,9 +1,30 @@
 [project]
 name = "claudecode-telegram"
-version = "0.8.0"
+version = "0.32.0"
 description = "Telegram bridge for Claude Code"
-requires-python = ">=3.10"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = ["markdown-it-py>=3.0"]
 
 [project.scripts]
 claudecode-telegram = "bridge:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.uv]
+# Run as a script project (python bridge.py), not an installed package.
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = ["forge/proto/python"]
+
+[tool.ruff.lint]
+# Conservative ruleset for a large, stdlib-heavy codebase: pyflakes (F) + pycodestyle errors (E).
+select = ["E", "F"]
+ignore = [
+    "E402", # module-level import not at top (VERSION sits above imports in bridge.py)
+    "E741", # ambiguous variable name (cosmetic)
+    "E501", # line too long (not enforced as an error on this 10k-line file yet)
+]

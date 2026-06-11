@@ -3,7 +3,6 @@
 
 VERSION = "0.29.1"
 
-import hashlib
 import os
 import json
 import mimetypes
@@ -5227,7 +5226,7 @@ class WorkerManager:
                 elif peer_host:
                     note = f"On {peer_host}. Uses SSH + paste-buffer -p (bracketed paste). Always prefix your name."
                 elif caller_host:
-                    note = f"On bridge host (cross-machine from caller). Uses SSH + paste-buffer -p. Always prefix your name."
+                    note = "On bridge host (cross-machine from caller). Uses SSH + paste-buffer -p. Always prefix your name."
                 else:
                     note = "Uses paste-buffer -p (bracketed paste) for reliable delivery. Sleep 1s before Enter — TUI needs time to render. Always prefix your name."
                 workers.append({
@@ -6073,7 +6072,7 @@ def handle_grpc_worker_response(name: str, text: str, payload: bytes = b""):
     """Route a gRPC worker response through the same Telegram path as hooks."""
     try:
         if not name or not text:
-            print(f"gRPC response ignored: missing worker name or text")
+            print("gRPC response ignored: missing worker name or text")
             return
 
         chat_id_file = get_chat_id_file(name)
@@ -6977,7 +6976,7 @@ class CommandRouter:
             self.reply(chat_id, "Usage: /rewind <name>\n/rewind team — view team chat", outcome="Needs decision")
             return True
         name = name.lower().strip()
-        import secrets, time as _time
+        import time as _time
         token = secrets.token_urlsafe(32)
         base_url = BRIDGE_PUBLIC_URL or f"http://localhost:{PORT}"
         # Team chat viewer
@@ -7028,7 +7027,7 @@ class CommandRouter:
             return True
 
         # Generate token and serve via existing transcript-like endpoint
-        import secrets, time as _time
+        import time as _time
         token = secrets.token_urlsafe(32)
         PR_REVIEW_TOKENS[token] = {"pr_num": pr_num, "owner": owner, "repo": repo, "expires_at": _time.time() + 300}
         base_url = BRIDGE_PUBLIC_URL or f"http://localhost:{PORT}"
@@ -7070,7 +7069,7 @@ class CommandRouter:
                     f"  Messages: {info.get('total_messages', 0)}",
                     f"  Summaries: {info.get('total_summaries', 0)}",
                     f"  L0 identity: {info['L0_identity']['tokens']} tokens ({info['L0_identity']['agents']} agents, {info['L0_identity']['projects']} projects, {info['L0_identity']['wings']} wings)",
-                    f"  L1 essential: last 7 days, top 15 items",
+                    "  L1 essential: last 7 days, top 15 items",
                 ]
                 self.reply(chat_id, "\n".join(lines))
             except Exception as e:
@@ -7137,7 +7136,8 @@ class CommandRouter:
         if sources:
             lines.append("")
             # Generate a single rewind token for all source links
-            import secrets, time as _time
+            import secrets
+            import time as _time
             tc_token = secrets.token_urlsafe(32)
             REWIND_TOKENS[tc_token] = {"name": "__team__", "expires_at": _time.time() + REWIND_TIMEOUT}
             base_url = BRIDGE_PUBLIC_URL or f"http://localhost:{PORT}"
@@ -7850,7 +7850,7 @@ class CommandRouter:
             target_host, worker_name, backend_name)
         if preflight_fails:
             self.reply(chat_id,
-                f"Preflight failed:\n" + "\n".join(f"  - {f}" for f in preflight_fails))
+                "Preflight failed:\n" + "\n".join(f"  - {f}" for f in preflight_fails))
             return True
 
         # All checks pass
@@ -7998,7 +7998,7 @@ class CommandRouter:
         elif local_commit and remote_commit and local_commit != remote_commit:
             if local_changed:
                 conflicts.append(
-                    f"VPS has uncommitted changes AND different commit than remote")
+                    "VPS has uncommitted changes AND different commit than remote")
             elif remote_changed:
                 # Remote changed, local has new commits — this is the normal case
                 # (VPS got new commits while worker was away, worker made changes)
@@ -8061,7 +8061,7 @@ class CommandRouter:
             print(f"[teleport] {name}: stopped, session_id={session_id}")
 
             if source_cwd and target_cwd:
-                self._teleport_notify(chat_id, f"Syncing working directory...")
+                self._teleport_notify(chat_id, "Syncing working directory...")
                 print(f"[teleport] {name}: syncing {source_cwd} → {target_cwd}")
                 ok = self._sync_working_directory(
                     source_cwd, target_cwd, source_host, target_host, full_sync)
@@ -8222,9 +8222,9 @@ class CommandRouter:
                                            host=target_host):
                             print(f"[teleport] git sync succeeded for {project}")
                             return True
-                        print(f"[teleport] git pull failed, falling back to rsync")
+                        print("[teleport] git pull failed, falling back to rsync")
                     else:
-                        print(f"[teleport] git push failed, falling back to rsync")
+                        print("[teleport] git push failed, falling back to rsync")
                 except Exception as e:
                     print(f"[teleport] git sync error, falling back to rsync: {e}")
 
@@ -8696,7 +8696,7 @@ class CommandRouter:
                     host=target_host, capture_output=True, text=True, timeout=5)
                 if cap.returncode == 0:
                     print(f"[teleport] pane content: {cap.stdout[:300]}")
-        print(f"[teleport] verify FAILED after 30 attempts")
+        print("[teleport] verify FAILED after 30 attempts")
         return False
 
     def _teleport_rollback(self, name, tmux_name, source_host, source_cwd,
@@ -8967,7 +8967,7 @@ class CommandRouter:
                 details = _extract_question_details(raw_lines)
                 if details:
                     if _send_interactive_reply(tmux_name, shortcut, details, host=host):
-                        action = f"Skipped" if shortcut in ("skip", "cancel") else f"Picked option {shortcut}"
+                        action = "Skipped" if shortcut in ("skip", "cancel") else f"Picked option {shortcut}"
                         self.reply(chat_id, f"{action}.")
                         return
 
@@ -9027,7 +9027,8 @@ TEAM_CHAT_MEDIA_DIR = os.path.expanduser("~/team/exports/chat-full")
 
 def _render_md_to_html(md_text):
     """Simple markdown to HTML renderer for file previews."""
-    import re as _re, html as _html
+    import re as _re
+    import html as _html
     h = _html.escape(md_text)
     # Headers
     h = _re.sub(r'^######\s+(.+)$', r'<h6>\1</h6>', h, flags=_re.MULTILINE)
@@ -9064,7 +9065,9 @@ def _render_md_to_html(md_text):
 
 def _render_csv_to_html(csv_text):
     """Render CSV as an HTML table."""
-    import csv as _csv, io as _io, html as _html
+    import csv as _csv
+    import io as _io
+    import html as _html
     esc = _html.escape
     reader = _csv.reader(_io.StringIO(csv_text))
     rows = []
@@ -9626,7 +9629,8 @@ def _transcript_stats(entries: list) -> dict:
 
 def _render_transcript_loading(name: str, sid: str, token: str, sync_key: str) -> str:
     """Render a loading page while transcript syncs from remote host."""
-    import html as html_mod, time as _time
+    import html as html_mod
+    import time as _time
     esc = html_mod.escape
     with _TRANSCRIPT_SYNC_LOCK:
         info = _TRANSCRIPT_SYNC.get(sync_key, {})
@@ -9637,7 +9641,7 @@ def _render_transcript_loading(name: str, sid: str, token: str, sync_key: str) -
     error = info.get("error")
 
     if status == "error":
-        bar_html = f'<div class="bar-fill err" style="width:100%"></div>'
+        bar_html = '<div class="bar-fill err" style="width:100%"></div>'
         msg = f'<p class="err-msg">Error: {esc(error or "Unknown error")}</p>'
         meta_js = ""
     else:
@@ -10658,7 +10662,7 @@ document.addEventListener('keydown', function(e) {{
   var thread = document.getElementById('thread');
   var q = thread && thread.getAttribute('data-search');
   if (!q) return;
-  var terms = q.split(/\s+/).filter(function(t) {{ return t.length > 0; }});
+  var terms = q.split(/\\s+/).filter(function(t) {{ return t.length > 0; }});
   if (!terms.length) return;
   var pattern = new RegExp('(' + terms.map(function(t) {{
     return t.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&');
@@ -10705,7 +10709,6 @@ document.querySelectorAll('.ts[data-ts]').forEach(function(el) {{
 </script>
 </body>
 </html>'''
-    return page_html
 
 
 # ============================================================
@@ -10791,7 +10794,7 @@ class Handler(BaseHTTPRequestHandler):
         if WEBHOOK_SECRET:
             header_token = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
             if header_token != WEBHOOK_SECRET:
-                print(f"Webhook rejected: invalid secret token")
+                print("Webhook rejected: invalid secret token")
                 self.send_response(403)
                 self.end_headers()
                 self.wfile.write(b"Forbidden")
@@ -11896,7 +11899,7 @@ def main():
         print("Webhook verification: enabled")
     else:
         print("Webhook verification: disabled (set TELEGRAM_WEBHOOK_SECRET to enable)")
-    print(f"Hook endpoint auth: disabled (localhost-only)")
+    print("Hook endpoint auth: disabled (localhost-only)")
     if admin_chat_id:
         print(f"Admin: {admin_chat_id} (pre-configured)")
     else:
@@ -11904,7 +11907,7 @@ def main():
 
     # Sandbox status
     if SANDBOX_ENABLED:
-        print(f"Sandbox mode: Workers run in Docker containers")
+        print("Sandbox mode: Workers run in Docker containers")
         print(f"Mounted: {Path.home()} → /workspace")
         if SANDBOX_EXTRA_MOUNTS:
             for host, container, ro in SANDBOX_EXTRA_MOUNTS:

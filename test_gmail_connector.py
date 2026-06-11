@@ -1,7 +1,5 @@
 """Unit tests for gmail_connector.py — TDD inner loop."""
 import base64
-import json
-import pytest
 from unittest.mock import patch, MagicMock
 from gmail_connector import GmailConnector
 

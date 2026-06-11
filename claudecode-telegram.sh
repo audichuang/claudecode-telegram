@@ -9,8 +9,17 @@ set -euo pipefail
 # CONFIG + GLOBALS
 # ============================================================
 
-VERSION="0.31.0"
+VERSION="0.32.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# uv-managed interpreter: prefer the synced .venv, fall back to system python3.
+# Kept in a single var so every python entry point (bridge, poll fallback) uses one policy.
+if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+    PY="$SCRIPT_DIR/.venv/bin/python"
+else
+    PY="python3"
+fi
+export PY
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment variables
@@ -312,7 +321,7 @@ start_poll_fallback() {
     telegram_api "$token" "deleteWebhook" "{}" >/dev/null 2>&1 || true
     sleep 1
 
-    python3 -u -c '
+    "$PY" -u -c '
 import os, time, json, urllib.request, sys
 token, bridge = sys.argv[1], sys.argv[2]
 offset = 0
@@ -457,6 +466,16 @@ cmd_run() {
     check_cmd tmux || { error "tmux not installed"; hint "brew install tmux"; exit 4; }
     check_cmd python3 || { error "python3 not installed"; exit 4; }
 
+    # Sync the uv-managed venv once per launch (idempotent; fast when up-to-date).
+    # All nodes share one checkout + one .venv; --frozen keeps uv.lock read-only so
+    # concurrent node startups never race to rewrite the lock.
+    if check_cmd uv; then
+        ( cd "$SCRIPT_DIR" && uv sync --frozen --quiet ) || warn "uv sync failed; using system python3"
+        [[ -x "$SCRIPT_DIR/.venv/bin/python" ]] && PY="$SCRIPT_DIR/.venv/bin/python" && export PY
+    else
+        warn "uv not found; using system python3 (run 'uv sync' to manage deps)"
+    fi
+
     if ! $no_tunnel && [[ -z "$tunnel_url" ]]; then
         check_cmd cloudflared || { error "cloudflared not installed"; hint "brew install cloudflared (or use --no-tunnel)"; exit 4; }
     fi
@@ -524,7 +543,7 @@ cmd_run() {
     if $no_tunnel; then
         log "$(dim "No tunnel (use external tunnel or local testing)")"
         log "$(dim "Ctrl+C to stop")"
-        exec python3 -u "$SCRIPT_DIR/bridge.py" 2>&1 | tee -a "$bridge_log"
+        exec "$PY" -u "$SCRIPT_DIR/bridge.py" 2>&1 | tee -a "$bridge_log"
     fi
 
     local tunnel_pid=""
@@ -554,7 +573,7 @@ cmd_run() {
     fi
 
     # Start bridge server in background
-    python3 -u "$SCRIPT_DIR/bridge.py" >> "$bridge_log" 2>&1 &
+    "$PY" -u "$SCRIPT_DIR/bridge.py" >> "$bridge_log" 2>&1 &
     local bridge_pid=$!
     echo "$bridge_pid" > "$node_dir/bridge.pid"
     echo "$port" > "$node_dir/port"
@@ -1241,8 +1260,8 @@ cmd_webhook_info() {
         warn "Webhook info unavailable (Telegram API error)"
         return 1
     fi
-    local url; url=$(echo "$r" | grep -o '"url":"[^"]*"' | cut -d'"' -f4)
-    local pending; pending=$(echo "$r" | grep -o '"pending_update_count":[0-9]*' | cut -d: -f2)
+    local url; url=$(echo "$r" | grep -o '"url":"[^"]*"' | cut -d'"' -f4 || true)
+    local pending; pending=$(echo "$r" | grep -o '"pending_update_count":[0-9]*' | cut -d: -f2 || true)
 
     log "Node: $node"
     if [[ -n "$url" ]]; then
