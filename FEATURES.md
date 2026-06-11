@@ -1,4 +1,14 @@
-# claudecode-telegram Product Specification (v0.26.0)
+# claudecode-telegram Product Specification (v0.26.0) — HISTORICAL
+
+> **⚠️ Superseded in v1.0.0.** The bridge is now **topic-only**: one Telegram
+> forum 話題 = one session. The multi-worker surface specified below
+> (/hire /focus /team /end /progress /pause /restart, @mentions, teleport,
+> codex/gemini/opencode backends, gRPC, /register) was **deleted**.
+> Current behavior: `DOC.md` (v1.0.0 changelog + philosophy) and
+> `docs/superpowers/specs/2026-06-10-topic-sessions-design.md` +
+> `2026-06-11-topic-only-v1-design.md`. This file is kept as a record of the
+> multi-worker era.
+
 
 ## Overview
 - MUST provide a Telegram bot plus an HTTP bridge that routes manager messages to multiple workers and returns worker responses to Telegram.

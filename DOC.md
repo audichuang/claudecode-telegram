@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 0.30.1
+> Version: 1.0.0
 
 ## Current Philosophy (Summary)
 
@@ -14,7 +14,7 @@
 | **Token isolation** | `TELEGRAM_BOT_TOKEN` never leaves bridge process |
 | **Admin config** | Pre-set via `ADMIN_CHAT_ID` or auto-learn first user |
 | **Secure by default** | 0o700 dirs, 0o600 files, silent rejection of non-admins |
-| **Decentralized worker comms** | Bridge provides discovery only; workers communicate directly via protocol |
+| **話題 IS the addressing** | One forum topic = one session; no focus/active state, no worker names to type |
 
 ---
 
@@ -339,6 +339,198 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.0.0 - Topic-only bridge (the multi-worker era is deleted)
+
+**BREAKING:** the legacy non-topic router is gone. One Telegram forum 話題 =
+one session is the ONLY model; `TOPIC_MODE` is hardwired True (the env var is
+no longer consulted). bridge.py shrank 12,219 → 9,846 lines; test.sh dropped
+~5.5k lines of tests for deleted machinery (275 FAST tests remain, all green).
+
+**Topic lifecycle is symmetric (C1):**
+- `forum_topic_closed` ends the bound session (same exit as `/close`);
+  `forum_topic_reopened` acts as a fresh topic (folder picker when unbound).
+- Deleted topics emit NO Telegram event — a reply bouncing with
+  "message thread not found" reaps the session (no retry into the void).
+
+**No focus/active state (C3):** `hire()` no longer set_focus; startup no
+longer restores a "last active worker"; both startup notifications unified to
+"✅ Bridge 上線 — N 個話題 session 存活". `state["active"]`, `set_focus`,
+`save/load_last_active`, `LAST_ACTIVE_FILE` deleted.
+
+**Media works inside topics (was silently dropped):** photos/files/GIF/audio/
+video/sticker download into the session inbox and route as local paths; voice
+transcribes transparently. Media before the folder pick is trigger-only.
+
+**Deleted (C4):**
+- Orchestration: `/hire /focus /team /end /progress /pause /restart`,
+  per-worker `/<name>` shortcuts, `@mention`/`@all`, restart-all, the legacy
+  `BOT_COMMANDS` menu, `_last_mention`.
+- Teleport (1,355 lines): commands, git push/pull state, preflight/rollback,
+  registry fields; `get_worker_host()` is hardwired None (all sessions local;
+  remaining `host=` branches are provably dead, to fold in a cosmetic pass).
+- Backends: Codex/Gemini/OpenCode adapters (`BACKENDS={"claude"}`), worker
+  pipes' non-interactive users, the gRPC server, the `/register` forge endpoint.
+
+**Kept:** watchdog/typing/emoji liveness, transport seam (telegram/local),
+hook reply path, `/cd /close /memory /quota /voice /settings /rewind /pr`,
+multi-node prod/dev/test isolation (shell layer), team memory, uv toolchain.
+
+### v0.34.0 - First message is a trigger, never a task
+
+**Root cause (confirmed via getUpdates/getWebhookInfo):** Telegram does not
+commit a forum topic until its first message is sent — creating a topic without
+typing produces **zero** updates for the bot (`pending_update_count: 0`), so
+"show the picker on creation, before any typing" is physically impossible.
+The `forum_topic_created` service message arrives *together with* the first
+user message (≈1s apart).
+
+**New design — the first message is the trigger Telegram requires, nothing more:**
+- An unknown topic's first message only summons the folder picker. It is never
+  stashed, never forwarded — the `_pending_topic_text` mechanism is removed, and
+  `open_topic_session()` always sends the welcome alone.
+- Grace window (`_PICKER_GRACE_SECS = 5s`): the creation-companion message that
+  lands right after the picker is swallowed silently (no "請點按鈕" noise).
+  Text typed later, while the picker is still open, gets the nudge.
+- The picker text explains itself: "第一則訊息只是開啟選單的觸發，不會傳給 AI"。
+- Picker send failures are logged loudly (a dropped picker reads as "bot 已讀不回").
+
+**Flow:** 建話題（Telegram 強制要打一句）→ 選單出現（那句話被吞掉）→
+點資料夾 → worker 在該目錄誕生並打一次招呼 → 之後的訊息才是任務。
+
+### v0.33.0 - Topic spawn fix + topic-native command surface
+
+**Spawn fix (the "測試546 → cwd cc-switch546" bug):**
+- A new topic's worker pane was started in the bridge's cwd, then `cd <pick>` was
+  injected and `#{pane_current_path}` read back 0.2s later — a fresh shell racing
+  trust-prompt/welcome keystrokes yielded a mangled path with the worker name stuck
+  on (`cc-switch546`). Root fix: `tmux new-session -c <cwd>` so the pane is **born**
+  in the picked dir — no cd injection, no readback, no race. Persist `startup_cwd`
+  directly (matches `restart()`).
+- Naming: `_sanitize_topic_name` dropped CJK/accented letters, so "測試546" became a
+  misleading "546". Now returns '' when meaningful non-ASCII letters are dropped, and
+  `resolve_topic_session_name` also rejects pure-numeric and reserved names → falls
+  back to `t<thread_id>`.
+- A typed reply (e.g. "2") while a topic's folder picker is open is no longer leaked
+  to the worker — `_awaiting_folder` guards it. `/cd <path>` is clamped under
+  TOPIC_ROOT and must be a real dir.
+
+**Topic-native command surface (slimdown):** one 話題 = one session, so the
+multi-worker orchestration surface is vestigial inside a topic.
+- Legacy commands (`/hire /focus /team /end /progress /pause /restart /teleport*`)
+  are intercepted with a "話題模式不需要" hint instead of leaking to the worker.
+- Global commands (`/memory /voice /settings /rewind /pr /pilot`) are delegated so
+  they actually work in a topic (they leaked before).
+- The Telegram command menu is a slim fixed set in TOPIC_MODE (no per-worker
+  `/<name>` shortcuts); the worker welcome drops the `/workers`/name-prefix/
+  cross-machine framing.
+- **Kept** (a deeper "C" decision, untouched): the session-spawn primitive,
+  watchdog/liveness reactions, remote/teleport, worker pipes.
+
+FAST suite: 358 passed / 0 failed.
+
+### v0.32.0 - uv-managed toolchain, ruff lint, and a green test suite
+
+**What:** Migrated the project to [uv](https://docs.astral.sh/uv/) for dependency and
+interpreter management, added `ruff` as the linter, and drove the FAST test suite from
+10 failing to **0 failing** by fixing the real bugs and test-setup drift those failures
+were hiding.
+
+**uv migration (runtime + dev):**
+- `pyproject.toml` now declares the one real runtime dep (`markdown-it-py`) — it was
+  previously `dependencies = []`, a latent bug: a synced venv could not import the
+  bridge. Dev tools (`pytest`, `ruff`) live in a `[dependency-groups] dev` group.
+  `requires-python` bumped to `>=3.12` to match the f-string syntax already in the code.
+  `uv.lock` is committed; `package = false` (run-as-script, not installed).
+- A single `$PY` interpreter resolver — prefer the synced `.venv/bin/python`, fall back
+  to system `python3` — now backs **every** Python entry point: the bridge (foreground
+  + background launch), the poll-fallback forwarder, and both hooks
+  (`send-to-telegram.sh`, `on-tool-failure.sh`). Hooks use the venv interpreter directly
+  (not `uv run`) to avoid per-message resolution latency.
+- `cmd_run` does a one-time `uv sync --frozen` at node startup (idempotent; the lock is
+  read-only so concurrent multi-node starts never race), then points `$PY` at the venv.
+  Falls back to system `python3` when `uv` is absent. `test.sh` syncs and prepends
+  `.venv/bin` so tests exercise the locked dependency set, not system site-packages.
+
+**ruff:**
+- Conservative `[tool.ruff]` config (target `py312`, `select = E,F`, line-length 120,
+  ignoring `E402`/`E741`/`E501`). 35 safe autofixes applied (unused imports,
+  placeholder-less f-strings, multi-import splits). 6 findings (`F841`/`E722`/`E731`)
+  left as a deliberate follow-up rather than churning the 10k-line bridge.
+
+**Bugs fixed while getting to green:**
+
+| Fix | Was |
+|-----|-----|
+| `team_memory` package created (graceful, empty-until-indexed) | `/memory` crashed in prod — the package `bridge.py` imports never existed anywhere |
+| `cmd_webhook_info`: `\|\| true` on the grep pipelines | `set -euo pipefail` aborted the command on any no-match / error webhook response |
+| `\s` → `\\s` in transcript-HTML JS regex | invalid Python escape (`SyntaxWarning`; a hard error under `-W error`) |
+| removed dead `return page_html` | unreachable line referencing an undefined name |
+| test-setup drift | FakeRouter `_resolve_media_target` stub, `tts_enabled` toggle, pinned `$HOME`, imgcap pane deadline 8s→30s |
+
+**Result:** FAST suite **350 passed / 0 failed** (was 339 / 10). Multi-node safety
+preserved: shared `.venv`, `--frozen` lock, PID-based stop unchanged.
+
+### v0.31.0 - Liveness reactions + typing inside the right topic (TOPIC_MODE)
+
+**Problem:** The user could see "已讀" and "正在打字…" but had no way to tell a
+*thinking* worker from a *dead/stuck* one. Both signals were driven purely by the
+`pending` file flag (set on receipt, cleared only by the Stop hook), so a crashed
+or hung worker showed "typing…" forever. Worse, the typing indicator was sent at
+chat level with no `message_thread_id`, so it appeared in the group's **General**
+view instead of inside the 話題 the user was actually chatting in.
+
+**What:** The bridge already computes a precise per-worker state every 4s
+(`compute_state` → `BUSY_THINKING` / `WAITING` / `STUCK` / `DEAD` / …) but only used
+it for admin alerts. TOPIC_MODE now surfaces that state to the user as an evolving
+reaction on their triggering message, and keeps the familiar one-on-one typing feel:
+
+| State | Reaction | Typing |
+|-------|----------|--------|
+| received & pasted | 👀 | on |
+| actively thinking / running tools | ✍ | on |
+| stuck / poisoned / dead | 😴 | **stops** |
+| response delivered | 👍 | off |
+
+- `topic_reaction_for_state()` / `topic_request_stalled()` — pure state→emoji /
+  stop-typing mapping (only Telegram's default allowed reaction emojis are used).
+- `_update_topic_reaction()` is called from the watchdog each tick; it dedups so the
+  Telegram API is hit only when the emoji actually changes.
+- `route_message` records the in-flight `(chat_id, msg_id)`; `deliver_hook_response`
+  stamps it 👍 and stops tracking so a late watchdog tick can't clobber it.
+- `send_chat_action` now carries `message_thread_id` across all transports, and
+  `send_typing_loop` resolves the topic thread via `load_topic_meta` so "typing…"
+  lands **inside the 話題** (thread `0`/non-forum → omitted, shows in the main chat).
+
+### Topic Sessions (TOPIC_MODE) — forum threads as sessions
+
+**What:** When enabled, each Telegram forum **Topic (話題)** maps to its own
+Claude session. Sending into a thread routes to that thread's worker; opening a
+new thread shows a root-confined folder picker to choose the session's cwd.
+Hook replies are delivered back into the originating thread. `/quota` reports
+subscriber rate-limit usage; `/close` ends the thread's session; `/cd` changes
+its folder (with a path arg) or reopens the picker (bare).
+
+**Non-forum fallback:** A plain DM with no `message_thread_id` maps to one fixed
+default session named `tmain` (stored as thread `0`), using the same open/route
+logic keyed by chat only. This lets the feature work in a regular DM chat, not
+just forum groups.
+
+**Setup:**
+
+1. **Enable the mode.** Set `TOPIC_MODE=1` in the node's environment. It is
+   **default OFF**; legacy single-chat behavior is unchanged when unset.
+2. **Confine the folder picker (optional).** Set `TOPIC_ROOT` to the directory
+   the picker is rooted at (default `~`). The navigator cannot escape above this
+   root — `cd:`/`use:` paths are clamped via `_norm_under_root`.
+3. **Forum group + bot admin.** Convert the Telegram group to a **forum**
+   (Topics enabled) and make the bot an **admin** so it can read
+   `message_thread_id` and post into specific threads. Each Topic then drives an
+   independent session.
+4. **`/quota` data (optional).** Point claude-hud's `externalUsageWritePath` at
+   the bridge's `CC_USAGE_FILE` (default `~/.claude/cc-usage.json`) so `/quota`
+   can render the 5h / 7d subscriber usage bars. Stale snapshots (>10 min) and a
+   missing file both fall back to an "unavailable" message.
 
 ### v0.30.1 - Caller-aware `/workers?from=<name>` for cross-machine sends
 

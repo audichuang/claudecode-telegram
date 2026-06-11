@@ -10,8 +10,7 @@ import subprocess
 import re
 import sqlite3
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 CACHE_DB = os.environ.get("PR_CACHE_DB", "/tmp/pr-review-cache.db")
 USER_PROFILE_TTL = 86400  # 24 hours
@@ -1799,7 +1798,7 @@ def _format_comment_with_context(comment_body, pr_num, path, line, context_snipp
 def _notify_telegram(comment_body, pr_num, path, line, context_snippet=None, short_sha=""):
     """Send PR comment notification to Telegram via bridge's /notify endpoint."""
     bridge_url = os.environ.get("BRIDGE_URL", "http://localhost:8271")
-    text = f"\U0001f4ac " + _format_comment_with_context(
+    text = "\U0001f4ac " + _format_comment_with_context(
         comment_body, pr_num, path, line, context_snippet, short_sha)
     try:
         import urllib.request
@@ -1835,7 +1834,8 @@ def _route_mentions_to_workers(comment_body, pr_num, path, line, context_snippet
         if target_session not in active_sessions:
             continue
         try:
-            import tempfile as _tf, uuid as _uuid
+            import tempfile as _tf
+            import uuid as _uuid
             buf_name = f"pr-{_uuid.uuid4().hex[:8]}"
             fd, tmpfile = _tf.mkstemp(suffix=".msg", prefix="pr-send-")
             try:

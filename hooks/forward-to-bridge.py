@@ -4,7 +4,6 @@
 Bridge handles markdown->Telegram HTML conversion via markdown-it-py.
 """
 
-import os
 import sys
 import json
 import urllib.error

@@ -59,7 +59,7 @@ class GitHubConnector(BaseConnector):
             if seed:
                 print(f"[github] First run — seeded {len(seed)} existing events as seen")
             else:
-                print(f"[github] First run — no events to seed")
+                print("[github] First run — no events to seed")
         else:
             print(f"[github] Restart — {self._seen_id_count()} events already tracked, skipping seed")
         print(f"[github] Started (interval={self.poll_interval}s, repo={self.repo}, user={self.from_user}, since={self._last_poll_time})")

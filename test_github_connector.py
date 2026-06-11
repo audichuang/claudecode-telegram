@@ -1,11 +1,8 @@
 """Tests for github_connector.py"""
 
-import json
-import time
 import threading
 from unittest.mock import patch, MagicMock
 
-import pytest
 from github_connector import GitHubConnector
 from base_connector import CONSECUTIVE_FAIL_WARN
 

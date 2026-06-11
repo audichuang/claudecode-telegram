@@ -20,10 +20,19 @@ INPUT=$(cat)
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path')
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Get session name from tmux (works even without TMUX env var)
-# In Docker/sandbox mode, fall back to BRIDGE_SESSION env var
+# Get session name from THIS hook's own tmux pane only.
+# IMPORTANT: resolve via $TMUX_PANE, and only when it is set. A bare
+# `tmux display-message` (or `-t ""`) falls back to the server's *active*
+# session, so a Claude Code session NOT running inside its own tmux pane
+# (e.g. a plain CLI session, or an orchestrator session) would otherwise
+# leak its output into whichever worker happens to be active. Gate on
+# $TMUX_PANE so non-worker sessions never forward.
+# In Docker/sandbox mode, fall back to BRIDGE_SESSION env var.
 # ─────────────────────────────────────────────────────────────────────────────
-SESSION_NAME=$(tmux display-message -p '#{session_name}' 2>/dev/null || true)
+SESSION_NAME=""
+if [ -n "${TMUX_PANE:-}" ]; then
+    SESSION_NAME=$(tmux display-message -t "$TMUX_PANE" -p '#{session_name}' 2>/dev/null || true)
+fi
 if [ -z "$SESSION_NAME" ] && [ -n "${BRIDGE_SESSION:-}" ]; then
     # Docker mode: use BRIDGE_SESSION env var directly
     SESSION_NAME="${TMUX_PREFIX:-claude-}${BRIDGE_SESSION}"
@@ -195,6 +204,8 @@ fi
 
 # Forward to bridge (non-blocking with timeout)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Prefer the uv-managed venv interpreter (repo-root .venv); fall back to system python3.
+if [[ -x "$SCRIPT_DIR/../.venv/bin/python" ]]; then PY="$SCRIPT_DIR/../.venv/bin/python"; else PY="python3"; fi
 TMPFILE=$(mktemp)
 echo "$TEXT" > "$TMPFILE"
 
@@ -209,7 +220,7 @@ if ! command -v timeout &>/dev/null; then
     fi
 fi
 (
-    ${TIMEOUT_CMD:+$TIMEOUT_CMD 5} python3 "$SCRIPT_DIR/forward-to-bridge.py" "$TMPFILE" "$BRIDGE_SESSION" "$BRIDGE_ENDPOINT" "$SESSION_ID"
+    ${TIMEOUT_CMD:+$TIMEOUT_CMD 5} "$PY" "$SCRIPT_DIR/forward-to-bridge.py" "$TMPFILE" "$BRIDGE_SESSION" "$BRIDGE_ENDPOINT" "$SESSION_ID"
     rm -f "$TMPFILE"
 ) &
 

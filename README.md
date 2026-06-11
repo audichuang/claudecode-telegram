@@ -161,21 +161,23 @@ tmux -V
 
 You should see output like: `tmux 3.4`.
 
-#### Step 5: Install Python 3
+#### Step 5: Install Python 3 and uv
 
-Why this matters: the bridge is written in Python.
+Why this matters: the bridge is written in Python (3.12+), and `uv` manages its
+dependencies and virtual environment (the launcher runs `uv sync` for you on start).
 
 ```bash
-brew install python
+brew install python uv
 ```
 
 Verification command:
 
 ```bash
-python3 --version
+python3 --version   # 3.12 or newer
+uv --version
 ```
 
-You should see output like: `Python 3.11.x`.
+You should see Python `3.12.x` (or newer) and a `uv` version.
 
 #### Step 6: Install jq
 
@@ -287,19 +289,23 @@ You should see output like: `1.0.x`.
 
 #### Step 4: Install tmux, jq, curl, and Python 3
 
-Why this matters: these are required by the bridge runtime and setup scripts.
+Why this matters: these are required by the bridge runtime and setup scripts. The
+bridge needs Python 3.12+ and `uv` (the launcher runs `uv sync` for you on start).
 
 ```bash
 sudo apt install -y tmux jq curl python3
+# uv (Python dependency/venv manager) is not in apt — install via the official script:
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 Verification command:
 
 ```bash
 tmux -V
+uv --version
 ```
 
-You should see output like: `tmux 3.3a`.
+You should see output like: `tmux 3.3a` and a `uv` version.
 
 Verification command:
 
@@ -585,49 +591,41 @@ If this fails:
 
 ### Part 6: Start Using It in Telegram (1 min)
 
-#### Step 1: Open your bot chat
+#### Step 1: Set up a forum group
 
-Why this matters: all manager/operator actions happen in Telegram.
+Why this matters: the bridge is topic-only — one forum 話題 (topic) = one Claude session.
 
-1. Open Telegram.
-2. Search for your bot username from BotFather.
-3. Press **Start**.
+1. Create a Telegram group and enable **Topics** (話題) in group settings.
+2. Add your bot to the group and make it **admin**.
 
-#### Step 2: Hire your first worker
+#### Step 2: Open your first session
 
-Why this matters: no one can receive tasks until a worker exists.
+Why this matters: a session is born when you create a topic and pick its folder.
 
-Send this in Telegram:
-
-```bash
-/hire myworker
-```
-
-You should see confirmation that worker `myworker` was created.
-
-If this fails:
-- Error: `No one assigned` on later messages.
-- Fix: run `/team` then `/focus myworker`.
+1. Create a new 話題 and type anything (Telegram requires a first message —
+   it is only a trigger and is never sent to Claude).
+2. A folder picker appears. Tap through to the project folder and confirm.
+3. The session starts there and greets you once.
 
 #### Step 3: Send your first task
 
-Why this matters: this validates end-to-end delivery from Telegram to worker and back.
+Why this matters: this validates end-to-end delivery from Telegram to the session and back.
 
-Send this in Telegram:
+Send this in the 話題:
 
 ```bash
 Summarize today’s priorities from our latest commit messages.
 ```
 
 What to expect:
-1. Bot reacts with `👀` (delivery confirmed).
-2. Worker replies as `myworker: ...`.
+1. Bot reacts with `👀` (delivery confirmed), evolving to `✍`/`👍`.
+2. The session replies in the same 話題.
 
 If this fails:
 - Symptom: no `👀` reaction.
 - Fix: verify `TELEGRAM_BOT_TOKEN` and bridge status.
-- Symptom: `👀` appears but no reply.
-- Fix: run `/progress`, then `/restart` if the worker is stuck.
+- Symptom: `👀` appears but no reply (`😴` shows up).
+- Fix: `/cd <path>` to restart in place, or `/close` and recreate the 話題.
 
 ---
 
@@ -636,9 +634,9 @@ If this fails:
 ### For Managers (Telegram only)
 
 1. Ask your operator to complete setup once.
-2. Open the bot in Telegram.
-3. Send `/hire myworker`.
-4. Start assigning work in plain English.
+2. Open the forum group in Telegram.
+3. Create a 話題 per workstream and pick its folder.
+4. Start assigning work in plain English — each 話題 is its own session.
 
 ### For Operators (normal startup)
 
@@ -649,20 +647,12 @@ If this fails:
 
 ### Real Commands (from our real workflow)
 
-1. `/hire ops`
-2. `/hire triage`
-3. `/hire research`
-4. `/hire frontend`
-5. `/hire qa`
-6. `/ops Run 5 worker queue: scrape refunds, reconcile invoices, update CRM notes, draft escalation email, and ping @qa for flaky test owners`
-7. `/triage Triage the latest GitHub issues; label, close dupes, and summarize top 10 with links`
-8. `/research Compare auth flows across api/, web/, and mobile/ repos; highlight inconsistencies + suggested fix`
-9. `/frontend Audit the settings UI for missing states and propose copy improvements`
-10. `/qa Reproduce the top crash from yesterday and draft a minimal repro`
-11. `@ops Coordinate with @frontend on status banner copy; @research share findings with @triage`
-12. `/progress`
-13. `/progress` (later, when you return)
-14. `@ops Post the nightly summary + anything blocked`
+1. Create 話題 `ops`, `triage`, `research` — one per workstream, each in its own folder.
+2. In `ops`: `Run the queue: scrape refunds, reconcile invoices, update CRM notes, draft the escalation email`
+3. In `triage`: `Triage the latest GitHub issues; label, close dupes, and summarize top 10 with links`
+4. In `research`: `Compare auth flows across api/, web/, and mobile/ repos; highlight inconsistencies + suggested fix`
+5. Switching sessions = tapping a different 話題 (native Telegram, no commands).
+6. The message reaction (👀 ✍ 😴 👍) tells you whether each session is alive and working.
 
 You can also drop a screenshot and ask: `What is wrong with this UI?`
 
@@ -672,24 +662,18 @@ You can also drop a screenshot and ask: `What is wrong with this UI?`
 
 | Command | What it does |
 |---------|--------------|
-| `/hire <name>` | Add a worker |
-| `/focus <name>` | Set who gets your next message |
-| `/progress` | See if the focused worker is busy |
-| `/team` | List workers + focus |
-| `/end <name>` | Remove a worker |
-| `/pause` | Interrupt active worker |
-| `/restart` | Restart active worker |
-| `/restart --clean` | Restart with fresh context |
-| `/learn` | Ask focused worker what they learned |
-| `@name <msg>` | Send one-off message to a specific worker |
-| `<message>` | Send to current focused worker |
+| 新話題 + 第一則訊息 | Open a session (folder picker appears; the message is just the trigger) |
+| `/cd <path>` | Switch this topic's working folder (restarts in place) |
+| `/close` | End this topic's session (closing the 話題 does the same) |
+| `/memory <query>` | Search team chat memory |
+| `/quota` | Show subscriber usage |
+| `/voice on\|off` | Toggle voice replies |
+| `/settings` | Show settings |
+| `/rewind <name>` | Transcript viewer |
+| `/pr <github_pr_url>` | PR review viewer |
+| `<message>` | Send to this topic's session |
 
-Backend selection examples:
-- `/hire alice --codex`
-- `/hire codex-alice`
-- `/hire gemini-worker --gemini`
-- `/hire op-worker --opencode`
-- `/hire custom --backend <name>`
+Claude is the only backend (codex/gemini/opencode were removed in v1.0.0).
 
 ### Shell commands
 
@@ -732,8 +716,8 @@ Backend selection examples:
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | Bot doesn't respond | Bridge down or wrong admin | Run `./claudecode-telegram.sh status` and restart if needed |
-| `👀` but no reply | Worker busy or stuck | Run `/progress`, then `/restart` |
-| `No one assigned` | No focused worker | Run `/team`, then `/focus <name>` |
+| `👀` but no reply | Session busy or stuck | Watch the reaction: `✍` = working, `😴` = stalled → `/cd <path>` to restart in place |
+| Picker never appears | Topic not committed | Type any message in the new 話題 (Telegram needs a first message) |
 
 ### `OAuth error: Invalid code`
 
@@ -912,7 +896,7 @@ Fix:
 ./claudecode-telegram.sh hook install
 ```
 
-Then restart your Claude worker session (`/restart`) or end/hire worker again.
+Then restart the session in its 話題 (`/cd <same-path>`), or `/close` and recreate the 話題.
 
 ## Security Hardening (Optional)
 
@@ -974,7 +958,7 @@ The bridge passes this to Telegram during webhook setup and verifies it on every
 ## Gotchas & Limits
 
 - **Single admin**: First person to message becomes admin unless `ADMIN_CHAT_ID` is set.
-- **Focus resets + context persists**: After restart, run `/focus` again. Want a clean slate? `/end <name>` then `/hire <name>`.
+- **One 話題 = one session**: want a clean slate? `/close` the 話題 and create a new one.
 - **Telegram limits**: Long replies split after 4096 chars.
 
 ## Project Structure

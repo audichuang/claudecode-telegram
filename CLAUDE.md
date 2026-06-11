@@ -4,9 +4,15 @@
 
 When making changes that result in a new version:
 
-1. **Update version** in `claudecode-telegram.sh`:
+1. **Update version** in ALL THREE of `claudecode-telegram.sh`, `pyproject.toml`,
+   AND `bridge.py` (keep them in sync — `/settings` reports bridge.py's copy):
    ```bash
+   # claudecode-telegram.sh
    VERSION="x.y.z"
+   # pyproject.toml
+   version = "x.y.z"
+   # bridge.py
+   VERSION = "x.y.z"
    ```
 
 2. **Update `DOC.md`** with:
@@ -29,13 +35,31 @@ When making changes that result in a new version:
 - **Minor (0.x.0)**: New features, backward-compatible changes
 - **Major (x.0.0)**: Breaking changes, architecture overhaul
 
+## Toolchain (uv)
+
+The project is **uv-managed**. `pyproject.toml` declares deps (`markdown-it-py` runtime;
+`pytest` + `ruff` in the `dev` group), `uv.lock` is committed, `requires-python >= 3.12`,
+`package = false` (the bridge runs as a script, not an installed package).
+
+- **Setup / deps:** `uv sync` creates `.venv` and installs the locked deps. Re-run after
+  editing `pyproject.toml`, and commit the updated `uv.lock`.
+- **Run anything:** `uv run python bridge.py`, `uv run ruff check .`, `uv run pytest`.
+- **Launch uses a `$PY` resolver:** `claudecode-telegram.sh` + both hooks prefer
+  `.venv/bin/python`, falling back to system `python3`. `cmd_run` runs `uv sync --frozen`
+  once at node startup — the lock stays read-only, so concurrent multi-node starts never
+  race to rewrite it. `test.sh` syncs and prepends `.venv/bin` automatically.
+- **Lint:** `uv run ruff check .` (config in `pyproject.toml`: `select = E,F`, py312).
+
 ## Key Files
 
 | File | Purpose |
 |------|---------|
 | `bridge.py` | Telegram webhook handler, session management |
-| `claudecode-telegram.sh` | CLI wrapper, tunnel/webhook setup |
+| `claudecode-telegram.sh` | CLI wrapper, tunnel/webhook setup, `$PY`/uv-sync launch |
 | `hooks/send-to-telegram.sh` | Claude Stop hook, sends responses |
+| `hooks/on-tool-failure.sh` | PostToolUseFailure hook (POISONED detection) |
+| `team_memory/` | `/memory` stack + search (graceful, empty until an index is built) |
+| `pyproject.toml` / `uv.lock` | uv dependency + interpreter management, ruff config |
 | `test.sh` | Automated acceptance tests |
 | `CLAUDE.md` | Project instructions + operational learnings (AGENTS.md symlink) |
 | `DOC.md` | Design philosophy, changelog |
@@ -46,7 +70,7 @@ When making changes that result in a new version:
 Workflow rules:
 - Use FAST mode during development (TDD inner loop); run default mode before committing; run FULL mode before pushing.
 - Write tests alongside features; focus on e2e behavior (not scaffolding).
-- Treat tests as usage examples; prefer real Telegram flows (hire → send → reply) and keep them deterministic.
+- Treat tests as usage examples; prefer real Telegram flows (開話題 → 選資料夾 → send → reply) and keep them deterministic.
 - When adding tests, follow `TEST.md`.
 - See `TEST.md` for mode definitions, env vars, isolation details, inventories, and manual/CI instructions.
 
@@ -190,6 +214,29 @@ SESSIONS_DIR="$HOME/.claude/telegram/sessions"
 4. Consider skipping watchdog tests in CI (mark as slow/optional)
 5. Ensure `start_bridge()` passes ALL required env vars, not just token/port
 6. Add explicit stop conditions (max retries or timeouts) and log when the watchdog gives up
+
+### Bridge processes MUST be setsid-detached (the 07:47 silent-death lesson)
+
+**Problem:** The dev bridge died silently twice (2026-06-10 20:21, 2026-06-11 07:47):
+last log line was a successful `POST /response`, then nothing — no shutdown banner,
+no traceback. Forensics ruled out OOM/kernel kills (journal readable & empty),
+graceful signals (SIGTERM/SIGINT print a banner since v0.4.0), the test suite
+(it only ever kills :8295/:8096), and manual kills (shell history + transcripts clean).
+
+**Root cause:** the bridge was launched under an interactive host — a foreground
+`./claudecode-telegram.sh run` whose parent was a terminal/Claude-session shell.
+When that host went away (terminal closed / session shell reclaimed), the whole
+process group got SIGHUP/SIGKILL, which Python dies from **silently** (no handler
+can run for SIGKILL; SIGHUP's default action prints nothing).
+
+**Rule:** ALWAYS launch the bridge fully detached so no host teardown can reach it:
+```bash
+setsid bash -c '... exec ./.venv/bin/python -u bridge.py >> "$NODE/bridge.log" 2>&1' \
+  </dev/null >/dev/null 2>&1 &
+```
+Verify afterwards: the bridge's PPID must be 1. Every setsid-launched restart since
+leaves a clean `Received SIGTERM` banner on shutdown — the silent-death mode is
+extinct unless someone launches it attached again.
 
 ### NEVER use pkill on multi-node setups
 
