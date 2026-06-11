@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code <-> Telegram Bridge - Multi-Session Control Panel"""
 
-VERSION = "0.29.1"
+VERSION = "1.0.0"
 
 import os
 import json
@@ -131,7 +131,6 @@ API_ENDPOINTS = {
     "GET /pr-review/<pr_num>": "PR review viewer with diff, search, file navigation",
     "POST /response": "Hook: send Claude response to Telegram",
     "POST /notify": "Send notification to all admin chats",
-    "POST /register": "Forge worker registration (name, host, version, tools)",
 }
 
 # Sandbox mode: run Claude Code in Docker container for isolation
@@ -959,25 +958,25 @@ class MessageTransport:
     def send_text(self, chat_id, text, parse_mode=None, reply_to=None, message_thread_id=None) -> dict | None:
         raise NotImplementedError
 
-    def send_photo(self, chat_id, photo_path, caption=None) -> bool:
+    def send_photo(self, chat_id, photo_path, caption=None, message_thread_id=None) -> bool:
         raise NotImplementedError
 
-    def send_document(self, chat_id, doc_path, caption=None) -> bool:
+    def send_document(self, chat_id, doc_path, caption=None, message_thread_id=None) -> bool:
         raise NotImplementedError
 
-    def send_animation(self, chat_id, animation_path, caption=None) -> bool:
+    def send_animation(self, chat_id, animation_path, caption=None, message_thread_id=None) -> bool:
         raise NotImplementedError
 
-    def send_video(self, chat_id, video_path, caption=None) -> bool:
+    def send_video(self, chat_id, video_path, caption=None, message_thread_id=None) -> bool:
         raise NotImplementedError
 
-    def send_audio(self, chat_id, audio_path, caption=None) -> bool:
+    def send_audio(self, chat_id, audio_path, caption=None, message_thread_id=None) -> bool:
         raise NotImplementedError
 
-    def send_voice(self, chat_id, voice_path, caption=None) -> bool:
+    def send_voice(self, chat_id, voice_path, caption=None, message_thread_id=None) -> bool:
         raise NotImplementedError
 
-    def send_sticker(self, chat_id, sticker_path) -> bool:
+    def send_sticker(self, chat_id, sticker_path, message_thread_id=None) -> bool:
         raise NotImplementedError
 
     def send_chat_action(self, chat_id, action, message_thread_id=None) -> None:
@@ -1080,7 +1079,7 @@ class TelegramTransport(MessageTransport):
         # Use module-level telegram_api so tests can mock bridge.telegram_api
         return telegram_api("sendMessage", payload)
 
-    def send_photo(self, chat_id, photo_path, caption=None) -> bool:
+    def send_photo(self, chat_id, photo_path, caption=None, message_thread_id=None) -> bool:
         if not BOT_TOKEN:
             return False
         ok, validated = validate_photo_path(photo_path)
@@ -1095,6 +1094,11 @@ class TelegramTransport(MessageTransport):
         body_parts.append(b'Content-Disposition: form-data; name="chat_id"')
         body_parts.append(b"")
         body_parts.append(str(chat_id).encode())
+        if message_thread_id:
+            body_parts.append(f"--{boundary}".encode())
+            body_parts.append(b'Content-Disposition: form-data; name="message_thread_id"')
+            body_parts.append(b"")
+            body_parts.append(str(message_thread_id).encode())
         body_parts.append(f"--{boundary}".encode())
         body_parts.append(f'Content-Disposition: form-data; name="photo"; filename="{photo_path.name}"'.encode())
         body_parts.append(f"Content-Type: {content_type}".encode())
@@ -1126,7 +1130,7 @@ class TelegramTransport(MessageTransport):
             print(f"sendPhoto error: {e}")
             return False
 
-    def send_animation(self, chat_id, animation_path, caption=None) -> bool:
+    def send_animation(self, chat_id, animation_path, caption=None, message_thread_id=None) -> bool:
         if not BOT_TOKEN:
             return False
         ok, validated = validate_photo_path(animation_path)
@@ -1141,6 +1145,11 @@ class TelegramTransport(MessageTransport):
         body_parts.append(b'Content-Disposition: form-data; name="chat_id"')
         body_parts.append(b"")
         body_parts.append(str(chat_id).encode())
+        if message_thread_id:
+            body_parts.append(f"--{boundary}".encode())
+            body_parts.append(b'Content-Disposition: form-data; name="message_thread_id"')
+            body_parts.append(b"")
+            body_parts.append(str(message_thread_id).encode())
         body_parts.append(f"--{boundary}".encode())
         body_parts.append(f'Content-Disposition: form-data; name="animation"; filename="{animation_path.name}"'.encode())
         body_parts.append(f"Content-Type: {content_type}".encode())
@@ -1172,7 +1181,7 @@ class TelegramTransport(MessageTransport):
             print(f"sendAnimation error: {e}")
             return False
 
-    def send_document(self, chat_id, doc_path, caption=None) -> bool:
+    def send_document(self, chat_id, doc_path, caption=None, message_thread_id=None) -> bool:
         if not BOT_TOKEN:
             return False
         ok, validated = validate_document_path(doc_path)
@@ -1187,6 +1196,11 @@ class TelegramTransport(MessageTransport):
         body_parts.append(b'Content-Disposition: form-data; name="chat_id"')
         body_parts.append(b"")
         body_parts.append(str(chat_id).encode())
+        if message_thread_id:
+            body_parts.append(f"--{boundary}".encode())
+            body_parts.append(b'Content-Disposition: form-data; name="message_thread_id"')
+            body_parts.append(b"")
+            body_parts.append(str(message_thread_id).encode())
         body_parts.append(f"--{boundary}".encode())
         body_parts.append(f'Content-Disposition: form-data; name="document"; filename="{doc_path.name}"'.encode())
         body_parts.append(f"Content-Type: {content_type}".encode())
@@ -1218,7 +1232,7 @@ class TelegramTransport(MessageTransport):
             print(f"sendDocument error: {e}")
             return False
 
-    def _send_media_multipart(self, chat_id, file_path, field_name, api_method, caption=None) -> bool:
+    def _send_media_multipart(self, chat_id, file_path, field_name, api_method, caption=None, message_thread_id=None) -> bool:
         if not BOT_TOKEN:
             return False
         boundary = uuid.uuid4().hex
@@ -1228,6 +1242,11 @@ class TelegramTransport(MessageTransport):
         body_parts.append(b'Content-Disposition: form-data; name="chat_id"')
         body_parts.append(b"")
         body_parts.append(str(chat_id).encode())
+        if message_thread_id:
+            body_parts.append(f"--{boundary}".encode())
+            body_parts.append(b'Content-Disposition: form-data; name="message_thread_id"')
+            body_parts.append(b"")
+            body_parts.append(str(message_thread_id).encode())
         body_parts.append(f"--{boundary}".encode())
         body_parts.append(f'Content-Disposition: form-data; name="{field_name}"; filename="{file_path.name}"'.encode())
         body_parts.append(f"Content-Type: {content_type}".encode())
@@ -1259,33 +1278,33 @@ class TelegramTransport(MessageTransport):
             print(f"{api_method} error: {e}")
             return False
 
-    def send_video(self, chat_id, video_path, caption=None) -> bool:
+    def send_video(self, chat_id, video_path, caption=None, message_thread_id=None) -> bool:
         ok, validated = validate_document_path(video_path)
         if not ok:
             print(validated)
             return False
-        return self._send_media_multipart(chat_id, validated, "video", "sendVideo", caption)
+        return self._send_media_multipart(chat_id, validated, "video", "sendVideo", caption, message_thread_id)
 
-    def send_audio(self, chat_id, audio_path, caption=None) -> bool:
+    def send_audio(self, chat_id, audio_path, caption=None, message_thread_id=None) -> bool:
         ok, validated = validate_document_path(audio_path)
         if not ok:
             print(validated)
             return False
-        return self._send_media_multipart(chat_id, validated, "audio", "sendAudio", caption)
+        return self._send_media_multipart(chat_id, validated, "audio", "sendAudio", caption, message_thread_id)
 
-    def send_voice(self, chat_id, voice_path, caption=None) -> bool:
+    def send_voice(self, chat_id, voice_path, caption=None, message_thread_id=None) -> bool:
         ok, validated = validate_document_path(voice_path)
         if not ok:
             print(validated)
             return False
-        return self._send_media_multipart(chat_id, validated, "voice", "sendVoice", caption)
+        return self._send_media_multipart(chat_id, validated, "voice", "sendVoice", caption, message_thread_id)
 
-    def send_sticker(self, chat_id, sticker_path) -> bool:
+    def send_sticker(self, chat_id, sticker_path, message_thread_id=None) -> bool:
         sticker_path = Path(sticker_path)
         if not sticker_path.exists() or not sticker_path.is_file():
             print(f"Sticker not found: {sticker_path}")
             return False
-        return self._send_media_multipart(chat_id, sticker_path, "sticker", "sendSticker")
+        return self._send_media_multipart(chat_id, sticker_path, "sticker", "sendSticker", message_thread_id=message_thread_id)
 
     def send_chat_action(self, chat_id, action, message_thread_id=None) -> None:
         payload = {"chat_id": chat_id, "action": action}
@@ -1384,31 +1403,31 @@ class LocalTransport(MessageTransport):
         self._log("send_text", chat_id, text=text[:200], parse_mode=parse_mode)
         return {"ok": True, "result": {"message_id": 1}}
 
-    def send_photo(self, chat_id, photo_path, caption=None) -> bool:
+    def send_photo(self, chat_id, photo_path, caption=None, message_thread_id=None) -> bool:
         self._log("send_photo", chat_id, path=photo_path, caption=caption)
         return True
 
-    def send_document(self, chat_id, doc_path, caption=None) -> bool:
+    def send_document(self, chat_id, doc_path, caption=None, message_thread_id=None) -> bool:
         self._log("send_document", chat_id, path=doc_path, caption=caption)
         return True
 
-    def send_animation(self, chat_id, animation_path, caption=None) -> bool:
+    def send_animation(self, chat_id, animation_path, caption=None, message_thread_id=None) -> bool:
         self._log("send_animation", chat_id, path=animation_path, caption=caption)
         return True
 
-    def send_video(self, chat_id, video_path, caption=None) -> bool:
+    def send_video(self, chat_id, video_path, caption=None, message_thread_id=None) -> bool:
         self._log("send_video", chat_id, path=video_path, caption=caption)
         return True
 
-    def send_audio(self, chat_id, audio_path, caption=None) -> bool:
+    def send_audio(self, chat_id, audio_path, caption=None, message_thread_id=None) -> bool:
         self._log("send_audio", chat_id, path=audio_path, caption=caption)
         return True
 
-    def send_voice(self, chat_id, voice_path, caption=None) -> bool:
+    def send_voice(self, chat_id, voice_path, caption=None, message_thread_id=None) -> bool:
         self._log("send_voice", chat_id, path=voice_path, caption=caption)
         return True
 
-    def send_sticker(self, chat_id, sticker_path) -> bool:
+    def send_sticker(self, chat_id, sticker_path, message_thread_id=None) -> bool:
         self._log("send_sticker", chat_id, path=sticker_path)
         return True
 
@@ -1465,32 +1484,32 @@ def download_telegram_file(file_id, session_name):
 # Backward-compat module-level media stubs.
 # Tests patch these (e.g. patch.object(bridge, 'send_voice', ...)).
 # Production code routes through transport.*; these stubs allow test mocking.
-def send_voice(chat_id, voice_path, caption=None):
-    return transport.send_voice(chat_id, voice_path, caption)
+def send_voice(chat_id, voice_path, caption=None, message_thread_id=None):
+    return transport.send_voice(chat_id, voice_path, caption, message_thread_id=message_thread_id)
 
 
-def send_photo(chat_id, photo_path, caption=None):
-    return transport.send_photo(chat_id, photo_path, caption)
+def send_photo(chat_id, photo_path, caption=None, message_thread_id=None):
+    return transport.send_photo(chat_id, photo_path, caption, message_thread_id=message_thread_id)
 
 
-def send_animation(chat_id, animation_path, caption=None):
-    return transport.send_animation(chat_id, animation_path, caption)
+def send_animation(chat_id, animation_path, caption=None, message_thread_id=None):
+    return transport.send_animation(chat_id, animation_path, caption, message_thread_id=message_thread_id)
 
 
-def send_document(chat_id, doc_path, caption=None):
-    return transport.send_document(chat_id, doc_path, caption)
+def send_document(chat_id, doc_path, caption=None, message_thread_id=None):
+    return transport.send_document(chat_id, doc_path, caption, message_thread_id=message_thread_id)
 
 
-def send_video(chat_id, video_path, caption=None):
-    return transport.send_video(chat_id, video_path, caption)
+def send_video(chat_id, video_path, caption=None, message_thread_id=None):
+    return transport.send_video(chat_id, video_path, caption, message_thread_id=message_thread_id)
 
 
-def send_audio(chat_id, audio_path, caption=None):
-    return transport.send_audio(chat_id, audio_path, caption)
+def send_audio(chat_id, audio_path, caption=None, message_thread_id=None):
+    return transport.send_audio(chat_id, audio_path, caption, message_thread_id=message_thread_id)
 
 
-def send_sticker(chat_id, sticker_path):
-    return transport.send_sticker(chat_id, sticker_path)
+def send_sticker(chat_id, sticker_path, message_thread_id=None):
+    return transport.send_sticker(chat_id, sticker_path, message_thread_id=message_thread_id)
 
 
 # ============================================================
@@ -2813,6 +2832,13 @@ _awaiting_folder = set()
 _picker_sent_at = {}
 _PICKER_GRACE_SECS = 5.0
 
+# Per-update reply routing: _handle_topic_message records the inbound 話題
+# thread here so every reply() raised while handling that update (command
+# replies, error hints, delegated /memory & friends) lands back in the same
+# topic. threading.local is safe because each Telegram update is handled in
+# its own dedicated thread.
+_reply_ctx = threading.local()
+
 
 # External usage snapshot written by claude-hud (subscriber rate-limit data).
 USAGE_FILE = os.path.expanduser(os.environ.get("CC_USAGE_FILE", "~/.claude/cc-usage.json"))
@@ -3480,17 +3506,17 @@ def _send_watchdog_alert(name: str, state: str, reason: str) -> None:
         age_match = re.search(r"age=(\d+)s", reason)
         age_min = int(age_match.group(1)) // 60 if age_match else 0
         age_str = f"{age_min}min" if age_min > 0 else reason.split()[0]
-        text = f"🔴 {name} has made no progress for {age_str}.\n/restart --clean {name} (starts fresh)"
+        text = f"🔴 {name} has made no progress for {age_str}.\n在它的話題用 /cd <路徑> 原地重啟，或 /close 後重開話題。"
     elif state == "POISONED":
-        text = f"🔴 {name} is stuck in an error loop.\n/restart --clean {name} (starts fresh)"
+        text = f"🔴 {name} is stuck in an error loop.\n在它的話題用 /cd <路徑> 原地重啟，或 /close 後重開話題。"
     elif state == "DEAD":
-        text = f"🔴 {name} stopped unexpectedly.\n/restart --clean {name} (starts fresh)"
+        text = f"🔴 {name} stopped unexpectedly.\n在它的話題用 /cd <路徑> 重啟，或 /close 後重開話題。"
     elif state == "EXITED":
-        text = f"🟡 {name}'s session ended.\n/restart {name}"
+        text = f"🟡 {name}'s session ended.\n在它的話題用 /cd <路徑> 重啟。"
     elif state == "OFFLINE":
-        text = f"🔴 {name} is not running.\n/hire {name}"
+        text = f"🔴 {name} is not running.\n重開它的話題（或在話題裡 /cd <路徑>）即可重啟。"
     else:
-        text = f"{name}: {state} ({reason}). Check /team"
+        text = f"{name}: {state} ({reason})."
     try:
         result = transport.send_text(admin_chat_id, text)
         if result and result.get("ok"):
@@ -4807,7 +4833,7 @@ class WorkerManager:
                         "protocol": "none",
                         "address": "",
                         "status": "exited",
-                        "note": f"Worker exited. Use /restart {name} to bring back.",
+                        "note": f"Worker exited. Reopen its 話題 (or /cd <path> inside it) to restart.",
                     })
                 continue
 
@@ -5573,7 +5599,11 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
     # (files are on the remote host, not local) — validate after fetching
     host = get_worker_host(name)
     # If this session is bound to a forum Topic, route the reply back into it.
+    # Thread 0 (tmain / non-forum) must be OMITTED: Telegram rejects a
+    # message_thread_id outside forums, and that bounce would trick
+    # _reap_dead_topic into killing a healthy tmain session.
     _, topic_thread_id = load_topic_meta(name)
+    topic_thread_id = topic_thread_id or None
     if host:
         _accept_all = lambda p: (True, Path(p))
         clean_text, images = _parse_media_tags(text, "image", _accept_all)
@@ -5665,9 +5695,9 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
         full_caption = f"{name}: {img_caption}" if img_caption else f"{name}:"
         # Use sendAnimation for GIFs and MP4s to preserve animation
         if Path(img_path).suffix.lower() in (".gif", ".mp4"):
-            sent = send_animation(chat_id, img_path, full_caption)
+            sent = send_animation(chat_id, img_path, full_caption, message_thread_id=topic_thread_id)
         else:
-            sent = send_photo(chat_id, img_path, full_caption)
+            sent = send_photo(chat_id, img_path, full_caption, message_thread_id=topic_thread_id)
         if sent:
             print(f"Image sent: {name} -> {img_path}")
         else:
@@ -5678,15 +5708,15 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
         full_caption = f"{name}: {file_caption}" if file_caption else f"{name}:"
         ext = Path(file_path).suffix.lower()
         if ext in VIDEO_EXTENSIONS:
-            sent = send_video(chat_id, file_path, full_caption)
+            sent = send_video(chat_id, file_path, full_caption, message_thread_id=topic_thread_id)
         elif ext in AUDIO_EXTENSIONS:
-            sent = send_audio(chat_id, file_path, full_caption)
+            sent = send_audio(chat_id, file_path, full_caption, message_thread_id=topic_thread_id)
         elif ext in VOICE_EXTENSIONS:
-            sent = send_voice(chat_id, file_path, full_caption)
+            sent = send_voice(chat_id, file_path, full_caption, message_thread_id=topic_thread_id)
         elif ext in STICKER_EXTENSIONS:
-            sent = send_sticker(chat_id, file_path)
+            sent = send_sticker(chat_id, file_path, message_thread_id=topic_thread_id)
         else:
-            sent = send_document(chat_id, file_path, full_caption)
+            sent = send_document(chat_id, file_path, full_caption, message_thread_id=topic_thread_id)
         if sent:
             print(f"File sent: {name} -> {file_path}")
         else:
@@ -5705,7 +5735,7 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
                     print(f"TTS starting: {len(para)} chars for {name} (part {i+1}/{len(paragraphs)})")
                     voice_path = synthesize_speech(para)
                     if voice_path:
-                        send_voice(chat_id, voice_path, caption=f"{name}:")
+                        send_voice(chat_id, voice_path, caption=f"{name}:", message_thread_id=topic_thread_id)
                         try:
                             os.unlink(voice_path)
                         except OSError:
@@ -5911,25 +5941,25 @@ class _LegacyTransportAdapter(MessageTransport):
         result = self._legacy.send_message(chat_id, text)
         return result if result else {"ok": True, "result": {"message_id": 1}}
 
-    def send_photo(self, chat_id, photo_path, caption=None) -> bool:
+    def send_photo(self, chat_id, photo_path, caption=None, message_thread_id=None) -> bool:
         return False
 
-    def send_document(self, chat_id, doc_path, caption=None) -> bool:
+    def send_document(self, chat_id, doc_path, caption=None, message_thread_id=None) -> bool:
         return False
 
-    def send_animation(self, chat_id, animation_path, caption=None) -> bool:
+    def send_animation(self, chat_id, animation_path, caption=None, message_thread_id=None) -> bool:
         return False
 
-    def send_video(self, chat_id, video_path, caption=None) -> bool:
+    def send_video(self, chat_id, video_path, caption=None, message_thread_id=None) -> bool:
         return False
 
-    def send_audio(self, chat_id, audio_path, caption=None) -> bool:
+    def send_audio(self, chat_id, audio_path, caption=None, message_thread_id=None) -> bool:
         return False
 
-    def send_voice(self, chat_id, voice_path, caption=None) -> bool:
+    def send_voice(self, chat_id, voice_path, caption=None, message_thread_id=None) -> bool:
         return False
 
-    def send_sticker(self, chat_id, sticker_path) -> bool:
+    def send_sticker(self, chat_id, sticker_path, message_thread_id=None) -> bool:
         return False
 
     def send_chat_action(self, chat_id, action, message_thread_id=None) -> None:
@@ -5957,9 +5987,16 @@ class CommandRouter:
         self.transport = transport
         self.workers = workers
 
-    def reply(self, chat_id, text, outcome=None):
+    def reply(self, chat_id, text, outcome=None, message_thread_id=None):
+        # Replies raised while handling a topic message inherit that topic's
+        # thread via _reply_ctx (set in _handle_topic_message; each Telegram
+        # update runs in its own thread, so threading.local cannot leak
+        # across topics). Thread 0 (tmain / non-forum) is omitted entirely.
+        if message_thread_id is None:
+            message_thread_id = getattr(_reply_ctx, "thread_id", None)
         if self.transport is not None:
-            self.transport.send_text(chat_id, text)
+            self.transport.send_text(chat_id, text,
+                                     message_thread_id=message_thread_id or None)
 
     def send_startup_message(self, chat_id):
         sessions = list(self.workers.get_registered_sessions().keys())
@@ -5980,6 +6017,11 @@ class CommandRouter:
         chat_id = msg.get("chat", {}).get("id")
         message_id = msg.get("message_id")
         thread_id = msg.get("message_thread_id")
+        # Same admin gate as handle_message: only the admin's taps count.
+        sender = (cq.get("from") or {}).get("id")
+        if admin_chat_id is not None and sender != admin_chat_id and chat_id != admin_chat_id:
+            print(f"Rejected non-admin callback: sender={sender} chat={chat_id}")
+            return
         if thread_id is None:
             # Symmetric to _handle_topic_message: a non-forum DM carries no
             # message_thread_id, so normalize to the default thread (0 -> 'tmain')
@@ -6175,6 +6217,9 @@ class CommandRouter:
             # one default session keyed by chat only (thread 0 -> 'tmain').
             thread_id = 0
 
+        # Route every reply() in this update back into this 話題 (0 → omit).
+        _reply_ctx.thread_id = thread_id or None
+
         # A forum_topic_created service message carries the 話題 title; capture
         # it (keyed by the topic's thread id) so the session is named after it.
         # Telegram only commits a topic when its first message is sent, so this
@@ -6293,12 +6338,29 @@ class CommandRouter:
             self._send_folder_picker(chat_id, thread_id)
 
     def handle_message(self, update):
+        global admin_chat_id
         msg = update.get("message", {})
         text = msg.get("text", "") or msg.get("caption", "")
         chat_id = msg.get("chat", {}).get("id")
         msg_id = msg.get("message_id")
         if not chat_id:
             return
+
+        # Admin gate. In topic mode messages arrive from the forum GROUP, so
+        # the gate is on the SENDER's user id (a private chat's id equals the
+        # user's id, so a preset ADMIN_CHAT_ID works for both). First sender
+        # becomes admin; everyone else is silently rejected.
+        sender = (msg.get("from") or {}).get("id")
+        if admin_chat_id is None:
+            admin_chat_id = sender or chat_id
+            save_last_chat_id(chat_id)
+            print(f"Admin registered: {admin_chat_id}")
+        elif sender != admin_chat_id and chat_id != admin_chat_id:
+            print(f"Rejected non-admin: sender={sender} chat={chat_id}")
+            return
+        else:
+            save_last_chat_id(chat_id)
+
         # Topic-only bridge: every inbound message is routed by its 話題
         # thread. Media is handled inside the topic path (downloaded into the
         # bound session's inbox and delivered as a local path).
@@ -6788,16 +6850,13 @@ class CommandRouter:
         registered = self.workers.get_registered_sessions()
         session = registered.get(session_name)
         if not session:
-            self.reply(chat_id, f"Can't find {session_name}. Check /team for who's available.")
+            self.reply(chat_id, f"找不到 {session_name} 的工作階段。請 /close 後重開這個話題。")
             return
 
         if not self.workers.is_online(session_name, session):
-            # Check if worker is being teleported before reporting offline
-            teleport_state_file = SESSIONS_DIR / session_name / "teleport_state"
-            if teleport_state_file.exists():
-                self.reply(chat_id, f"{session_name.capitalize()} is being teleported. Please wait.")
-                return
-            self.reply(chat_id, f"{session_name.capitalize()} is offline. Try /restart.")
+            self.reply(chat_id,
+                       f"{session_name} 離線了。在這個話題用 /cd <路徑> 原地重啟，"
+                       "或 /close 後重開話題。")
             return
 
         backend_name = get_worker_backend(session_name, session)
@@ -8881,11 +8940,11 @@ class Handler(BaseHTTPRequestHandler):
             _sync_worker_manager()
             registered = worker_manager.get_registered_sessions()
             tmux_name = ""
+            host = get_worker_host(name)
             if name in registered:
                 backend_name = get_worker_backend(name, registered[name])
                 # Re-export hook env on checkin (refreshes BRIDGE_URL after restart)
                 tmux_name = registered[name].get("tmux", f"{TMUX_PREFIX}{name}")
-                host = get_worker_host(name)
                 if tmux_exists(tmux_name, host=host):
                     export_hook_env(tmux_name, backend_name, host=host)
             else:

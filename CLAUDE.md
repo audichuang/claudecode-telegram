@@ -4,12 +4,15 @@
 
 When making changes that result in a new version:
 
-1. **Update version** in BOTH `claudecode-telegram.sh` and `pyproject.toml` (keep them in sync):
+1. **Update version** in ALL THREE of `claudecode-telegram.sh`, `pyproject.toml`,
+   AND `bridge.py` (keep them in sync — `/settings` reports bridge.py's copy):
    ```bash
    # claudecode-telegram.sh
    VERSION="x.y.z"
    # pyproject.toml
    version = "x.y.z"
+   # bridge.py
+   VERSION = "x.y.z"
    ```
 
 2. **Update `DOC.md`** with:

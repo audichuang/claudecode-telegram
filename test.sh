@@ -1071,6 +1071,114 @@ print('OK')
     fi
 }
 
+test_topic_admin_gate() {
+    info "Testing topic mode learns the first sender as admin and rejects others..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+bridge.admin_chat_id = None
+bridge.save_last_chat_id = lambda c: None
+cr.workers.get_registered_sessions = lambda registered=None: {'tA': {}}
+bridge.find_topic_session = lambda c, t, r: 'tA'
+routed = []
+cr.route_message = lambda name, text, chat_id, msg_id: routed.append((name, text))
+def msg(uid, text):
+    return {'message': {'text': text, 'chat': {'id': -100123}, 'from': {'id': uid},
+            'message_id': 1, 'message_thread_id': 50}}
+# First sender becomes admin and routes
+cr.handle_message(msg(817, 'hi'))
+assert bridge.admin_chat_id == 817, bridge.admin_chat_id
+assert routed == [('tA', 'hi')], routed
+# A different sender in the same group is silently rejected
+cr.handle_message(msg(999, 'evil'))
+assert routed == [('tA', 'hi')], ('non-admin must not route:', routed)
+# Callback from non-admin is ignored
+opened = []
+cr.open_topic_session = lambda *a, **k: opened.append(a)
+tok = bridge._folder_token('/tmp')
+cb = {'callback_query': {'id': 'x', 'data': 'use:' + tok, 'from': {'id': 999},
+      'message': {'chat': {'id': -100123}, 'message_id': 1, 'message_thread_id': 50}}}
+cr.handle_callback(cb)
+assert opened == [], ('non-admin callback must be ignored:', opened)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "topic admin gate: learn first sender, reject others (msg + callback)"
+    else
+        fail "topic admin gate test failed"
+    fi
+}
+
+test_topic_command_reply_targets_thread() {
+    info "Testing command replies (/quota etc.) are sent into the topic thread..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+bridge.admin_chat_id = 817
+cr.workers.get_registered_sessions = lambda registered=None: {}
+sent = []
+cr.transport.send_text = (lambda chat_id, text, parse_mode=None, reply_to=None,
+    message_thread_id=None: sent.append((text, message_thread_id)) or {'ok': True})
+msg = {'message_thread_id': 77, 'text': '/quota', 'chat': {'id': -100123},
+       'from': {'id': 817}, 'message_id': 9}
+cr._handle_topic_message(msg, '/quota', -100123, 9)
+assert sent, 'reply must be sent'
+assert sent[0][1] == 77, ('reply must carry the topic thread id:', sent)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "command replies land in the topic thread"
+    else
+        fail "topic command reply threading test failed"
+    fi
+}
+
+test_media_reply_targets_thread() {
+    info "Testing worker image/file replies are sent into the topic thread..."
+    if python3 -c "
+import os, tempfile
+import bridge
+img = tempfile.mktemp(suffix='.png')
+open(img, 'wb').write(b'fake')
+bridge.load_topic_meta = lambda name: (555, 88)
+bridge.get_worker_host = lambda name: None
+sent = []
+bridge.send_photo = (lambda chat_id, photo_path, caption=None, message_thread_id=None:
+    sent.append(('photo', message_thread_id)) or True)
+bridge.transport.send_text = (lambda chat_id, text, parse_mode=None, reply_to=None,
+    message_thread_id=None: {'ok': True, 'result': {'message_id': 1}})
+bridge.send_response_to_telegram('tM', f'look [[image:{img}]]', 555)
+os.unlink(img)
+assert sent and sent[0] == ('photo', 88), ('media must carry thread id:', sent)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "worker media replies land in the topic thread"
+    else
+        fail "media reply threading test failed"
+    fi
+}
+
+test_tmain_thread_zero_omitted() {
+    info "Testing tmain (thread 0) hook replies omit message_thread_id (and never get reaped)..."
+    if python3 -c "
+import bridge
+bridge.load_topic_meta = lambda name: (555, 0)
+bridge.get_worker_host = lambda name: None
+sent = []
+bridge.transport.send_text = (lambda chat_id, text, parse_mode=None, reply_to=None,
+    message_thread_id=None: sent.append(message_thread_id) or {'ok': True, 'result': {'message_id': 1}})
+bridge.send_response_to_telegram('tmain', 'hello', 555)
+assert sent == [None], ('thread 0 must be omitted, got:', sent)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "tmain hook replies omit message_thread_id"
+    else
+        fail "tmain thread-zero test failed"
+    fi
+}
+
 test_topic_picker_shown_on_topic_creation() {
     info "Testing the folder picker is shown on topic creation (no throwaway first message needed)..."
     if python3 -c "
@@ -2448,7 +2556,7 @@ bridge.state['tts_enabled'] = True  # enable auto-TTS gate (defaults off)
 voice_sent = []
 text_sent = []
 
-def mock_send_voice(chat_id, path, caption=None):
+def mock_send_voice(chat_id, path, caption=None, message_thread_id=None):
     voice_sent.append((chat_id, path, caption))
     return True
 
@@ -9010,7 +9118,7 @@ assert sent.get('method') == 'sendMessage', 'telegram_api not called'
 assert sent['data']['chat_id'] == 123, 'admin chat id should be used'
 txt = sent['data']['text']
 assert 'alice' in txt, f'alert should include worker name: {txt}'
-assert 'frozen' in txt or '/restart' in txt, f'alert should be human-friendly: {txt}'
+assert 'no progress' in txt or '/cd' in txt, f'alert should be human-friendly: {txt}'
 
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
@@ -9627,35 +9735,6 @@ print('OK')
         success "resolved alert has 180s cooldown"
     else
         fail "resolved alert should have cooldown to prevent spam"
-    fi
-}
-
-test_is_online_teleported_ssh_failure_assumes_online() {
-    info "Testing is_online treats SSH failures as online for remote workers..."
-
-    if python3 -c "
-from unittest.mock import patch
-import bridge
-
-wm = bridge.WorkerManager(bridge.SESSIONS_DIR, 'claude-test-')
-session = {'tmux': 'claude-test-ren', 'backend': 'claude'}
-
-# SSH failure (exception) should return True (assume online)
-def mock_tmux_exists(name, host=None):
-    if host:
-        raise Exception('SSH connection refused')
-    return True
-
-with patch('bridge.get_worker_host', return_value='mac-mini'), \
-     patch('bridge.tmux_exists', side_effect=mock_tmux_exists):
-    result = wm.is_online('ren', session)
-    assert result is True, f'SSH failure should assume online, got {result}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "is_online treats SSH failure as online for teleported workers"
-    else
-        fail "is_online should treat SSH failure as online for teleported workers"
     fi
 }
 
@@ -11389,8 +11468,8 @@ with patch('bridge.telegram_api', fake_api):
 
 txt = sent['data']['text']
 assert 'no progress' in txt.lower(), f'Should say no progress: {txt}'
-assert '/restart --clean alice' in txt, f'Should have restart command: {txt}'
-assert 'starts fresh' in txt.lower(), f'Should explain --clean: {txt}'
+assert '/cd' in txt and '/close' in txt, f'Should give topic-native recovery: {txt}'
+assert '/restart' not in txt, f'Deleted commands must not be suggested: {txt}'
 assert 'STUCK' not in txt, f'Should not expose internal state name: {txt}'
 
 print('OK')
@@ -11423,7 +11502,7 @@ with patch('bridge.telegram_api', fake_api):
 txt = sent['data']['text']
 assert 'error' in txt.lower(), f'Should mention error: {txt}'
 assert 'POISONED' not in txt, f'Should not expose internal state POISONED: {txt}'
-assert '/restart --clean bob' in txt, f'Should have restart command: {txt}'
+assert '/cd' in txt and '/restart' not in txt, f'Should give topic-native recovery: {txt}'
 
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
@@ -11455,7 +11534,7 @@ with patch('bridge.telegram_api', fake_api):
 txt = sent['data']['text']
 assert 'stopped' in txt.lower(), f'Should say stopped: {txt}'
 assert 'process' not in txt.lower(), f'Should not say process: {txt}'
-assert '/restart --clean carol' in txt, f'Should have restart command: {txt}'
+assert '/cd' in txt and '/restart' not in txt, f'Should give topic-native recovery: {txt}'
 
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
@@ -11537,80 +11616,33 @@ print('OK')
     fi
 }
 
-test_teleport_suppresses_offline_message() {
-    info "Testing route_message says 'being teleported' instead of 'offline' when teleport_state exists..."
+test_is_online_teleported_ssh_failure_assumes_online() {
+    info "Testing is_online treats SSH failures as online for remote workers..."
 
-    local tmpscript tmpout
-    tmpscript=$(mktemp /tmp/test_teleport_offline_XXXXX.py)
-    tmpout=$(mktemp)
-    cat > "$tmpscript" << 'PYEOF'
-import os, sys, tempfile, json
-from pathlib import Path
-from unittest.mock import MagicMock
+    if python3 -c "
+from unittest.mock import patch
 import bridge
 
-tmpdir = tempfile.mkdtemp()
-sessions_dir = Path(tmpdir) / 'sessions'
-sessions_dir.mkdir()
-orig_sessions_dir = bridge.SESSIONS_DIR
-bridge.SESSIONS_DIR = sessions_dir
+wm = bridge.WorkerManager(bridge.SESSIONS_DIR, 'claude-test-')
+session = {'tmux': 'claude-test-ren', 'backend': 'claude'}
 
-worker_name = 'alice'
-worker_dir = sessions_dir / worker_name
-worker_dir.mkdir()
-(worker_dir / 'chat_id').write_text('12345')
-(worker_dir / 'backend').write_text('claude')
+# SSH failure (exception) should return True (assume online)
+def mock_tmux_exists(name, host=None):
+    if host:
+        raise Exception('SSH connection refused')
+    return True
 
-# Write teleport_state file to simulate teleport in progress
-(worker_dir / 'teleport_state').write_text(json.dumps({
-    "phase": 1, "source_host": "host1",
-    "target_host": "host2", "target_cwd": "/tmp",
-    "started_at": 1000,
-}))
+with patch('bridge.get_worker_host', return_value='mac-mini'), \
+     patch('bridge.tmux_exists', side_effect=mock_tmux_exists):
+    result = wm.is_online('ren', session)
+    assert result is True, f'SSH failure should assume online, got {result}'
 
-tmux_name = f'{bridge.TMUX_PREFIX}{worker_name}'
-router = bridge.command_router
-orig_workers = router.workers
-
-mock_workers = MagicMock()
-mock_workers.get_registered_sessions.return_value = {
-    worker_name: {'tmux': tmux_name}
-}
-mock_workers.is_online.return_value = False  # Worker appears offline during teleport
-mock_workers.tmux_prefix = bridge.TMUX_PREFIX
-router.workers = mock_workers
-
-replies = []
-router.reply = lambda chat_id, text, **kw: replies.append(text)
-
-router.route_message(worker_name, 'hello', 12345, None)
-
-assert len(replies) == 1, f'Expected 1 reply, got {len(replies)}: {replies}'
-assert 'being teleported' in replies[0], f'Should say being teleported, got: {replies[0]}'
-assert 'offline' not in replies[0].lower(), f'Should NOT say offline, got: {replies[0]}'
-
-# Now remove teleport_state and verify it says offline
-(worker_dir / 'teleport_state').unlink()
-replies.clear()
-
-router.route_message(worker_name, 'hello', 12345, None)
-
-assert len(replies) == 1, f'Expected 1 reply, got {len(replies)}: {replies}'
-assert 'offline' in replies[0].lower(), f'Should say offline when no teleport, got: {replies[0]}'
-
-router.workers = orig_workers
-bridge.SESSIONS_DIR = orig_sessions_dir
-sys.stdout.write('OK\n')
-sys.stdout.flush()
-os._exit(0)
-PYEOF
-    PYTHONPATH="$SCRIPT_DIR" python3 "$tmpscript" > "$tmpout" 2>/dev/null || true
-    if grep -q "OK" "$tmpout"; then
-        success "route_message returns teleport message instead of offline"
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "is_online treats SSH failure as online for teleported workers"
     else
-        fail "teleport offline suppression test failed"
+        fail "is_online should treat SSH failure as online for teleported workers"
     fi
-    rm -f "$tmpscript" "$tmpout"
 }
 
 test_watchdog_skips_dead_alert_during_teleport() {
@@ -11747,7 +11779,7 @@ bridge._handle_watchdog_transition('deadworker', 'EXITED', 'session gone', since
 assert len(calls) == 1, f'expected 1 alert call, got {len(calls)}'
 txt = calls[0][1]['text']
 assert 'deadworker' in txt, f'alert should mention worker name: {txt}'
-assert '/restart' in txt, f'alert should suggest /restart: {txt}'
+assert '/cd' in txt, f'alert should give topic-native recovery: {txt}'
 
 bridge.telegram_api = orig_api
 bridge.admin_chat_id = None
@@ -14281,6 +14313,10 @@ run_unit_tests() {
     run_test test_topic_open_sends_welcome_only
     run_test test_topic_first_message_trigger_not_forwarded
     run_test test_topic_trigger_swallowed_in_grace_window
+    run_test test_topic_admin_gate
+    run_test test_topic_command_reply_targets_thread
+    run_test test_media_reply_targets_thread
+    run_test test_tmain_thread_zero_omitted
     run_test test_topic_picker_shown_on_topic_creation
     run_test test_hire_does_not_set_focus
     run_test test_startup_message_topic_semantics
@@ -14375,7 +14411,6 @@ run_unit_tests() {
     run_test test_export_hook_env_remaps_remote_sessions_dir
     run_test test_export_hook_env_uses_public_url_for_remote
     run_test test_resolved_alert_cooldown
-    run_test test_is_online_teleported_ssh_failure_assumes_online
     run_test test_is_online_teleported_checks_claude_process
     run_test test_scan_latest_session_id_local
     run_test test_get_claude_session_id_authoritative_overrides_stale
@@ -14451,7 +14486,7 @@ run_unit_tests() {
     run_test test_watchdog_alert_dead_copy
     run_test test_watchdog_alert_waiting_input_copy
     run_test test_watchdog_resolved_copy
-    run_test test_teleport_suppresses_offline_message
+    run_test test_is_online_teleported_ssh_failure_assumes_online
     run_test test_watchdog_skips_dead_alert_during_teleport
     run_test test_team_attention_needs_reply
     # Unit tests - Concurrency
