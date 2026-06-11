@@ -1094,6 +1094,257 @@ print('OK')
     fi
 }
 
+test_hire_does_not_set_focus() {
+    info "Testing hire() no longer sets focus/active (topic mode has no current worker)..."
+    if python3 -c "
+import tempfile, subprocess
+import bridge
+picked = tempfile.mkdtemp()
+wm = bridge.worker_manager
+wm._sync_paths = lambda: None
+bridge.is_valid_backend = lambda b: True
+bridge._which_binary = lambda b: '/usr/bin/true'
+bridge.tmux_exists = lambda t: False
+wm._get_startup_cwd = lambda name: picked
+class R:
+    returncode = 0; stdout = ''; stderr = b''
+subprocess.run = lambda cmd, *a, **k: R()
+bridge.save_claude_session_cwd = lambda n, c: None
+bridge.export_hook_env = lambda *a, **k: None
+bridge.ensure_session_dir = lambda n: None
+bridge.time.sleep = lambda *a, **k: None
+bridge.state['active'] = None
+focused = []
+bridge.set_focus = lambda name: focused.append(name)
+try:
+    wm.hire('tF', chat_id=11)
+except Exception:
+    pass
+assert focused == [], ('hire must not set focus:', focused)
+assert bridge.state['active'] is None, bridge.state['active']
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "hire() does not set focus/active"
+    else
+        fail "hire no-focus test failed"
+    fi
+}
+
+test_startup_message_topic_semantics() {
+    info "Testing the startup notification speaks topic semantics (no Team:/Focused:/hire)..."
+    if python3 -c "
+import bridge
+cr = bridge.command_router
+cr.workers.get_registered_sessions = lambda registered=None: {'t46': {}, 't51': {}}
+replies = []
+cr.reply = lambda chat_id, text, **kw: replies.append(text)
+cr.send_startup_message(555)
+out = replies[0]
+assert '話題' in out and '2' in out, out
+assert 'Team:' not in out, out
+assert 'Focused:' not in out, out
+assert '/hire' not in out, out
+# Zero sessions: still topic semantics, no hire pitch
+cr.workers.get_registered_sessions = lambda registered=None: {}
+replies.clear()
+cr.send_startup_message(555)
+assert '/hire' not in replies[0] and 'hire' not in replies[0].lower(), replies
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "startup notification uses topic semantics"
+    else
+        fail "startup message semantics test failed"
+    fi
+}
+
+test_topic_closed_ends_session() {
+    info "Testing forum_topic_closed ends the bound session and cleans topic globals..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+ended = []
+cr.workers.get_registered_sessions = lambda registered=None: {'tX': {}}
+bridge.find_topic_session = lambda c, t, r: 'tX'
+cr.workers.end = lambda name: ended.append(name)
+bridge._topic_titles[(555, 70)] = 'x'
+bridge._awaiting_folder.add((555, 70))
+bridge._picker_sent_at[(555, 70)] = 1.0
+msg = {'message_thread_id': 70, 'forum_topic_closed': {}, 'chat': {'id': 555}}
+cr._handle_topic_message(msg, '', 555, 7)
+assert ended == ['tX'], ('closed must end the session:', ended)
+assert (555, 70) not in bridge._topic_titles, bridge._topic_titles
+assert (555, 70) not in bridge._awaiting_folder, bridge._awaiting_folder
+assert (555, 70) not in bridge._picker_sent_at, bridge._picker_sent_at
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "forum_topic_closed ends session + cleans globals"
+    else
+        fail "topic closed-ends-session test failed"
+    fi
+}
+
+test_topic_reopened_unbound_shows_picker() {
+    info "Testing forum_topic_reopened acts like a fresh topic (picker when unbound, silent when bound)..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+cr.workers.get_registered_sessions = lambda registered=None: {}
+shown = []
+routed = []
+cr._send_folder_picker = lambda c, t: shown.append((c, t))
+cr.route_message = lambda name, text, chat_id, msg_id: routed.append((name, text))
+bridge.find_topic_session = lambda c, t, r: None
+msg = {'message_thread_id': 71, 'forum_topic_reopened': {}, 'chat': {'id': 555}}
+cr._handle_topic_message(msg, '', 555, 8)
+assert shown == [(555, 71)], ('reopened unbound should show picker:', shown)
+# Already bound: no picker, and the service message must NOT be routed
+bridge.find_topic_session = lambda c, t, r: 'tY'
+cr._handle_topic_message(msg, '', 555, 9)
+assert shown == [(555, 71)], ('reopened bound must not re-prompt:', shown)
+assert routed == [], ('service message must never be routed:', routed)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "forum_topic_reopened: picker when unbound, silent when bound"
+    else
+        fail "topic reopened test failed"
+    fi
+}
+
+test_deleted_topic_reaped_on_send_failure() {
+    info "Testing a thread-not-found send failure reaps the session (topic deleted has no event)..."
+    if python3 -c "
+import bridge
+ended = []
+bridge.worker_manager.end = lambda name: ended.append(name)
+bridge.load_topic_meta = lambda name: (555, 72)
+bridge.get_worker_host = lambda name: None
+bridge._topic_titles[(555, 72)] = 'x'
+calls = []
+bridge.transport.send_text = (lambda chat_id, text, parse_mode=None, reply_to=None,
+    message_thread_id=None: calls.append(text) or
+    {'ok': False, 'error_code': 400, 'description': 'Bad Request: message thread not found'})
+bridge.send_response_to_telegram('tZ', 'hello', 555)
+assert ended == ['tZ'], ('dead topic must reap session:', ended)
+assert len(calls) == 1, ('no futile retry after thread-not-found:', calls)
+assert (555, 72) not in bridge._topic_titles, bridge._topic_titles
+# Other 400s are NOT reaped (HTML parse errors etc.)
+assert not bridge._reap_dead_topic('tZ', {'ok': False, 'error_code': 400, 'description': 'Bad Request: parse error'})
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "deleted topic reaped on thread-not-found send failure"
+    else
+        fail "dead-topic reap test failed"
+    fi
+}
+
+test_topic_photo_routed_with_local_path() {
+    info "Testing a photo sent in a topic is downloaded and routed with its local path..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+cr.workers.get_registered_sessions = lambda registered=None: {'tP': {}}
+bridge.find_topic_session = lambda c, t, r: 'tP'
+dl = []
+bridge.download_telegram_file = lambda file_id, target: dl.append((file_id, target)) or '/tmp/in/x.jpg'
+routed = []
+cr.route_message = lambda name, text, chat_id, msg_id: routed.append((name, text))
+msg = {'message_thread_id': 90, 'chat': {'id': 555}, 'caption': 'look at this',
+       'photo': [{'file_id': 'small', 'file_size': 10}, {'file_id': 'big', 'file_size': 99}]}
+cr._handle_topic_message(msg, 'look at this', 555, 7)
+assert dl == [('big', 'tP')], ('largest photo downloaded into the session inbox:', dl)
+assert routed and routed[0][0] == 'tP', routed
+assert '/tmp/in/x.jpg' in routed[0][1] and 'look at this' in routed[0][1], routed
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "topic photo downloaded + routed with local path"
+    else
+        fail "topic photo routing test failed"
+    fi
+}
+
+test_topic_document_routed_with_metadata() {
+    info "Testing a document sent in a topic routes with name/size/path..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+cr.workers.get_registered_sessions = lambda registered=None: {'tP': {}}
+bridge.find_topic_session = lambda c, t, r: 'tP'
+bridge.download_telegram_file = lambda file_id, target: '/tmp/in/spec.pdf'
+routed = []
+cr.route_message = lambda name, text, chat_id, msg_id: routed.append((name, text))
+msg = {'message_thread_id': 90, 'chat': {'id': 555},
+       'document': {'file_id': 'd1', 'file_name': 'spec.pdf', 'file_size': 2048, 'mime_type': 'application/pdf'}}
+cr._handle_topic_message(msg, '', 555, 7)
+assert routed, 'document must be routed'
+assert 'spec.pdf' in routed[0][1] and '/tmp/in/spec.pdf' in routed[0][1], routed
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "topic document routed with metadata + path"
+    else
+        fail "topic document routing test failed"
+    fi
+}
+
+test_topic_voice_transcribed_transparently() {
+    info "Testing a voice message in a topic routes its transcript as plain text..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+cr.workers.get_registered_sessions = lambda registered=None: {'tP': {}}
+bridge.find_topic_session = lambda c, t, r: 'tP'
+bridge.download_telegram_file = lambda file_id, target: '/tmp/in/v.ogg'
+bridge.transcribe_voice = lambda path: '幫我跑測試'
+routed = []
+cr.route_message = lambda name, text, chat_id, msg_id: routed.append((name, text))
+msg = {'message_thread_id': 90, 'chat': {'id': 555},
+       'voice': {'file_id': 'v1', 'duration': 3}}
+cr._handle_topic_message(msg, '', 555, 7)
+assert routed == [('tP', '幫我跑測試')], ('transcript should route as if typed:', routed)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "topic voice transcribed and routed transparently"
+    else
+        fail "topic voice transcription test failed"
+    fi
+}
+
+test_topic_media_before_binding_not_forwarded() {
+    info "Testing media in an unbound topic acts as trigger only (picker, no download)..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+bridge._picker_sent_at.clear()
+cr.workers.get_registered_sessions = lambda registered=None: {}
+bridge.find_topic_session = lambda c, t, r: None
+dl = []
+bridge.download_telegram_file = lambda file_id, target: dl.append(file_id) or '/tmp/x'
+routed = []
+cr.route_message = lambda name, text, chat_id, msg_id: routed.append((name, text))
+shown = []
+cr._send_folder_picker = lambda c, t: shown.append((c, t))
+msg = {'message_thread_id': 91, 'chat': {'id': 555},
+       'photo': [{'file_id': 'p', 'file_size': 5}]}
+cr._handle_topic_message(msg, '', 555, 7)
+assert shown == [(555, 91)], ('unbound media should summon picker:', shown)
+assert dl == [] and routed == [], ('media must not download/route before binding:', dl, routed)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "media before binding is trigger-only"
+    else
+        fail "unbound media test failed"
+    fi
+}
+
 test_topic_folder_callback_data_within_limit() {
     info "Testing folder-picker callback_data stays <= 64 bytes for deep paths (token, not full path)..."
     if python3 -c "
@@ -19543,6 +19794,15 @@ run_unit_tests() {
     run_test test_topic_first_message_trigger_not_forwarded
     run_test test_topic_trigger_swallowed_in_grace_window
     run_test test_topic_picker_shown_on_topic_creation
+    run_test test_hire_does_not_set_focus
+    run_test test_startup_message_topic_semantics
+    run_test test_topic_closed_ends_session
+    run_test test_topic_reopened_unbound_shows_picker
+    run_test test_deleted_topic_reaped_on_send_failure
+    run_test test_topic_photo_routed_with_local_path
+    run_test test_topic_document_routed_with_metadata
+    run_test test_topic_voice_transcribed_transparently
+    run_test test_topic_media_before_binding_not_forwarded
     run_test test_topic_folder_callback_data_within_limit
     run_test test_topic_typing_targets_thread
     run_test test_hook_reply_targets_thread

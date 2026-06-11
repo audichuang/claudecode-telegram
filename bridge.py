@@ -5480,7 +5480,8 @@ class WorkerManager:
             # standalone greeting here to avoid a duplicate "你好" reply.
             self.send(name, welcome)
 
-        set_focus(name)
+        # No focus/active concept: a 話題 IS the addressing — which session you
+        # talk to is decided by which topic you type in, never by bridge state.
         _registry_add(name, backend, chat_id)
 
         if not backend_obj.is_interactive:
@@ -5987,6 +5988,44 @@ def _localize_media(name: str, media_list: list) -> list:
     return result
 
 
+def _build_startup_lines(sessions):
+    """Startup notification in topic semantics: how many 話題 sessions survive.
+
+    No Team:/Focused:/hire framing — the topic list IS the session list.
+    """
+    n = len(sessions)
+    if n:
+        return [f"✅ Bridge 上線 — {n} 個話題 session 存活（{', '.join(sessions)}）"]
+    return ["✅ Bridge 上線 — 目前沒有存活的話題 session，建立新話題即可開工。"]
+
+
+def _reap_dead_topic(name, result):
+    """End a session whose 話題 no longer exists.
+
+    Telegram sends NO event when a topic is deleted, so the only signal is a
+    reply bouncing with "message thread not found". Returns True when reaped
+    (callers should stop retrying — the thread is gone, not malformed).
+    """
+    desc = ((result or {}).get("description") or "").lower()
+    if "thread not found" not in desc:
+        return False
+    print(f"話題 gone for {name} ({desc}) — ending its session", flush=True)
+    try:
+        cid, tid = load_topic_meta(name)
+        if cid is not None and tid is not None:
+            key = (int(cid), int(tid))
+            _awaiting_folder.discard(key)
+            _picker_sent_at.pop(key, None)
+            _topic_titles.pop(key, None)
+    except Exception:
+        pass
+    try:
+        worker_manager.end(name)
+    except Exception as e:
+        print(f"Failed to end {name} after topic deletion: {e}", flush=True)
+    return True
+
+
 def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: str = "Response"):
     """Send a response to Telegram. Shared by hook responses.
 
@@ -6059,6 +6098,10 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
                 else:
                     print(f"{log_prefix} sent: {name} -> Telegram OK")
             else:
+                # The topic was deleted (no Telegram event exists for that):
+                # reap the session instead of retrying into a void.
+                if _reap_dead_topic(name, result):
+                    return
                 # Fallback: retry as plain text on HTTP 400 (HTML parse error)
                 desc = (result or {}).get("description", "")
                 error_code = (result or {}).get("error_code", 0)
@@ -6491,22 +6534,8 @@ class CommandRouter:
             self.transport.send_text(chat_id, text)
 
     def send_startup_message(self, chat_id):
-        registered = self.workers.get_registered_sessions()
-        sessions = list(registered.keys())
-        active = state["active"]
-
-        lines = ["I'm online and ready."]
-        if sessions:
-            lines.append(f"Team: {', '.join(sessions)}")
-            if active:
-                lines.append(f"Focused: {active}")
-        else:
-            lines.append("No workers yet. Hire your first long-lived worker with /hire <name>.")
-
-        if SANDBOX_ENABLED:
-            lines.append(f"Sandbox: {Path.home()} → /workspace")
-
-        self.reply(chat_id, "\n".join(lines))
+        sessions = list(self.workers.get_registered_sessions().keys())
+        self.reply(chat_id, "\n".join(_build_startup_lines(sessions)))
 
     def handle_callback(self, update):
         """Handle a Telegram callback_query from the folder navigator keyboard.
@@ -6577,6 +6606,107 @@ class CommandRouter:
         welcome = self.workers._build_welcome(name, get_backend(DEFAULT_BACKEND))
         self.route_message(name, welcome, chat_id, None)
 
+    def _topic_media_text(self, msg, caption, name):
+        """Download any media in a topic message into ``name``'s inbox and
+        return the text to route (caption + local path), or None if the
+        message carries no media.
+
+        The topic IS the addressing, so unlike the legacy path there is no
+        focus check — media lands in the session the 話題 is bound to. Voice
+        is transcribed transparently (the worker sees plain text).
+        """
+        photo = msg.get("photo")
+        document = msg.get("document")
+        animation = msg.get("animation")
+        audio = msg.get("audio")
+        voice = msg.get("voice")
+        video = msg.get("video")
+        video_note = msg.get("video_note")
+        sticker = msg.get("sticker")
+
+        doc_is_image = bool(document) and document.get("mime_type", "").startswith("image/")
+
+        def with_caption(body):
+            return f"{caption}\n\n{body}" if caption else body
+
+        if animation:
+            local = download_telegram_file(animation.get("file_id"), name)
+            if not local:
+                self.reply(msg.get("chat", {}).get("id"), "GIF 下載失敗，請再試一次。")
+                return ""
+            return with_caption(f"Manager sent GIF: `{local}`")
+
+        if photo or doc_is_image:
+            if photo:
+                largest = max(photo, key=lambda p: p.get("file_size", 0))
+                file_id = largest.get("file_id")
+            else:
+                file_id = document.get("file_id")
+            local = download_telegram_file(file_id, name)
+            if not local:
+                self.reply(msg.get("chat", {}).get("id"), "圖片下載失敗，請再試一次。")
+                return ""
+            return with_caption(f"Manager sent image: `{local}`")
+
+        if document:
+            local = download_telegram_file(document.get("file_id"), name)
+            if not local:
+                self.reply(msg.get("chat", {}).get("id"), "檔案下載失敗，請再試一次。")
+                return ""
+            size_str = format_file_size(document.get("file_size", 0))
+            return with_caption(
+                f"Manager sent file: {document.get('file_name', 'unknown')} "
+                f"({size_str}, {document.get('mime_type', 'unknown')})\nPath: `{local}`"
+            )
+
+        media_item = audio or voice or video or video_note or sticker
+        if media_item:
+            local = download_telegram_file(media_item.get("file_id"), name)
+            if not local:
+                self.reply(msg.get("chat", {}).get("id"), "媒體下載失敗，請再試一次。")
+                return ""
+            if voice:
+                transcript = transcribe_voice(local)
+                if transcript:
+                    # Transparent: the worker receives just the text, as if typed.
+                    return f"{caption}\n\n{transcript}" if caption else transcript
+                return with_caption(
+                    f"Manager sent voice message: ({voice.get('duration', 0)}s)\nPath: `{local}`")
+            if audio:
+                title = audio.get("title", audio.get("file_name", "audio"))
+                return with_caption(
+                    f"Manager sent audio: {title} ({audio.get('duration', 0)}s)\nPath: `{local}`")
+            if video:
+                return with_caption(
+                    f"Manager sent video: {video.get('file_name', 'video')} "
+                    f"({video.get('duration', 0)}s)\nPath: `{local}`")
+            if video_note:
+                return with_caption(
+                    f"Manager sent video note: ({video_note.get('duration', 0)}s)\nPath: `{local}`")
+            if sticker:
+                return with_caption(
+                    f"Manager sent sticker: {sticker.get('emoji', '')}\nPath: {local}")
+
+        return None
+
+    def _end_topic_session(self, chat_id, thread_id, reason=""):
+        """End the session bound to (chat_id, thread_id) and drop its topic state.
+
+        The single lifecycle exit shared by /close, the forum_topic_closed
+        service message, and the dead-topic reaper. Returns the ended session
+        name, or None if the topic had no session.
+        """
+        key = (int(chat_id), int(thread_id))
+        _awaiting_folder.discard(key)
+        _picker_sent_at.pop(key, None)
+        _topic_titles.pop(key, None)
+        name = find_topic_session(chat_id, thread_id, self.workers.get_registered_sessions())
+        if name:
+            self.workers.end(name)
+            print(f"Topic session ended ({reason or 'closed'}): {name} thread={thread_id}",
+                  flush=True)
+        return name
+
     def _send_folder_picker(self, chat_id, thread_id):
         """Show the root-confined folder navigator in a 話題 thread.
 
@@ -6631,6 +6761,20 @@ class CommandRouter:
                 self._send_folder_picker(chat_id, tid)
             return
 
+        # Topic lifecycle is symmetric: closing the 話題 ends its session (the
+        # spec's "closing/deleting the 話題 → ends that session"). NOTE: these
+        # service payloads are EMPTY objects, so test membership — not truthiness.
+        if "forum_topic_closed" in msg:
+            self._end_topic_session(chat_id, thread_id, reason="話題已關閉")
+            return
+        # Reopening is a fresh start: the old session was ended on close, so an
+        # unbound reopened topic gets the folder picker again. If a session is
+        # still bound (close event was missed), just keep routing to it.
+        if "forum_topic_reopened" in msg:
+            if not find_topic_session(chat_id, thread_id, self.workers.get_registered_sessions()):
+                self._send_folder_picker(chat_id, thread_id)
+            return
+
         registered = self.workers.get_registered_sessions()
 
         # Parse a leading command token the same way handle_command does:
@@ -6647,12 +6791,11 @@ class CommandRouter:
             self.reply(chat_id, format_quota(read_usage_snapshot()))
             return
 
-        # /close — end this thread's session.
+        # /close — end this thread's session (same lifecycle path as the
+        # forum_topic_closed service message).
         if cmd == "/close":
-            _awaiting_folder.discard((chat_id, thread_id))
-            name = find_topic_session(chat_id, thread_id, registered)
+            name = self._end_topic_session(chat_id, thread_id, reason="/close")
             if name:
-                self.workers.end(name)
                 self.reply(chat_id, f"已關閉這個話題的工作階段（{name}）。")
             else:
                 self.reply(chat_id, "這個話題還沒有工作階段。")
@@ -6705,11 +6848,20 @@ class CommandRouter:
                 return
             self.reply(chat_id, "請點上面的資料夾按鈕來選擇工作目錄（輸入文字無法選擇）。")
         elif name:
-            self.route_message(name, text, chat_id, msg_id)
+            # Media (photo/file/voice/...) is downloaded into this session's
+            # inbox and delivered as a local path; '' means a failed download
+            # (already reported), None means a plain text message.
+            media_text = self._topic_media_text(msg, text, name)
+            if media_text == "":
+                return
+            outgoing = media_text if media_text is not None else text
+            if not outgoing:
+                return
+            self.route_message(name, outgoing, chat_id, msg_id)
         else:
             # Unknown topic with no picker yet (created-event missed, e.g.
             # after a bridge restart): the message is just the trigger — show
-            # the picker, never forward the text.
+            # the picker, never forward the text (or media).
             self._send_folder_picker(chat_id, thread_id)
 
     def handle_message(self, update):
@@ -12020,13 +12172,8 @@ def main():
             if tmux_exists(tmux_name, host=host):
                 export_hook_env(tmux_name, backend_name, host=host)
 
-    # Restore focus only to a still-existing worker; otherwise leave it cleared.
-    last_active = load_last_active()
-    state["active"] = reconcile_startup_focus(last_active, registered)
-    if state["active"]:
-        print(f"Restored last active worker: {state['active']}")
-    elif last_active:
-        print(f"Last active worker '{last_active}' no longer exists; no focus set")
+    # No focus/active restoration: in topic mode the 話題 decides which session
+    # a message reaches — the bridge keeps no "current worker" state.
 
     # Log team dir and checkin note status
     if os.path.isdir(TEAM_DIR):
@@ -12049,7 +12196,6 @@ def main():
     setup_bot_commands()
     print(f"Multi-Session Bridge on {BRIDGE_BIND}:{PORT}")
     print(f"Hook endpoint: http://localhost:{PORT}/response")
-    print(f"Active: {state['active'] or 'none'}")
     print(f"Sessions: {list(registered.keys()) or 'none'}")
     if WEBHOOK_SECRET:
         print("Webhook verification: enabled")
@@ -12076,21 +12222,9 @@ def main():
     # Send startup notification if we have a last known chat ID
     if last_chat_id:
         state["startup_notified"] = True
-        sessions = list(registered.keys())
-        active = state["active"]
-
-        lines = ["I'm online and ready."]
-        if sessions:
-            lines.append(f"Team: {', '.join(sessions)}")
-            if active:
-                lines.append(f"Focused: {active}")
-        else:
-            lines.append("No workers yet. Hire your first long-lived worker with /hire <name>.")
-
-        if SANDBOX_ENABLED:
-            lines.append(f"Sandbox: {Path.home()} → /workspace")
-
-        result = transport.send_text(last_chat_id, "\n".join(lines))
+        result = transport.send_text(
+            last_chat_id, "\n".join(_build_startup_lines(list(registered.keys())))
+        )
         if result and result.get("ok"):
             print(f"Sent startup notification to chat {last_chat_id}")
         else:
