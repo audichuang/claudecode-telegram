@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 0.34.0
+> Version: 1.0.0
 
 ## Current Philosophy (Summary)
 
@@ -14,7 +14,7 @@
 | **Token isolation** | `TELEGRAM_BOT_TOKEN` never leaves bridge process |
 | **Admin config** | Pre-set via `ADMIN_CHAT_ID` or auto-learn first user |
 | **Secure by default** | 0o700 dirs, 0o600 files, silent rejection of non-admins |
-| **Decentralized worker comms** | Bridge provides discovery only; workers communicate directly via protocol |
+| **話題 IS the addressing** | One forum topic = one session; no focus/active state, no worker names to type |
 
 ---
 
@@ -339,6 +339,42 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.0.0 - Topic-only bridge (the multi-worker era is deleted)
+
+**BREAKING:** the legacy non-topic router is gone. One Telegram forum 話題 =
+one session is the ONLY model; `TOPIC_MODE` is hardwired True (the env var is
+no longer consulted). bridge.py shrank 12,219 → 9,846 lines; test.sh dropped
+~5.5k lines of tests for deleted machinery (275 FAST tests remain, all green).
+
+**Topic lifecycle is symmetric (C1):**
+- `forum_topic_closed` ends the bound session (same exit as `/close`);
+  `forum_topic_reopened` acts as a fresh topic (folder picker when unbound).
+- Deleted topics emit NO Telegram event — a reply bouncing with
+  "message thread not found" reaps the session (no retry into the void).
+
+**No focus/active state (C3):** `hire()` no longer set_focus; startup no
+longer restores a "last active worker"; both startup notifications unified to
+"✅ Bridge 上線 — N 個話題 session 存活". `state["active"]`, `set_focus`,
+`save/load_last_active`, `LAST_ACTIVE_FILE` deleted.
+
+**Media works inside topics (was silently dropped):** photos/files/GIF/audio/
+video/sticker download into the session inbox and route as local paths; voice
+transcribes transparently. Media before the folder pick is trigger-only.
+
+**Deleted (C4):**
+- Orchestration: `/hire /focus /team /end /progress /pause /restart`,
+  per-worker `/<name>` shortcuts, `@mention`/`@all`, restart-all, the legacy
+  `BOT_COMMANDS` menu, `_last_mention`.
+- Teleport (1,355 lines): commands, git push/pull state, preflight/rollback,
+  registry fields; `get_worker_host()` is hardwired None (all sessions local;
+  remaining `host=` branches are provably dead, to fold in a cosmetic pass).
+- Backends: Codex/Gemini/OpenCode adapters (`BACKENDS={"claude"}`), worker
+  pipes' non-interactive users, the gRPC server, the `/register` forge endpoint.
+
+**Kept:** watchdog/typing/emoji liveness, transport seam (telegram/local),
+hook reply path, `/cd /close /memory /quota /voice /settings /rewind /pr`,
+multi-node prod/dev/test isolation (shell layer), team memory, uv toolchain.
 
 ### v0.34.0 - First message is a trigger, never a task
 

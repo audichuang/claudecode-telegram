@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIG + GLOBALS
 # ============================================================
 
-VERSION="0.34.0"
+VERSION="1.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # uv-managed interpreter: prefer the synced .venv, fall back to system python3.
@@ -510,7 +510,7 @@ cmd_run() {
         log "$(dim "Hooks already installed")"
     fi
 
-    log "$(dim "No default session - use /hire <name> from Telegram")"
+    log "$(dim "No default session - create a 話題 (topic) in your forum group to start one")"
 
     # Set up env vars for bridge
     export TELEGRAM_BOT_TOKEN="$token" PORT="$port"
@@ -622,9 +622,9 @@ cmd_run() {
     fi
 
     log ""
-    log "$(bold "Ready!") Send /hire <name> to your bot to create a Claude instance"
+    log "$(bold "Ready!") Create a 話題 (topic) in your forum group to open a Claude session"
     log ""
-    log "$(bold "Commands:") /hire /focus /team /progress /pause /restart /end"
+    log "$(bold "Commands:") /cd /close /memory /quota /voice /settings /rewind /pr"
     log "$(dim "Ctrl+C to stop")"
     if [[ -n "$tunnel_pid" ]]; then
         log "$(dim "Tunnel watchdog: enabled (auto-restart on failure)")"
@@ -1521,17 +1521,15 @@ MULTI-NODE
   ./claudecode-telegram.sh --node prod stop       # Stop prod only
   ./claudecode-telegram.sh --all status           # Status of all nodes
 
-TELEGRAM COMMANDS
-  /hire <name>      Create new Claude instance
-  /focus <name>     Switch active Claude
-  /team             List all instances
-  /end <name>       Stop and remove instance
-  /progress         Detailed status of focused worker
-  /pause            Interrupt active Claude
-  /restart          Restart worker (--clean for fresh start)
-  /learn            Ask focused worker what they learned
-  @name <msg>       One-off message to specific Claude
-  <message>         Send to active Claude
+TELEGRAM (topic-only: one forum 話題 = one Claude session)
+  新話題 + 第一則訊息   開新 session（會跳資料夾選單）
+  /cd <path>        Switch this topic's working folder
+  /close            End this topic's session (closing the 話題 does too)
+  /memory <query>   Search team chat memory
+  /quota            Show subscriber usage
+  /voice on|off     Toggle voice replies
+  /settings         Show settings
+  <message>         Send to this topic's session
 
 SHELL COMMANDS
   run               Start bridge + tunnel + webhook

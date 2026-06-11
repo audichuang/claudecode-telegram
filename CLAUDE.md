@@ -67,7 +67,7 @@ The project is **uv-managed**. `pyproject.toml` declares deps (`markdown-it-py` 
 Workflow rules:
 - Use FAST mode during development (TDD inner loop); run default mode before committing; run FULL mode before pushing.
 - Write tests alongside features; focus on e2e behavior (not scaffolding).
-- Treat tests as usage examples; prefer real Telegram flows (hire → send → reply) and keep them deterministic.
+- Treat tests as usage examples; prefer real Telegram flows (開話題 → 選資料夾 → send → reply) and keep them deterministic.
 - When adding tests, follow `TEST.md`.
 - See `TEST.md` for mode definitions, env vars, isolation details, inventories, and manual/CI instructions.
 
