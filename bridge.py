@@ -27,13 +27,6 @@ from pathlib import Path
 from typing import Dict, Optional, Protocol
 
 try:
-    from bridge_grpc import BridgeGRPCServer
-    BRIDGE_GRPC_IMPORT_ERROR = None
-except ImportError as e:
-    BridgeGRPCServer = None
-    BRIDGE_GRPC_IMPORT_ERROR = e
-
-try:
     from gmail_connector import GmailConnector
     GMAIL_IMPORT_ERROR = None
 except ImportError as e:
@@ -68,8 +61,6 @@ if NODE_NAME and not os.environ.get("PORT"):
 else:
     PORT = int(os.environ.get("PORT", "8270"))
 
-GRPC_PORT = int(os.environ.get("BRIDGE_GRPC_PORT", str(PORT + 1)))
-grpc_server = None  # initialized in main()
 gmail_connector_instance = None  # initialized in main()
 github_connector_instance = None  # initialized in main()
 
@@ -280,22 +271,14 @@ def _remote_copy(src: str, dst: str, host: str = None, direction: str = "push"):
         subprocess.run(["scp", "-q", f"{host}:{src}", dst], capture_output=True)
 
 
-def parse_worker_target(target: str) -> tuple:
-    """Parse 'name@host' or 'name' into (name, host).
-
-    Returns (name, None) for local workers, (name, host) for remote.
-    """
-    if "@" in target:
-        name, host = target.rsplit("@", 1)
-        return name, host
-    return target, None
-
-
 def get_worker_host(name: str) -> Optional[str]:
-    """Get the SSH host for a worker from the persistent registry, or None if local."""
-    registry = _load_registry()
-    worker = registry.get("workers", {}).get(name, {})
-    return worker.get("host")
+    """Always None: teleport was removed in v1.0.0 — every session is local.
+
+    Kept as a function (rather than ripping out the 100+ host= call sites in
+    one sweep) so the remaining ``if host:`` branches are provably dead; they
+    can be folded away mechanically in a later cleanup pass.
+    """
+    return None
 
 
 def _project_slug(cwd: str) -> str:
@@ -344,242 +327,6 @@ def _ensure_bare_repo(project_name: str) -> str:
             ["git", "init", "--bare", bare_path],
             capture_output=True, text=True, check=True)
     return bare_path
-
-
-def _git_push_state(source_cwd: str, worker_name: str, bare_repo: str,
-                    host: str = None) -> Optional[dict]:
-    """Push working state to bare repo without mutating source.
-
-    Approach: temporarily `git add -A` to capture untracked files in the index,
-    run `git stash create` (non-mutating — creates commit without moving HEAD),
-    then `git reset` to restore original index. Working tree is never modified.
-
-    Returns metadata dict {orig_sha, orig_branch, staged_files, stash_sha}
-    or None on failure.
-    """
-    try:
-        # Get current HEAD
-        r = _remote_run(["git", "-C", source_cwd, "rev-parse", "HEAD"],
-                        host=host, capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            print(f"[git-sync] rev-parse HEAD failed: {r.stderr[:200]}")
-            return None
-        orig_sha = r.stdout.strip()
-
-        # Get current branch name (or "HEAD" if detached)
-        r = _remote_run(["git", "-C", source_cwd, "rev-parse", "--abbrev-ref", "HEAD"],
-                        host=host, capture_output=True, text=True, timeout=10)
-        orig_branch = r.stdout.strip() if r.returncode == 0 else "HEAD"
-
-        # Get originally staged files (before we touch the index)
-        r = _remote_run(["git", "-C", source_cwd, "diff", "--cached", "--name-only"],
-                        host=host, capture_output=True, text=True, timeout=15)
-        staged_files = [f for f in r.stdout.strip().split("\n") if f] if r.returncode == 0 else []
-
-        # Stage everything (including untracked) temporarily to capture in stash
-        _remote_run(["git", "-C", source_cwd, "add", "-A"],
-                    host=host, capture_output=True, text=True, timeout=30)
-
-        # Create stash commit (non-mutating — working tree untouched)
-        r = _remote_run(["git", "-C", source_cwd, "stash", "create"],
-                        host=host, capture_output=True, text=True, timeout=30)
-        stash_sha = r.stdout.strip() if r.returncode == 0 else ""
-
-        # Restore original index: reset, then re-stage originally staged files
-        _remote_run(["git", "-C", source_cwd, "reset", "HEAD"],
-                    host=host, capture_output=True, text=True, timeout=15)
-        if staged_files:
-            _remote_run(["git", "-C", source_cwd, "add", "--"] + staged_files,
-                        host=host, capture_output=True, text=True, timeout=15)
-
-        # Determine what to push: stash commit if dirty, HEAD if clean
-        push_sha = stash_sha if stash_sha else orig_sha
-        ref = f"refs/heads/teleport/{worker_name}"
-
-        # Push to bare repo
-        if host:
-            # Remote source → push to VPS bare repo via SSH
-            r = _remote_run(
-                ["git", "-C", source_cwd, "push", "--force",
-                 f"claude@100.125.36.102:{bare_repo}", f"{push_sha}:{ref}"],
-                host=host, capture_output=True, text=True, timeout=60)
-        else:
-            r = _remote_run(
-                ["git", "-C", source_cwd, "push", "--force",
-                 bare_repo, f"{push_sha}:{ref}"],
-                host=host, capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            print(f"[git-sync] push failed: {r.stderr[:200]}")
-            return None
-
-        return {
-            "orig_sha": orig_sha,
-            "orig_branch": orig_branch,
-            "staged_files": staged_files,
-            "stash_sha": stash_sha or None,
-        }
-    except Exception as e:
-        print(f"[git-sync] push state error: {e}")
-        return None
-
-
-def _git_pull_state(target_cwd: str, worker_name: str, bare_repo_url: str,
-                    metadata: dict, host: str = None) -> bool:
-    """Pull and apply working state on target. Returns success.
-
-    For fresh targets: clones from bare repo.
-    For existing targets: fetches and applies.
-    Restores branch, working tree changes, and staged files.
-    """
-    try:
-        orig_sha = metadata["orig_sha"]
-        orig_branch = metadata["orig_branch"]
-        staged_files = metadata.get("staged_files", [])
-        stash_sha = metadata.get("stash_sha")
-        ref = f"teleport/{worker_name}"
-
-        is_existing = False
-        try:
-            r = _remote_run(["git", "-C", target_cwd, "rev-parse", "--git-dir"],
-                            host=host, capture_output=True, text=True, timeout=10)
-            is_existing = r.returncode == 0
-        except Exception:
-            pass
-
-        if not is_existing:
-            # Fresh clone from bare repo
-            r = _remote_run(
-                ["git", "clone", "--no-checkout", bare_repo_url, target_cwd],
-                host=host, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                print(f"[git-sync] clone failed: {r.stderr[:200]}")
-                return False
-            # Configure user for the clone
-            _remote_run(["git", "-C", target_cwd, "config", "user.email", "teleport@bridge"],
-                        host=host, capture_output=True)
-            _remote_run(["git", "-C", target_cwd, "config", "user.name", "teleport"],
-                        host=host, capture_output=True)
-        else:
-            # Add/update remote pointing to bare repo
-            _remote_run(["git", "-C", target_cwd, "remote", "remove", "vps"],
-                        host=host, capture_output=True)
-            _remote_run(
-                ["git", "-C", target_cwd, "remote", "add", "vps", bare_repo_url],
-                host=host, capture_output=True, text=True, timeout=10)
-            # Fetch the teleport branch
-            r = _remote_run(
-                ["git", "-C", target_cwd, "fetch", "vps", ref],
-                host=host, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                print(f"[git-sync] fetch failed: {r.stderr[:200]}")
-                return False
-
-        # Checkout the original branch at the original commit
-        if orig_branch and orig_branch != "HEAD":
-            _remote_run(
-                ["git", "-C", target_cwd, "checkout", "-B", orig_branch, orig_sha],
-                host=host, capture_output=True, text=True, timeout=30)
-        else:
-            _remote_run(
-                ["git", "-C", target_cwd, "checkout", orig_sha],
-                host=host, capture_output=True, text=True, timeout=30)
-
-        # Apply the stash if there were uncommitted changes
-        if stash_sha:
-            # Fetch the stash commit (it's on the teleport branch)
-            # For fresh clones, it's already available. For existing, we fetched it.
-            # Use FETCH_HEAD or the ref directly
-            fetch_ref = f"vps/{ref}" if is_existing else f"origin/{ref}"
-
-            # Apply stash: the teleport branch tip IS the stash commit
-            r = _remote_run(
-                ["git", "-C", target_cwd, "stash", "apply", fetch_ref],
-                host=host, capture_output=True, text=True, timeout=30)
-            if r.returncode != 0:
-                # Fallback: try direct SHA if ref doesn't resolve
-                # The stash SHA was pushed as the branch tip
-                _remote_run(
-                    ["git", "-C", target_cwd, "read-tree", "-u", "--reset", orig_sha],
-                    host=host, capture_output=True, text=True, timeout=15)
-                r = _remote_run(
-                    ["git", "-C", target_cwd, "cherry-pick", "--no-commit", fetch_ref],
-                    host=host, capture_output=True, text=True, timeout=30)
-
-            # Re-stage originally staged files
-            if staged_files:
-                # First reset index to HEAD (stash apply may have staged everything)
-                _remote_run(["git", "-C", target_cwd, "reset", "HEAD"],
-                            host=host, capture_output=True, text=True, timeout=15)
-                _remote_run(["git", "-C", target_cwd, "add", "--"] + staged_files,
-                            host=host, capture_output=True, text=True, timeout=15)
-
-        return True
-    except Exception as e:
-        print(f"[git-sync] pull state error: {e}")
-        return False
-
-
-def _is_git_repo(cwd: str, host: str = None) -> bool:
-    """Check if cwd is inside a git repository."""
-    try:
-        r = _remote_run(
-            ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
-            host=host, capture_output=True, text=True, timeout=10)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def _get_project_name(cwd: str, host: str = None) -> Optional[str]:
-    """Derive project name from git remote.origin.url.
-
-    Returns short name (e.g., 'omi' from 'https://github.com/BasedHardware/omi.git')
-    or None if no origin remote.
-    """
-    try:
-        r = _remote_run(
-            ["git", "-C", cwd, "config", "--get", "remote.origin.url"],
-            host=host, capture_output=True, text=True, timeout=10)
-        if r.returncode != 0 or not r.stdout.strip():
-            return None
-        url = r.stdout.strip()
-        # Strip trailing .git
-        if url.endswith(".git"):
-            url = url[:-4]
-        # Handle SSH (git@host:org/repo) and HTTPS (https://host/org/repo)
-        if ":" in url and not url.startswith("http"):
-            # SSH format: git@github.com:Org/repo
-            name = url.rsplit("/", 1)[-1] if "/" in url.split(":")[-1] else url.split(":")[-1]
-        else:
-            # HTTPS format
-            name = url.rsplit("/", 1)[-1]
-        return name if name else None
-    except Exception:
-        return None
-
-
-def _registry_update_teleport(name: str, host: str, home_host: str, home_cwd: str):
-    """Update registry with teleport location info."""
-    with _watchdog_lock:
-        data = _load_registry()
-        worker = data.get("workers", {}).get(name, {})
-        worker["host"] = host
-        worker["home_host"] = home_host
-        worker["home_cwd"] = home_cwd
-        data.setdefault("workers", {})[name] = worker
-        _save_registry(data)
-
-
-def _registry_clear_teleport(name: str):
-    """Clear teleport location info from registry (after teleback)."""
-    with _watchdog_lock:
-        data = _load_registry()
-        worker = data.get("workers", {}).get(name, {})
-        worker.pop("host", None)
-        worker.pop("home_host", None)
-        worker.pop("home_cwd", None)
-        data.setdefault("workers", {})[name] = worker
-        _save_registry(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -864,65 +611,9 @@ class ClaudeBackend:
         return is_process_running(tmux_name, "claude")
 
 
-class CodexBackend:
-    """OpenAI Codex CLI - non-interactive mode."""
-    name = "codex"
-    binary = "codex"
-    is_interactive = False
-
-    def start_cmd(self, resume_id: str = "") -> str:
-        return "echo 'Codex worker ready (non-interactive)'"
-
-    def send(self, worker_name: str, tmux_name: str, text: str,
-             bridge_url: str, sessions_dir: Path) -> bool:
-        adapter = Path(__file__).parent / "hooks" / "codex-tmux-adapter.py"
-        return _spawn_adapter(adapter, worker_name, text, bridge_url, sessions_dir)
-
-    def is_online(self, tmux_name: str) -> bool:
-        return tmux_exists(tmux_name)
-
-
-class GeminiBackend:
-    """Google Gemini CLI - non-interactive mode (stub)."""
-    name = "gemini"
-    binary = "gemini"
-    is_interactive = False
-
-    def start_cmd(self, resume_id: str = "") -> str:
-        return "echo 'Gemini worker ready (non-interactive)'"
-
-    def send(self, worker_name: str, tmux_name: str, text: str,
-             bridge_url: str, sessions_dir: Path) -> bool:
-        adapter = Path(__file__).parent / "hooks" / "gemini-adapter.py"
-        return _spawn_adapter(adapter, worker_name, text, bridge_url, sessions_dir)
-
-    def is_online(self, tmux_name: str) -> bool:
-        return tmux_exists(tmux_name)
-
-
-class OpenCodeBackend:
-    """OpenCode CLI - non-interactive mode (stub)."""
-    name = "opencode"
-    binary = "opencode"
-    is_interactive = False
-
-    def start_cmd(self, resume_id: str = "") -> str:
-        return "echo 'OpenCode worker ready (non-interactive)'"
-
-    def send(self, worker_name: str, tmux_name: str, text: str,
-             bridge_url: str, sessions_dir: Path) -> bool:
-        adapter = Path(__file__).parent / "hooks" / "opencode-adapter.py"
-        return _spawn_adapter(adapter, worker_name, text, bridge_url, sessions_dir)
-
-    def is_online(self, tmux_name: str) -> bool:
-        return tmux_exists(tmux_name)
-
-
+# Claude is the only backend (codex/gemini/opencode adapters removed in v1.0.0).
 BACKENDS = {
     "claude": ClaudeBackend(),
-    "codex": CodexBackend(),
-    "gemini": GeminiBackend(),
-    "opencode": OpenCodeBackend(),
 }
 
 # Track inflight adapter processes per worker (non-interactive backends only)
@@ -1012,15 +703,14 @@ def is_claude_running(tmux_name: str, host: str = None) -> bool:
     return is_process_running(tmux_name, "claude", host=host)
 
 
-# In-memory state (RAM only, no persistence - tmux IS the persistence)
+# In-memory state (RAM only, no persistence - tmux IS the persistence).
+# No "active/focused" entry: the 話題 a message arrives in IS the addressing.
 state = {
-    "active": None,  # Currently active session name
     "startup_notified": False,  # Whether we've sent the startup message
     "tts_enabled": False,  # Auto-TTS for worker responses (toggle with /voice)
 }
 
 # Consecutive @mention tracking (auto-focus after 2 in a row to same worker)
-_last_mention = {"target": None, "count": 0}
 
 # Watchdog state
 _worker_states = {}  # name -> (state, reason, since)
@@ -1053,7 +743,6 @@ admin_chat_id = int(ADMIN_CHAT_ID_ENV) if ADMIN_CHAT_ID_ENV else None
 # Persistence files (in node directory, survives restart)
 NODE_DIR = SESSIONS_DIR.parent  # ~/.claude/telegram/nodes/<node>
 LAST_CHAT_ID_FILE = NODE_DIR / "last_chat_id"
-LAST_ACTIVE_FILE = NODE_DIR / "last_active"
 
 # Claude Code stores transcripts at ~/.claude/projects/<slug>/<uuid>.jsonl.
 # Overridable in tests.
@@ -1064,27 +753,8 @@ REWIND_TOKENS = {}
 PR_REVIEW_TOKENS = {}
 REWIND_TIMEOUT = 5 * 60  # 5 minutes
 
-BOT_COMMANDS = [
-    # Daily commands (frequency-first, natural workflow order)
-    {"command": "team", "description": "Show your team"},
-    {"command": "focus", "description": "Focus a worker: /focus <name>"},
-    {"command": "progress", "description": "Check focused worker status"},
-    {"command": "pause", "description": "Pause focused worker"},
-    {"command": "restart", "description": "Restart worker (--clean for fresh)"},
-    # Occasional
-    {"command": "voice", "description": "Toggle voice replies: /voice on|off"},
-    {"command": "settings", "description": "Show settings"},
-    {"command": "pilot", "description": "Toggle pilot access: /pilot <name>"},
-    {"command": "rewind", "description": "Transcript viewer: /rewind <name>"},
-    {"command": "pr", "description": "PR review viewer: /pr <github_pr_url>"},
-    {"command": "memory", "description": "Search team chat memory: /memory <query>"},
-    # Rare (onboarding/offboarding)
-    {"command": "hire", "description": "Hire a worker: /hire <name>"},
-    {"command": "end", "description": "Offboard a worker: /end <name>"},
-]
-
-# Topic-native command surface (used when TOPIC_MODE): one 話題 = one session, so
-# the multi-worker orchestration commands below are meaningless inside a topic.
+# Tombstones for the removed multi-worker orchestration era: typing one of
+# these in a 話題 gets a short hint instead of leaking to the worker as text.
 TOPIC_LEGACY_CMDS = {
     "/hire", "/focus", "/team", "/end", "/progress", "/pause", "/restart",
     "/teleport", "/teleport-check", "/teleback",
@@ -1137,46 +807,6 @@ def load_last_chat_id():
                 return int(chat_id)
     except Exception as e:
         print(f"Failed to load last_chat_id: {e}")
-    return None
-
-
-def save_last_active(name):
-    """Save last active worker name to file for auto-focus on restart."""
-    try:
-        NODE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-        LAST_ACTIVE_FILE.write_text(name)
-        LAST_ACTIVE_FILE.chmod(0o600)
-    except Exception as e:
-        print(f"Failed to save last_active: {e}")
-
-
-def load_last_active():
-    """Load last active worker name from file."""
-    try:
-        if LAST_ACTIVE_FILE.exists():
-            name = LAST_ACTIVE_FILE.read_text().strip()
-            if name:
-                return name
-    except Exception as e:
-        print(f"Failed to load last_active: {e}")
-    return None
-
-
-def set_focus(name):
-    """Set the active (focused) worker and persist it for restart."""
-    state["active"] = name
-    save_last_active(name)
-
-
-def clear_focus():
-    """Clear focus. Never auto-picks a replacement worker."""
-    state["active"] = None
-
-
-def reconcile_startup_focus(last_active, registered):
-    """Focus to restore on startup: last_active only if it still exists, else None."""
-    if last_active and last_active in registered:
-        return last_active
     return None
 
 
@@ -2154,7 +1784,7 @@ def get_workers(caller_from: str = None):
     is rendered from that caller's machine perspective.
     """
     _sync_worker_manager()
-    return _merge_grpc_workers(worker_manager.get_workers(caller_from=caller_from))
+    return worker_manager.get_workers(caller_from=caller_from)
 
 
 # download_telegram_file removed — use download_telegram_file() instead
@@ -2965,24 +2595,10 @@ def setup_bot_commands():
 
 
 def update_bot_commands():
-    """Update bot commands including dynamic worker shortcuts."""
-    if TOPIC_MODE:
-        # Topic-native: a slim, fixed menu — no per-worker /<name> shortcuts and
-        # no multi-worker orchestration commands, since each 話題 is its own session.
-        transport.setup_commands(list(TOPIC_BOT_COMMANDS))
-        print(f"Bot commands updated ({len(TOPIC_BOT_COMMANDS)} topic commands)")
-        return
-
-    commands = list(BOT_COMMANDS)  # Copy static commands
-
-    # Add worker shortcuts (e.g., /lee, /chen)
-    registered = get_registered_sessions()
-    for name in sorted(registered.keys()):
-        commands.append({"command": name, "description": f"Message {name}"})
-
-    transport.setup_commands(commands)
-    worker_count = len(registered)
-    print(f"Bot commands updated ({len(BOT_COMMANDS)} + {worker_count} workers)")
+    """Publish the topic-native command menu — a slim, fixed set. No per-worker
+    /<name> shortcuts and no orchestration commands: each 話題 is its own session."""
+    transport.setup_commands(list(TOPIC_BOT_COMMANDS))
+    print(f"Bot commands updated ({len(TOPIC_BOT_COMMANDS)} topic commands)")
 
 
 # ============================================================
@@ -3022,7 +2638,11 @@ TOPIC_ROOT = os.path.expanduser(os.environ.get("TOPIC_ROOT", "~"))
 # Topic-session routing mode. When on, inbound messages are routed by forum
 # thread (話題) instead of the legacy @mention/focus model. Default OFF so
 # legacy behavior is fully preserved.
-TOPIC_MODE = os.environ.get("TOPIC_MODE", "0") == "1"
+# Topic-only bridge (v1.0.0): one Telegram forum 話題 = one session. This is
+# the only mode — the legacy hire/focus/team router was removed. The constant
+# is kept (always True) so remaining gates read naturally until they are
+# folded away; the TOPIC_MODE env var is no longer consulted.
+TOPIC_MODE = True
 
 
 def _norm_under_root(path):
@@ -4329,56 +3949,6 @@ def validate_cwd(cwd: Optional[str], host: str = None) -> tuple[str, str]:
     return normalized, ""
 
 
-def parse_hire_args(raw: str) -> tuple[str, str]:
-    """Parse /hire arguments and return (name, backend).
-
-    Supports:
-    - /hire alice                    -> (alice, claude)
-    - /hire alice --backend codex    -> (alice, codex)
-    - /hire alice --codex            -> (alice, codex)  [legacy]
-    - /hire codex-alice              -> (alice, codex)  [prefix syntax]
-    """
-    parts = [p for p in (raw or "").split() if p]
-    backend = DEFAULT_BACKEND
-    name_parts = []
-    i = 0
-    while i < len(parts):
-        part = parts[i]
-        if part == "--backend" and i + 1 < len(parts):
-            backend = parts[i + 1]
-            i += 2
-            continue
-        elif part == "--codex":
-            # Legacy support
-            backend = "codex"
-        elif part.startswith("--"):
-            # Skip unknown flags
-            pass
-        else:
-            name_parts.append(part)
-        i += 1
-
-    if len(name_parts) != 1:
-        return "", backend
-
-    name = name_parts[0]
-
-    # Check for backend prefix syntax (e.g., codex-alice, gemini-bob)
-    for backend_name in list_backends():
-        prefix = f"{backend_name}-"
-        if name.startswith(prefix):
-            backend = backend_name
-            name = name[len(prefix):]
-            break
-
-    # Validate backend
-    if not is_valid_backend(backend):
-        # Return invalid backend so caller can show error
-        return name, backend
-
-    return name, backend
-
-
 def _format_watchdog_status(name: str, pending_lookup=None, state_snapshot: Optional[dict] = None) -> str:
     if pending_lookup is None:
         pending_lookup = is_pending
@@ -5052,25 +4622,6 @@ def get_worker_backend(name: str, session: Optional[dict] = None) -> str:
     return DEFAULT_BACKEND
 
 
-def _send_to_grpc_worker(name: str, message: str, from_name: str = "manager") -> bool:
-    if grpc_server is None:
-        return False
-
-    try:
-        if not grpc_server.is_worker_connected(name):
-            return False
-        if grpc_server.send_to_worker(name, message, from_name):
-            return True
-        print(f"gRPC send failed for '{name}', falling back to tmux backend")
-    except Exception as e:
-        print(f"gRPC send error for '{name}', falling back to tmux backend: {e}")
-    return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE: WorkerManager
-# ─────────────────────────────────────────────────────────────────────────────
-
 class WorkerManager:
     def __init__(self, sessions_dir: Path, tmux_prefix: str):
         self.sessions_dir = sessions_dir
@@ -5173,9 +4724,6 @@ class WorkerManager:
                     entry["tmux"] = f"{self.tmux_prefix}{name}"
                 registered[name] = entry
 
-        if state["active"] and state["active"] not in registered:
-            state["active"] = None
-
         return registered
 
     def is_online(self, name: str, session: dict = None) -> bool:
@@ -5209,8 +4757,6 @@ class WorkerManager:
     def send(self, name: str, message: str, chat_id: int = None, session: dict = None) -> bool:
         """Send message to worker using backend registry."""
         self._sync_paths()
-        if _send_to_grpc_worker(name, message, "manager"):
-            return True
         if not session:
             sessions = self.get_registered_sessions()
             session = sessions.get(name)
@@ -5534,9 +5080,6 @@ class WorkerManager:
         cleanup_worker_pipe(name)
         _registry_remove(name)
 
-        if state["active"] == name:
-            clear_focus()
-
         return True, None
 
     def restart(self, name: str, mode: str = "relaunch"):
@@ -5544,19 +5087,11 @@ class WorkerManager:
 
         If tmux session is gone but worker is in the persistent registry,
         re-creates the tmux session and restarts the backend (dead worker recovery).
-
-        For teleported workers, returns sentinel (False, "use_remote_restart") —
-        callers should route to CommandRouter._restart_remote_worker() instead.
         """
         self._sync_paths()
         registered = self.get_registered_sessions()
         if name not in registered:
             return False, f"Worker '{name}' not found"
-
-        # Teleported workers must be restarted via CommandRouter._restart_remote_worker
-        host = get_worker_host(name)
-        if host:
-            return False, "use_remote_restart"
 
         session = registered[name]
         backend_name = get_worker_backend(name, session)
@@ -5941,8 +5476,6 @@ def stop_docker_container(name):
 
 def send_to_worker(name: str, message: str, chat_id: Optional[int] = None) -> bool:
     """Send a message to a worker using the appropriate backend."""
-    if _send_to_grpc_worker(name, message, "manager"):
-        return True
     _sync_worker_manager()
     return worker_manager.send(name, message, chat_id)
 
@@ -6216,94 +5749,6 @@ def _mark_topic_request_done(name):
         print(f"[topic] done set_reaction failed for {name}: {e}")
 
 
-def handle_grpc_worker_response(name: str, text: str, payload: bytes = b""):
-    """Route a gRPC worker response through the same Telegram path as hooks."""
-    try:
-        if not name or not text:
-            print("gRPC response ignored: missing worker name or text")
-            return
-
-        chat_id_file = get_chat_id_file(name)
-        if not chat_id_file.exists():
-            print(f"gRPC response: no chat_id for session '{name}'")
-            return
-
-        chat_id = chat_id_file.read_text().strip()
-        print(f"gRPC response: {name} -> chat {chat_id} ({len(text)} chars)")
-
-        if payload:
-            try:
-                data = json.loads(payload.decode("utf-8"))
-                session_id = data.get("session_id", "")
-                if session_id:
-                    sid_file = ensure_session_dir(name) / "claude_session_id"
-                    old_sid = sid_file.read_text().strip() if sid_file.exists() else ""
-                    if old_sid != session_id:
-                        sid_file.write_text(session_id)
-                        sid_file.chmod(0o600)
-            except Exception as e:
-                print(f"gRPC response payload ignored for '{name}': {e}")
-
-        send_response_to_telegram(name, text, int(chat_id), log_prefix="gRPC response")
-        clear_pending(name)
-        mark_hook_event(name)
-    except Exception as e:
-        print(f"gRPC response error for '{name}': {e}")
-
-
-def handle_grpc_worker_register(name: str, host: str, version: str, tools: dict):
-    tool_names = ", ".join(sorted(tools.keys())) if tools else "none"
-    host_label = host or "unknown-host"
-    version_label = version or "unknown-version"
-    print(f"gRPC worker registered: {name} ({host_label}, {version_label}, tools: {tool_names})")
-
-
-def handle_grpc_worker_disconnect(name: str):
-    print(f"gRPC worker disconnected: {name}")
-
-
-def handle_grpc_jsonl_received(stream_id: str, data: bytes):
-    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", stream_id or "stream")
-    jsonl_dir = SESSIONS_DIR / "grpc-jsonl"
-    jsonl_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    jsonl_dir.chmod(0o700)
-    path = jsonl_dir / f"{safe_id}.jsonl"
-    path.write_bytes(data)
-    path.chmod(0o600)
-    print(f"gRPC JSONL received: {stream_id or safe_id} -> {path} ({len(data)} bytes)")
-
-
-def _merge_grpc_workers(workers: list) -> list:
-    """Include connected gRPC workers in /workers without changing tmux entries."""
-    if grpc_server is None:
-        return workers
-
-    try:
-        connected = grpc_server.get_connected_workers()
-    except Exception as e:
-        print(f"gRPC worker list unavailable: {e}")
-        return workers
-
-    existing = {worker.get("name") for worker in workers}
-    for worker in workers:
-        if worker.get("name") in connected:
-            worker["grpc_connected"] = True
-
-    for name in connected:
-        if name in existing:
-            continue
-        workers.append({
-            "name": name,
-            "machine": "",
-            "protocol": "grpc",
-            "address": f"{BRIDGE_BIND}:{GRPC_PORT}",
-            "grpc_connected": True,
-            "note": "Connected over gRPC MessageStream. Manager messages route through the gRPC stream.",
-        })
-
-    return workers
-
-
 def create_session(name, backend: str = DEFAULT_BACKEND, chat_id: int = None):
     """Create a new worker instance."""
     _sync_worker_manager()
@@ -6320,18 +5765,6 @@ def restart_claude(name, mode: str = "relaunch"):
     """Restart claude in an existing tmux session."""
     _sync_worker_manager()
     return worker_manager.restart(name, mode=mode)
-
-
-def switch_session(name):
-    """Switch active session."""
-    registered = get_registered_sessions()
-    if name not in registered:
-        return False, f"Worker '{name}' not found"
-
-    set_focus(name)
-    return True, None
-
-
 
 
 # ============================================================
@@ -6523,11 +5956,6 @@ class CommandRouter:
             transport = _LegacyTransportAdapter(transport)
         self.transport = transport
         self.workers = workers
-        # Restart-all state
-        self._restart_all_lock = threading.Lock()
-        self._restart_all_running = False
-        self._restart_all_abort = threading.Event()
-        self._restart_all_thread = None
 
     def reply(self, chat_id, text, outcome=None):
         if self.transport is not None:
@@ -6865,247 +6293,16 @@ class CommandRouter:
             self._send_folder_picker(chat_id, thread_id)
 
     def handle_message(self, update):
-        global admin_chat_id
-
         msg = update.get("message", {})
         text = msg.get("text", "") or msg.get("caption", "")
         chat_id = msg.get("chat", {}).get("id")
         msg_id = msg.get("message_id")
-
-        if TOPIC_MODE and chat_id:
-            return self._handle_topic_message(msg, text, chat_id, msg_id)
-
-        photo = msg.get("photo")
-        document = msg.get("document")
-        animation = msg.get("animation")
-        audio = msg.get("audio")
-        voice = msg.get("voice")
-        video = msg.get("video")
-        video_note = msg.get("video_note")
-        sticker = msg.get("sticker")
-
-        doc_is_image = False
-        if document:
-            mime_type = document.get("mime_type", "")
-            doc_is_image = mime_type.startswith("image/")
-
-        # Handle GIF/animation (Telegram sends these separately from photos)
-        if animation and chat_id:
-            file_id = animation.get("file_id")
-            if file_id:
-                if admin_chat_id is None:
-                    admin_chat_id = chat_id
-                elif chat_id != admin_chat_id:
-                    return
-
-                if not state["active"]:
-                    self.reply(chat_id, "No focused worker. Use /focus <name> first.")
-                    return
-
-                download_target = self._resolve_media_target(text, msg)
-                local_path = download_telegram_file(file_id, download_target)
-                if local_path:
-                    gif_text = f"Manager sent GIF: `{local_path}`"
-                    if text:
-                        gif_text = f"{text}\n\n{gif_text}"
-                    self._route_media_message(gif_text, text, chat_id, msg_id, msg=msg)
-                else:
-                    self.reply(chat_id, "Could not download GIF. Try again.")
-                return
-
-        if (photo or doc_is_image) and chat_id:
-            if photo:
-                largest = max(photo, key=lambda p: p.get("file_size", 0))
-                file_id = largest.get("file_id")
-            else:
-                file_id = document.get("file_id")
-
-            if file_id:
-                if admin_chat_id is None:
-                    admin_chat_id = chat_id
-                elif chat_id != admin_chat_id:
-                    return
-
-                if not state["active"]:
-                    self.reply(chat_id, "No focused worker. Use /focus <name> first.")
-                    return
-
-                download_target = self._resolve_media_target(text, msg)
-                local_path = download_telegram_file(file_id, download_target)
-                if local_path:
-                    image_text = f"Manager sent image: `{local_path}`"
-                    if text:
-                        image_text = f"{text}\n\n{image_text}"
-                    self._route_media_message(image_text, text, chat_id, msg_id, msg=msg)
-                else:
-                    self.reply(chat_id, "Could not download image. Try again or send as file.")
-                return
-
-        if document and not doc_is_image and chat_id:
-            file_id = document.get("file_id")
-            if file_id:
-                if admin_chat_id is None:
-                    admin_chat_id = chat_id
-                elif chat_id != admin_chat_id:
-                    return
-
-                if not state["active"]:
-                    self.reply(chat_id, "No focused worker. Use /focus <name> first.")
-                    return
-
-                download_target = self._resolve_media_target(text, msg)
-                local_path = download_telegram_file(file_id, download_target)
-                if local_path:
-                    file_name = document.get("file_name", "unknown")
-                    file_size = document.get("file_size", 0)
-                    mime_type = document.get("mime_type", "unknown")
-                    size_str = format_file_size(file_size)
-                    file_text = f"Manager sent file: {file_name} ({size_str}, {mime_type})\nPath: `{local_path}`"
-                    if text:
-                        file_text = f"{text}\n\n{file_text}"
-                    self._route_media_message(file_text, text, chat_id, msg_id, msg=msg)
-                else:
-                    self.reply(chat_id, "Could not download file. Try again.")
-                return
-
-        # Handle audio, voice, video, video_note, sticker — all have file_id
-        media_item = audio or voice or video or video_note or sticker
-        if media_item and chat_id:
-            file_id = media_item.get("file_id")
-            if file_id:
-                if admin_chat_id is None:
-                    admin_chat_id = chat_id
-                elif chat_id != admin_chat_id:
-                    return
-
-                if not state["active"]:
-                    self.reply(chat_id, "No focused worker. Use /focus <name> first.")
-                    return
-
-                download_target = self._resolve_media_target(text, msg)
-                local_path = download_telegram_file(file_id, download_target)
-                if local_path:
-                    if audio:
-                        title = audio.get("title", audio.get("file_name", "audio"))
-                        duration = audio.get("duration", 0)
-                        media_text = f"Manager sent audio: {title} ({duration}s)\nPath: `{local_path}`"
-                    elif voice:
-                        duration = voice.get("duration", 0)
-                        transcript = transcribe_voice(local_path)
-                        if transcript:
-                            # Transparent: worker receives just the text, as if manager typed it
-                            if text:
-                                # Caption + transcript
-                                self._route_media_message(f"{text}\n\n{transcript}", text, chat_id, msg_id, msg=msg)
-                            else:
-                                self._route_media_message(transcript, transcript, chat_id, msg_id, msg=msg)
-                            return
-                        else:
-                            media_text = f"Manager sent voice message: ({duration}s)\nPath: `{local_path}`"
-                    elif video:
-                        duration = video.get("duration", 0)
-                        file_name = video.get("file_name", "video")
-                        media_text = f"Manager sent video: {file_name} ({duration}s)\nPath: `{local_path}`"
-                    elif video_note:
-                        duration = video_note.get("duration", 0)
-                        media_text = f"Manager sent video note: ({duration}s)\nPath: `{local_path}`"
-                    elif sticker:
-                        emoji = sticker.get("emoji", "")
-                        media_text = f"Manager sent sticker: {emoji}\nPath: {local_path}"
-                    else:
-                        media_text = f"Manager sent media: {local_path}"
-                    if text:
-                        media_text = f"{text}\n\n{media_text}"
-                    self._route_media_message(media_text, text, chat_id, msg_id, msg=msg)
-                else:
-                    media_type = "audio" if audio else "voice" if voice else "video" if video else "media"
-                    self.reply(chat_id, f"Could not download {media_type}. Try again.")
-                return
-
-        if not text or not chat_id:
+        if not chat_id:
             return
-
-        if admin_chat_id is None:
-            admin_chat_id = chat_id
-            save_last_chat_id(chat_id)
-            print(f"Admin registered: {chat_id}")
-
-        if not state["startup_notified"]:
-            state["startup_notified"] = True
-            self.send_startup_message(chat_id)
-
-        if chat_id != admin_chat_id:
-            print(f"Rejected non-admin: {chat_id}")
-            return
-
-        save_last_chat_id(chat_id)
-
-        if text.startswith("/"):
-            if self.handle_command(text, chat_id, msg_id):
-                _last_mention["target"] = None
-                _last_mention["count"] = 0
-                return
-
-        if text.lower().startswith("@all "):
-            message = text[5:]
-            self.route_to_all(message, chat_id, msg_id)
-            _last_mention["target"] = None
-            _last_mention["count"] = 0
-            return
-
-        # Extract reply context (quote-reply = context only, never routing)
-        reply_context = ""
-        reply_to = msg.get("reply_to_message")
-        if reply_to:
-            reply_context = self.get_reply_context(reply_to)
-
-        # Parse @mentions anywhere in text
-        targets, clean_text = self.parse_at_mentions(text)
-
-        if targets:
-            message = clean_text or text
-            if reply_context:
-                message = self.format_reply_context(message, reply_context)
-            # If reply-to message contains media, download and forward it to targets
-            if reply_to:
-                reply_media = self._extract_reply_media(reply_to, targets[0])
-                if reply_media:
-                    media_text = reply_media
-                    if message:
-                        media_text = f"{message}\n\n{reply_media}"
-                    for name in targets:
-                        self.route_message(name, media_text, chat_id, msg_id, one_off=True)
-                else:
-                    for name in targets:
-                        self.route_message(name, message, chat_id, msg_id, one_off=True)
-            else:
-                for name in targets:
-                    self.route_message(name, message, chat_id, msg_id, one_off=True)
-
-            # Auto-focus: if same single worker mentioned 2+ consecutive times, switch focus
-            if len(targets) == 1:
-                target = targets[0]
-                if _last_mention["target"] == target:
-                    _last_mention["count"] += 1
-                else:
-                    _last_mention["target"] = target
-                    _last_mention["count"] = 1
-                if _last_mention["count"] >= 2 and state["active"] != target:
-                    set_focus(target)
-                    self.reply(chat_id, f"Switched to {target} (you mentioned them twice).")
-            else:
-                # Multi-mention resets streak
-                _last_mention["target"] = None
-                _last_mention["count"] = 0
-            return
-
-        # No @mentions → route to focused worker (resets mention streak)
-        _last_mention["target"] = None
-        _last_mention["count"] = 0
-        routed_text = text
-        if reply_context:
-            routed_text = self.format_reply_context(text, reply_context)
-        self.route_to_active(routed_text, chat_id, msg_id)
+        # Topic-only bridge: every inbound message is routed by its 話題
+        # thread. Media is handled inside the topic path (downloaded into the
+        # bound session's inbox and delivered as a local path).
+        return self._handle_topic_message(msg, text, chat_id, msg_id)
 
     def parse_at_mentions(self, text):
         """Extract all @mentions from anywhere in text. Returns (targets, cleaned_text)."""
@@ -7163,21 +6360,10 @@ class CommandRouter:
             cmd = cmd.split("@")[0]
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        if cmd == "/hire":
-            return self.cmd_hire(arg, chat_id)
-        elif cmd == "/focus":
-            return self.cmd_focus(arg, chat_id)
-        elif cmd == "/team":
-            return self.cmd_team(chat_id)
-        elif cmd == "/end":
-            return self.cmd_end(arg, chat_id)
-        elif cmd == "/progress":
-            return self.cmd_progress(chat_id)
-        elif cmd == "/pause":
-            return self.cmd_pause(chat_id)
-        elif cmd == "/restart":
-            return self.cmd_restart(chat_id, arg)
-        elif cmd == "/settings":
+        # Topic-only command surface: the orchestration commands (/hire /focus
+        # /team /end /progress /pause /restart) and per-worker /<name> shortcuts
+        # are gone — a 話題 IS the session, addressing happens by typing in it.
+        if cmd == "/settings":
             return self.cmd_settings(chat_id)
         elif cmd == "/voice":
             return self.cmd_voice(arg, chat_id)
@@ -7189,29 +6375,10 @@ class CommandRouter:
             return self.cmd_pr_review(arg, chat_id)
         elif cmd == "/memory":
             return self.cmd_memory(arg, chat_id)
-        elif cmd == "/teleport":
-            return self.cmd_teleport(arg, chat_id)
-        elif cmd == "/teleport-check":
-            return self.cmd_teleport(arg, chat_id, check_only=True)
-        elif cmd == "/teleback":
-            return self.cmd_teleback(arg, chat_id)
         elif cmd == "/quota":
             return self.cmd_quota(chat_id)
         elif cmd in BLOCKED_COMMANDS:
             self.reply(chat_id, f"{cmd} is interactive and not supported here.", outcome="Needs decision")
-            return True
-
-        worker_name = cmd[1:]
-        registered = self.workers.get_registered_sessions()
-        if worker_name in registered:
-            prev_focus = state["active"]
-            set_focus(worker_name)
-            if not arg:
-                self.reply(chat_id, f"Now talking to {worker_name.capitalize()}.")
-                return True
-            if prev_focus != worker_name:
-                self.transport.send_text(chat_id, f"Now talking to {worker_name.capitalize()}.")
-            self.route_message(worker_name, arg, chat_id, msg_id, one_off=False)
             return True
 
         return False
@@ -7219,35 +6386,6 @@ class CommandRouter:
     def cmd_quota(self, chat_id):
         """Show subscriber usage (5h/7d) from claude-hud's external snapshot."""
         self.reply(chat_id, format_quota(read_usage_snapshot()))
-        return True
-
-    def cmd_hire(self, name, chat_id):
-        if not name:
-            self.reply(chat_id, "Usage: /hire <name>", outcome="Needs decision")
-            return True
-
-        parsed_name, backend = parse_hire_args(name)
-        if not parsed_name:
-            self.reply(chat_id, "Usage: /hire <name>", outcome="Needs decision")
-            return True
-
-        name = parsed_name.lower().strip()
-        name = re.sub(r'[^a-z0-9-]', '', name)
-
-        if not name:
-            self.reply(chat_id, "Name must use letters, numbers, and hyphens only.", outcome="Needs decision")
-            return True
-
-        if name in RESERVED_NAMES:
-            self.reply(chat_id, f"Cannot use \"{name}\" - reserved command. Choose another name.", outcome="Needs decision")
-            return True
-
-        ok, err = create_session(name, backend, chat_id=chat_id)
-        if ok:
-            self.reply(chat_id, f"{name.capitalize()} is added and assigned. {PERSISTENCE_NOTE}")
-            update_bot_commands()
-        else:
-            self.reply(chat_id, f"Could not hire \"{name}\". {err}", outcome="Needs decision")
         return True
 
     def cmd_pilot(self, name, chat_id):
@@ -7518,1536 +6656,6 @@ class CommandRouter:
             self.reply(chat_id, f"Memory update failed: {e}", outcome="Needs decision")
         return True
 
-    def cmd_focus(self, name, chat_id):
-        if not name:
-            self.reply(chat_id, "Usage: /focus <name>", outcome="Needs decision")
-            return True
-
-        name = name.lower().strip()
-        ok, err = switch_session(name)
-        if ok:
-            self.reply(chat_id, f"Now talking to {name.capitalize()}.")
-        else:
-            self.reply(chat_id, f"Could not focus \"{name}\". {err}", outcome="Needs decision")
-        return True
-
-    def cmd_team(self, chat_id):
-        registered = self.workers.scan_tmux_sessions()
-        registered = self.workers.get_registered_sessions(registered)
-
-        if not registered:
-            self.reply(chat_id, "No team members yet. Add someone with /hire <name>.")
-            return True
-
-        worker_live = {}
-        for name, session in registered.items():
-            backend_name = get_worker_backend(name, session)
-            activity = None
-            context_pct = None
-
-            tmux_name = session.get("tmux", f"{self.workers.tmux_prefix}{name}")
-            host = get_worker_host(name)
-            tmux_alive = "tmux" in session and tmux_exists(tmux_name, host=host)
-            if tmux_alive:
-                backend = get_backend(backend_name)
-                if backend.is_interactive:
-                    if is_claude_running(tmux_name, host=host):
-                        activity, context_pct, _ = _read_tmux_activity(tmux_name, host=host)
-                    else:
-                        activity = "worker app not running"
-                else:
-                    activity = "handling async requests"
-
-            worker_live[name] = {
-                "backend": backend_name,
-                "activity": activity,
-                "context_pct": context_pct,
-            }
-
-        lines = format_team_lines(registered, state["active"], worker_live=worker_live)
-        self.reply(chat_id, "\n".join(lines))
-        return True
-
-    def cmd_end(self, name, chat_id):
-        if not name:
-            self.reply(chat_id, "This is permanent. Usage: /end <name>", outcome="Needs decision")
-            return True
-
-        name = name.lower().strip()
-        ok, err = kill_session(name)
-        if ok:
-            self.reply(chat_id, f"{name.capitalize()} removed from your team.")
-            update_bot_commands()
-        else:
-            self.reply(chat_id, f"Could not remove \"{name}\". {err}", outcome="Needs decision")
-        return True
-
-    def cmd_progress(self, chat_id):
-        if not state["active"]:
-            self.reply(chat_id, "No one assigned. Who should I talk to? Use /team or /focus <name>.")
-            return True
-
-        name = state["active"]
-        registered = self.workers.get_registered_sessions()
-        session = registered.get(name)
-        if not session:
-            self.reply(chat_id, "Can't find them. Check /team for who's available.")
-            return True
-
-        pending = is_pending(name)
-        backend_name = get_worker_backend(name, session)
-        backend = get_backend(backend_name)
-        online = False
-        ready = False
-        needs_attention = None
-        mode = "tmux"
-
-        tmux_name = session.get("tmux", f"{self.workers.tmux_prefix}{name}")
-        host = get_worker_host(name)
-        is_tmux_alive = "tmux" in session and tmux_exists(tmux_name, host=host)
-        if not is_tmux_alive:
-            # Worker exited (tmux gone, in registry only)
-            online = False
-            ready = False
-            mode = f"{backend_name} (exited)"
-            needs_attention = "Session exited. Use /restart to bring back."
-        elif not backend.is_interactive:
-            # Non-interactive: online = tmux exists, ready = always (stateless)
-            online = True
-            ready = True
-            mode = f"{backend_name} (non-interactive)"
-        else:
-            online = True
-            claude_running = is_claude_running(tmux_name, host=host)
-            ready = claude_running
-            if not claude_running:
-                needs_attention = "Not running. Use /restart."
-
-        resume_line = None
-        continuity_line = None
-
-        if not backend.is_interactive:
-            # Non-interactive: show Continuity (thread) + In-flight
-            session_id, source = get_any_session_id(name)
-            if session_id:
-                continuity_line = "Continuity: on"
-            else:
-                continuity_line = "Continuity: off (next message starts new thread)"
-        else:
-            # Interactive: show Resume
-            resume_id = get_claude_session_id(name)
-            if resume_id:
-                resume_line = "Resume: available"
-            else:
-                resume_line = "Resume: not available"
-
-        # Read live activity from tmux pane
-        activity = None
-        context_pct = None
-        raw_lines = None
-        if is_tmux_alive and ready:
-            activity, context_pct, raw_lines = _read_tmux_activity(tmux_name, host=host)
-
-        # Extract question details if at interactive prompt
-        question_details = None
-        if raw_lines and activity and "Waiting for" in activity:
-            question_details = _extract_question_details(raw_lines)
-
-        status = format_progress_lines(
-            name=name,
-            pending=pending,
-            backend=backend_name,
-            online=online,
-            ready=ready,
-            mode=mode,
-            resume_line=resume_line,
-            continuity_line=continuity_line,
-            needs_attention=needs_attention,
-            activity=activity,
-            context_pct=context_pct,
-            question_details=question_details
-        )
-
-        self.reply(chat_id, "\n".join(status))
-        return True
-
-    def cmd_pause(self, chat_id):
-        if not state["active"]:
-            self.reply(chat_id, "No one assigned.")
-            return True
-
-        name = state["active"]
-        registered = self.workers.get_registered_sessions()
-        session = registered.get(name)
-        if session:
-            backend_name = get_worker_backend(name, session)
-            backend = get_backend(backend_name)
-            if not backend.is_interactive:
-                kill_adapter(name)
-                clear_pending(name)
-                self.reply(chat_id, f"{name.capitalize()} is paused. I'll pick up where we left off.")
-                return True
-            host = get_worker_host(name)
-            tmux_send_escape(session["tmux"], host=host)
-            clear_pending(name)
-
-        self.reply(chat_id, f"{name.capitalize()} is paused. I'll pick up where we left off.")
-        return True
-
-    def cmd_restart(self, chat_id, args=""):
-        args = (args or "").strip()
-
-        # Parse flags
-        clean = False
-        force = False
-        tokens = args.split()
-        remaining = []
-        for t in tokens:
-            if t == "--clean":
-                clean = True
-            elif t == "--force":
-                force = True
-            else:
-                remaining.append(t)
-        name_arg = remaining[0].lower() if remaining else ""
-
-        # Branch: /restart cancel
-        if name_arg == "cancel":
-            return self._cmd_restart_cancel(chat_id)
-
-        # Branch: /restart all [--clean]
-        if name_arg == "all":
-            return self._cmd_restart_all(chat_id, clean)
-
-        if name_arg:
-            name = name_arg
-        else:
-            if not state["active"]:
-                registered = self.workers.get_registered_sessions()
-                if len(registered) == 1:
-                    name = next(iter(registered))
-                    set_focus(name)
-                else:
-                    self.reply(chat_id, "No one assigned.")
-                    return True
-            else:
-                name = state["active"]
-
-        registered = self.workers.get_registered_sessions()
-        session = registered.get(name)
-        if name not in registered:
-            if registered:
-                names = ", ".join(registered.keys())
-                self.reply(chat_id, f"Can't find \"{name}\". Available workers: {names}")
-            else:
-                self.reply(chat_id, "No team members yet. Add someone with /hire <name>.")
-            return True
-
-        if name_arg:
-            set_focus(name)
-
-        # Guard: skip restart if worker is already running (unless --force)
-        host = get_worker_host(name)
-        tmux_name = session.get("tmux", f"{self.workers.tmux_prefix}{name}") if session else f"{self.workers.tmux_prefix}{name}"
-        print(f"[cmd_restart] {name}: force={force}, clean={clean}, host={host}, tmux={tmux_name}")
-        tmux_alive = tmux_exists(tmux_name, host=host)
-        claude_running = is_claude_running(tmux_name, host=host) if tmux_alive else False
-        print(f"[cmd_restart] {name}: tmux_alive={tmux_alive}, claude_running={claude_running}")
-        if not force and tmux_alive and claude_running:
-            print(f"[cmd_restart] {name}: BLOCKED (already running)")
-            self.reply(chat_id, f"{name.capitalize()} is already running. Use /restart --force {name} to force.")
-            return True
-
-        # In-flight dedupe: block if a restart is already in progress (even with --force)
-        with _restart_lock:
-            inflight_ts = _restart_in_progress.get(name)
-            if inflight_ts and time.time() - inflight_ts < 120:
-                print(f"[cmd_restart] {name}: BLOCKED (restart in progress since {time.time() - inflight_ts:.0f}s ago)")
-                self.reply(chat_id, f"{name.capitalize()} restart already in progress. Wait for it to finish.")
-                return True
-            _restart_in_progress[name] = time.time()
-
-        try:
-            result = self._do_restart(name, session, chat_id, host, tmux_name, force, clean)
-            if force:
-                _force_restart_pending_cwd[name] = True
-            return result
-        finally:
-            with _restart_lock:
-                _restart_in_progress.pop(name, None)
-
-    def _do_restart(self, name, session, chat_id, host, tmux_name, force, clean):
-        """Execute restart after in-flight guard. Called from cmd_restart."""
-        # Teleported worker: delegate to remote restart
-        if host:
-            mode = "relaunch" if clean else "resume"
-            backend_name = get_worker_backend(name, session) if session else DEFAULT_BACKEND
-            backend_obj = get_backend(backend_name)
-            resume_id = get_claude_session_id(name, authoritative=True) if mode == "resume" else ""
-            target_cwd = get_claude_session_cwd(name)
-            print(f"[cmd_restart] {name}: remote restart mode={mode}, resume_id={resume_id}, cwd={target_cwd}")
-            self.reply(chat_id, f"Restarting {name.capitalize()} on remote host...")
-            ok, err = self._restart_remote_worker(
-                name, backend_name, backend_obj, tmux_name, host, mode)
-            _recent_restarts[name] = time.time()
-            print(f"[cmd_restart] {name}: remote restart result ok={ok}, err={err}")
-            if ok:
-                self.reply(chat_id, f"{name.capitalize()} is back and ready.")
-            else:
-                self.reply(chat_id, f"Could not restart \"{name}\" on {host}. {err}",
-                           outcome="Needs decision")
-            return True
-
-        # --clean: fresh start (clear session IDs)
-        if clean:
-            ok, err = restart_claude(name, mode="relaunch")
-            if ok:
-                _recent_restarts[name] = time.time()
-                self.reply(chat_id, f"Bringing {name.capitalize()} back online...")
-                self.reply(chat_id, f"{name.capitalize()} is back and ready.")
-            else:
-                self.reply(chat_id, f"Could not restart \"{name}\". {err}", outcome="Needs decision")
-            return True
-
-        # Default: resume behavior
-        backend_name = get_worker_backend(name, session) if session else DEFAULT_BACKEND
-        backend = get_backend(backend_name)
-
-        # Non-interactive backends: resume is automatic via saved thread ID
-        # (but only if tmux is still alive — dead workers need full restart)
-        tmux_name = session.get("tmux", f"{self.workers.tmux_prefix}{name}") if session else f"{self.workers.tmux_prefix}{name}"
-        worker_alive = session and "tmux" in session and tmux_exists(tmux_name)
-        if not backend.is_interactive and worker_alive:
-            session_id, source = get_any_session_id(name)
-            if session_id:
-                self.reply(chat_id, f"{name.capitalize()} is still active. Next message continues where you left off.")
-            else:
-                self.reply(chat_id, f"No active session for {name.capitalize()}. Next message starts fresh.")
-            return True
-
-        # Interactive backends: restart with --resume
-        session_dir = get_session_dir(name)
-        has_session_id = False
-        if session_dir.exists():
-            has_session_id = any(session_dir.glob("*_session_id"))
-
-        if not has_session_id:
-            ok, err = restart_claude(name, mode="relaunch")
-            if ok:
-                _recent_restarts[name] = time.time()
-                self.reply(chat_id, f"Restarting {name.capitalize()} fresh...")
-                self.reply(chat_id, f"{name.capitalize()} is back and ready.")
-            else:
-                self.reply(chat_id, f"Could not restart \"{name}\". {err}", outcome="Needs decision")
-            return True
-
-        ok, err = restart_claude(name, mode="resume")
-        if ok:
-            _recent_restarts[name] = time.time()
-            self.reply(chat_id, f"Resuming {name.capitalize()}...")
-            self.reply(chat_id, f"{name.capitalize()} is back and ready.")
-        else:
-            self.reply(chat_id, f"Could not restart \"{name}\". {err}", outcome="Needs decision")
-        return True
-
-    # ── Remote Restart ──────────────────────────────────────────────
-
-    def _restart_remote_worker(self, name, backend_name, backend, tmux_name, host, mode):
-        """Restart a teleported worker on its remote host.
-
-        Reuses _stop_worker_for_teleport + _start_worker_on_target which
-        already handle remote tmux, $HOME remapping, credential sync, etc.
-        """
-        resume_id = ""
-        target_cwd = get_claude_session_cwd(name)
-
-        # Remap $HOME if CWD still has the VPS path (e.g., /home/claude/...)
-        # This happens when remote session files have a stale VPS CWD.
-        if target_cwd and host:
-            local_home = os.path.expanduser("~")
-            if target_cwd.startswith(local_home):
-                r_home = _remote_run(
-                    ["bash", "-c", "echo $HOME"], host=host,
-                    capture_output=True, text=True, timeout=5)
-                remote_home = r_home.stdout.strip() if r_home.returncode == 0 else ""
-                if remote_home and remote_home != local_home:
-                    target_cwd = remote_home + target_cwd[len(local_home):]
-
-        print(f"[_restart_remote] {name}: mode={mode}, host={host}, tmux={tmux_name}, cwd={target_cwd}")
-        if mode == "resume":
-            resume_id = get_claude_session_id(name, authoritative=True)
-            print(f"[_restart_remote] {name}: resume_id={resume_id}")
-        else:
-            # Clear session IDs for relaunch
-            session_dir = SESSIONS_DIR / name
-            session_dir.mkdir(parents=True, exist_ok=True)
-            cleared = list(session_dir.glob("*_session_id"))
-            for f in cleared:
-                f.unlink()
-            _clear_hook_failures(name)
-            print(f"[_restart_remote] {name}: cleared {len(cleared)} session files for relaunch")
-
-        # Stop the remote Claude process if tmux is still alive
-        if tmux_exists(tmux_name, host=host):
-            print(f"[_restart_remote] {name}: stopping remote tmux {tmux_name}")
-            self._stop_worker_for_teleport(name, tmux_name, host=host)
-            # Kill tmux — _start_worker_on_target creates a fresh one
-            _remote_run(["tmux", "kill-session", "-t", tmux_name],
-                         host=host, capture_output=True)
-            time.sleep(0.5)
-        else:
-            print(f"[_restart_remote] {name}: tmux {tmux_name} not found on {host}")
-
-        # Re-read session_id (hook may have updated during /exit)
-        if mode == "resume":
-            resume_id = get_claude_session_id(name, authoritative=True) or resume_id
-            print(f"[_restart_remote] {name}: post-stop resume_id={resume_id}")
-
-        # Validate session is resumable on target before attempting --resume
-        # Claude stores sessions under ~/.claude/projects/-<cwd-dashes>/<session_id>.jsonl
-        # If the file doesn't exist on the target, --resume will fail immediately
-        if resume_id and target_cwd and host:
-            # Build the project dir path on the remote host
-            r_home = _remote_run(["bash", "-c", "echo $HOME"], host=host,
-                                  capture_output=True, text=True, timeout=5)
-            remote_home = r_home.stdout.strip() if r_home.returncode == 0 else ""
-            if remote_home:
-                # Claude Code project dir: ~/.claude/projects/-<cwd with / replaced by->
-                cwd_slug = target_cwd.replace("/", "-")
-                session_file = f"{remote_home}/.claude/projects/{cwd_slug}/{resume_id}.jsonl"
-                check = _remote_run(["test", "-f", session_file], host=host,
-                                     capture_output=True, timeout=5)
-                if check.returncode != 0:
-                    print(f"[_restart_remote] {name}: session {resume_id} NOT found at {session_file}, starting fresh")
-                    resume_id = ""
-                    # Clear stale session ID
-                    session_dir = SESSIONS_DIR / name
-                    session_dir.mkdir(parents=True, exist_ok=True)
-                    for f in session_dir.glob("*_session_id"):
-                        f.unlink()
-                else:
-                    print(f"[_restart_remote] {name}: session {resume_id} validated at {session_file}")
-
-        # Delegate to existing remote start flow
-        # skip_session_sync=True: worker was already on this host, target session files are authoritative
-        print(f"[_restart_remote] {name}: calling _start_worker_on_target(cwd={target_cwd}, resume={resume_id}, backend={backend_name})")
-        ok = self._start_worker_on_target(
-            name, host, target_cwd, resume_id, backend_name, skip_session_sync=True)
-        if not ok:
-            print(f"[_restart_remote] {name}: _start_worker_on_target FAILED")
-            return False, f"Failed to restart {name} on {host}"
-
-        # Send welcome
-        welcome = self.workers._build_welcome(name, backend)
-        if backend.is_interactive:
-            time.sleep(3.0)
-            self.workers.send(name, welcome)
-
-        print(f"[_restart_remote] {name}: restarted successfully (mode={mode})")
-        return True, None
-
-    # ── Restart All (sequential) ──────────────────────────────────
-
-    def _cmd_restart_all(self, chat_id, clean: bool):
-        registered = self.workers.get_registered_sessions()
-        if not registered:
-            self.reply(chat_id, "No team members yet. Add someone with /hire <name>.")
-            return True
-
-        with self._restart_all_lock:
-            if self._restart_all_running:
-                self.reply(chat_id, "A /restart all is already running. Use /restart cancel to stop it.")
-                return True
-            self._restart_all_running = True
-            self._restart_all_abort.clear()
-
-        # Snapshot worker names now; sort alphabetically, focused worker last
-        names = sorted(registered.keys())
-        active = state.get("active")
-        if active and active in names:
-            names.remove(active)
-            names.append(active)
-
-        mode = "relaunch" if clean else "resume"
-        self.reply(chat_id, f"Restarting {len(names)} workers sequentially ({mode})...")
-
-        self._restart_all_thread = threading.Thread(
-            target=self._run_restart_all_sequence,
-            args=(chat_id, names, mode),
-            daemon=True,
-        )
-        self._restart_all_thread.start()
-        return True
-
-    def _run_restart_all_sequence(self, chat_id, names, mode):
-        delay_s = 7
-        failed = []
-        try:
-            total = len(names)
-            for i, name in enumerate(names, 1):
-                if self._restart_all_abort.is_set():
-                    self.reply(chat_id, f"Restart sequence aborted at {i-1}/{total}.")
-                    return
-
-                host = get_worker_host(name)
-                if host:
-                    _sync_worker_manager()
-                    reg = worker_manager.get_registered_sessions()
-                    session = reg.get(name, {})
-                    backend_name = get_worker_backend(name, session)
-                    backend_obj = get_backend(backend_name)
-                    tmux_name = session.get("tmux", f"{self.workers.tmux_prefix}{name}")
-                    ok, err = self._restart_remote_worker(
-                        name, backend_name, backend_obj, tmux_name, host, mode)
-                else:
-                    ok, err = restart_claude(name, mode=mode)
-                if ok:
-                    self.reply(chat_id, f"[{i}/{total}] {name.capitalize()} restarted.")
-                else:
-                    failed.append((name, err))
-                    self.reply(chat_id, f"[{i}/{total}] {name.capitalize()} failed: {err}")
-
-                if i < total:
-                    # Interruptible sleep
-                    for _ in range(5):
-                        if self._restart_all_abort.is_set():
-                            break
-                        time.sleep(delay_s / 5)
-
-            if failed:
-                summary = ", ".join(n for n, _ in failed)
-                self.reply(chat_id, f"Restart all done. {len(failed)} failed: {summary}")
-            else:
-                self.reply(chat_id, f"Restart all done. All {total} workers restarted.")
-        finally:
-            with self._restart_all_lock:
-                self._restart_all_running = False
-                self._restart_all_abort.clear()
-                self._restart_all_thread = None
-
-    def _cmd_restart_cancel(self, chat_id):
-        with self._restart_all_lock:
-            if not self._restart_all_running:
-                self.reply(chat_id, "No restart-all sequence is running.")
-                return True
-            self._restart_all_abort.set()
-        self.reply(chat_id, "Stopping restart-all sequence...")
-        return True
-
-    # ── Teleport commands ──────────────────────────────────────────────────
-
-    def cmd_teleport(self, arg, chat_id, check_only=False):
-        """Teleport a worker to a remote machine."""
-        if not arg:
-            cmd_name = "/teleport-check" if check_only else "/teleport"
-            self.reply(chat_id, f"Usage: {cmd_name} <worker> <host>[:/path]")
-            return True
-
-        parts = arg.split()
-        worker_name = parts[0].lower()
-        target_spec = " ".join(parts[1:]) if len(parts) > 1 else ""
-
-        if not target_spec:
-            self.reply(chat_id, "Usage: /teleport <worker> <host>[:/path] [--full]")
-            return True
-
-        full_sync = "--full" in target_spec
-        target_spec = target_spec.replace("--full", "").strip()
-
-        # Parse target_host:target_cwd
-        if ":" in target_spec and not target_spec.startswith("/"):
-            target_host, target_cwd = target_spec.split(":", 1)
-        else:
-            target_host = target_spec
-            target_cwd = ""
-
-        # 1. Worker exists?
-        registry = _load_registry()
-        worker_entry = registry.get("workers", {}).get(worker_name)
-        if not worker_entry:
-            self.reply(chat_id, f"Worker '{worker_name}' not found in registry.")
-            return True
-        backend_name = worker_entry.get("backend", "claude")
-
-        # 2. Worker not actively busy? (EXITED/OFFLINE/UNKNOWN are all fine)
-        with _watchdog_lock:
-            ws = _worker_states.get(worker_name, ("UNKNOWN", "", 0))
-        current_state = ws[0]
-        if current_state in ("BUSY_TOOL", "BUSY_THINKING"):
-            self.reply(chat_id,
-                f"{worker_name} is busy. Must be idle to teleport.\n"
-                f"Wait for it to finish or /pause {worker_name} first.")
-            return True
-
-        # 3. No teleport in progress?
-        teleport_file = SESSIONS_DIR / worker_name / "teleport_state"
-        if teleport_file.exists():
-            self.reply(chat_id, f"{worker_name} has a teleport in progress.")
-            return True
-
-        # 4. Target reachable?
-        r = _remote_run(["echo", "ok"], host=target_host,
-                        capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            self.reply(chat_id, f"Cannot reach {target_host} via SSH.")
-            return True
-
-        # 5. Claude Code on target?
-        r = _remote_run(["which", "claude"], host=target_host,
-                        capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            self.reply(chat_id, f"claude not found on {target_host}. Install it first.")
-            return True
-
-        # 6. tmux on target?
-        r = _remote_run(["which", "tmux"], host=target_host,
-                        capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            self.reply(chat_id, f"tmux not found on {target_host}. Install it first.")
-            return True
-
-        # 7. Need a reachable URL for remote workers
-        target_bridge_url = BRIDGE_PUBLIC_URL or BRIDGE_URL
-        if "localhost" in target_bridge_url or "127.0.0.1" in target_bridge_url:
-            self.reply(chat_id,
-                "Cannot teleport: no reachable bridge URL. "
-                "Set BRIDGE_PUBLIC_URL to this machine's network IP "
-                "(e.g., BRIDGE_PUBLIC_URL=http://100.125.36.102:8271).")
-            return True
-
-        # 8. Bridge must be reachable from target
-        r = _remote_run(["curl", "-sf", "--connect-timeout", "5",
-                         f"{target_bridge_url}/health"],
-                        host=target_host, capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            self.reply(chat_id,
-                f"Target {target_host} cannot reach {target_bridge_url}. "
-                f"Ensure BRIDGE_BIND=0.0.0.0 and network connectivity.")
-            return True
-
-        # 9. Claude credentials on target?
-        r = _remote_run(["test", "-f", ".claude/.credentials.json"],
-                        host=target_host, capture_output=True, timeout=5)
-        if r.returncode != 0:
-            # Try to sync credentials from source
-            local_creds = os.path.expanduser("~/.claude/.credentials.json")
-            if os.path.exists(local_creds):
-                _remote_run(["mkdir", "-p", ".claude"],
-                             host=target_host, capture_output=True)
-                subprocess.run(
-                    ["rsync", "-az", local_creds,
-                     f"{target_host}:.claude/.credentials.json"],
-                    capture_output=True, timeout=10)
-                _remote_run(["chmod", "600", ".claude/.credentials.json"],
-                             host=target_host, capture_output=True)
-                self._teleport_notify(chat_id, "Synced credentials to target.")
-            else:
-                self.reply(chat_id,
-                    f"No Claude credentials on {target_host} or locally. "
-                    f"Run: ssh {target_host} claude login")
-                return True
-
-        # 10. Hooks installed on target?
-        r = _remote_run(["test", "-f", ".claude/hooks/send-to-telegram.sh"],
-                        host=target_host, capture_output=True, timeout=5)
-        if r.returncode != 0:
-            self._teleport_notify(chat_id, "Hooks missing on target — will install during teleport.")
-
-        # 11. Team-defined preflight checks
-        preflight_fails = self._run_teleport_preflight(
-            target_host, worker_name, backend_name)
-        if preflight_fails:
-            self.reply(chat_id,
-                "Preflight failed:\n" + "\n".join(f"  - {f}" for f in preflight_fails))
-            return True
-
-        # All checks pass
-        if check_only:
-            self.reply(chat_id,
-                f"Preflight OK — {worker_name} is clear to teleport to {target_host}.")
-            return True
-
-        self.reply(chat_id, f"Teleporting {worker_name} to {target_host}...")
-        threading.Thread(
-            target=self._do_teleport,
-            args=(worker_name, target_host, target_cwd, full_sync, chat_id),
-            daemon=True
-        ).start()
-        return True
-
-    def cmd_teleback(self, arg, chat_id):
-        """Bring a teleported worker back to its previous machine."""
-        parts = arg.split()
-        worker_name = parts[0].lower() if parts else ""
-        full_sync = "--full" in parts
-
-        if not worker_name:
-            self.reply(chat_id, "Usage: /teleback <worker> [--full]")
-            return True
-
-        registry = _load_registry()
-        worker = registry.get("workers", {}).get(worker_name)
-        if not worker:
-            self.reply(chat_id, f"Worker '{worker_name}' not in registry.")
-            return True
-
-        current_host = worker.get("host")
-        home_host = worker.get("home_host")
-        home_cwd = worker.get("home_cwd")
-
-        if current_host is None and home_cwd is None:
-            self.reply(chat_id, f"{worker_name} hasn't been teleported.")
-            return True
-
-        # Worker must not be actively busy
-        with _watchdog_lock:
-            ws = _worker_states.get(worker_name, ("UNKNOWN", "", 0))
-        if ws[0] in ("BUSY_TOOL", "BUSY_THINKING"):
-            self.reply(chat_id,
-                f"{worker_name} is busy. Must be idle to teleback.")
-            return True
-
-        target_host = home_host  # Where we're going back to (None = local)
-        target_cwd = home_cwd or get_claude_session_cwd(worker_name)
-
-        # If going back to local, verify current remote host is reachable
-        if current_host:
-            r = _remote_run(["echo", "ok"], host=current_host,
-                            capture_output=True, text=True, timeout=10)
-            if r.returncode != 0:
-                self.reply(chat_id,
-                    f"Cannot reach {current_host} where {worker_name} currently is.")
-                return True
-
-        # Conflict check: detect if both sides changed the working directory
-        if not full_sync:
-            conflicts = self._check_teleback_conflicts(
-                worker_name, current_host, target_cwd)
-            if conflicts:
-                self.reply(chat_id,
-                    f"Teleback conflict detected for {worker_name}:\n"
-                    + "\n".join(f"  {c}" for c in conflicts)
-                    + "\n\nUse /teleback " + worker_name + " --full to force sync "
-                    "(remote overwrites local).")
-                return True
-
-        dest_label = home_host or "local"
-        self.reply(chat_id, f"Bringing {worker_name} back to {dest_label}...")
-        threading.Thread(
-            target=self._do_teleport,
-            args=(worker_name, target_host, target_cwd, full_sync, chat_id, True),
-            daemon=True
-        ).start()
-        return True
-
-    def _check_teleback_conflicts(self, name, remote_host, local_cwd):
-        """Check for working directory conflicts before teleback.
-
-        Compares git status on both remote (where worker is) and local
-        (VPS, where worker is coming back to). If both sides have
-        uncommitted changes or new commits, report conflicts.
-
-        Returns list of conflict descriptions, or empty list if clean.
-        """
-        conflicts = []
-        if not local_cwd or not remote_host:
-            return conflicts
-
-        # Check if it's a git repo locally
-        local_is_git = os.path.isdir(os.path.join(local_cwd, ".git"))
-        if not local_is_git:
-            return conflicts  # Not a git repo — rsync is the only option
-
-        # Get local (VPS) git status — uncommitted changes + recent commits
-        local_status = subprocess.run(
-            ["git", "-C", local_cwd, "status", "--porcelain"],
-            capture_output=True, text=True, timeout=10)
-        local_changed = bool(local_status.stdout.strip()) if local_status.returncode == 0 else False
-
-        local_head = subprocess.run(
-            ["git", "-C", local_cwd, "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=5)
-        local_commit = local_head.stdout.strip() if local_head.returncode == 0 else ""
-
-        # Get remote git status
-        # Detect remote CWD (may have different $HOME prefix)
-        r_home = _remote_run(
-            ["bash", "-c", "echo $HOME"], host=remote_host,
-            capture_output=True, text=True, timeout=5)
-        remote_home = r_home.stdout.strip() if r_home.returncode == 0 else ""
-        local_home = os.path.expanduser("~")
-
-        remote_cwd = local_cwd
-        if remote_home and remote_home != local_home and local_cwd.startswith(local_home):
-            remote_cwd = remote_home + local_cwd[len(local_home):]
-
-        r_status = _remote_run(
-            ["git", "-C", remote_cwd, "status", "--porcelain"],
-            host=remote_host, capture_output=True, text=True, timeout=10)
-        remote_changed = bool(r_status.stdout.strip()) if r_status.returncode == 0 else False
-
-        r_head = _remote_run(
-            ["git", "-C", remote_cwd, "rev-parse", "HEAD"],
-            host=remote_host, capture_output=True, text=True, timeout=5)
-        remote_commit = r_head.stdout.strip() if r_head.returncode == 0 else ""
-
-        # Conflict: both sides have uncommitted changes
-        if local_changed and remote_changed:
-            local_files = [l.strip().split(None, 1)[-1]
-                          for l in local_status.stdout.strip().splitlines()[:5]]
-            remote_files = [l.strip().split(None, 1)[-1]
-                           for l in r_status.stdout.strip().splitlines()[:5]]
-            conflicts.append(
-                f"VPS has uncommitted changes: {', '.join(local_files)}")
-            conflicts.append(
-                f"Remote has uncommitted changes: {', '.join(remote_files)}")
-
-        # Conflict: commits diverged
-        elif local_commit and remote_commit and local_commit != remote_commit:
-            if local_changed:
-                conflicts.append(
-                    "VPS has uncommitted changes AND different commit than remote")
-            elif remote_changed:
-                # Remote changed, local has new commits — this is the normal case
-                # (VPS got new commits while worker was away, worker made changes)
-                conflicts.append(
-                    f"VPS has new commits since teleport (HEAD: {local_commit[:8]})")
-                conflicts.append(
-                    f"Remote has uncommitted changes (HEAD: {remote_commit[:8]})")
-
-        return conflicts
-
-    def _do_teleport(self, name, target_host, target_cwd, full_sync,
-                     chat_id, is_teleback=False):
-        """Run the full teleport flow in a background thread."""
-        try:
-            registered = self.workers.get_registered_sessions()
-            session = registered.get(name, {})
-            tmux_name = session.get("tmux", f"{TMUX_PREFIX}{name}")
-            backend_name = get_worker_backend(name, session)
-            source_host = get_worker_host(name)
-
-            source_cwd = get_claude_session_cwd(name)
-            print(f"[teleport] {name}: source_host={source_host}, source_cwd={source_cwd}, target_host={target_host}, target_cwd={target_cwd}")
-            if not target_cwd:
-                target_cwd = source_cwd
-                # Remap home directory when source and target have different $HOME
-                # e.g., /home/claude/project → /Users/beastoinagents/project
-                if target_cwd and target_host:
-                    local_home = os.path.expanduser("~")
-                    r_home = _remote_run(
-                        ["bash", "-c", "echo $HOME"], host=target_host,
-                        capture_output=True, text=True, timeout=5)
-                    remote_home = r_home.stdout.strip() if r_home.returncode == 0 else ""
-                    if remote_home and remote_home != local_home and target_cwd.startswith(local_home):
-                        target_cwd = remote_home + target_cwd[len(local_home):]
-
-            # Expand ~ in target_cwd to remote $HOME
-            if target_cwd and target_cwd.startswith("~") and target_host:
-                r_home = _remote_run(
-                    ["bash", "-c", "echo $HOME"], host=target_host,
-                    capture_output=True, text=True, timeout=5)
-                remote_home = r_home.stdout.strip() if r_home.returncode == 0 else ""
-                if remote_home:
-                    target_cwd = remote_home + target_cwd[1:]
-            elif target_cwd and target_cwd.startswith("~"):
-                target_cwd = os.path.expanduser(target_cwd)
-
-            # Write teleport state for crash recovery
-            ensure_session_dir(name)
-            state_file = SESSIONS_DIR / name / "teleport_state"
-            state_file.write_text(json.dumps({
-                "phase": 1, "source_host": source_host,
-                "target_host": target_host, "target_cwd": target_cwd,
-                "started_at": int(time.time()),
-            }))
-
-            # ── PHASE 1: Stop and sync (reversible) ──
-
-            self._teleport_notify(chat_id, f"Stopping {name}...")
-            session_id = self._stop_worker_for_teleport(name, tmux_name, source_host)
-            print(f"[teleport] {name}: stopped, session_id={session_id}")
-
-            if source_cwd and target_cwd:
-                self._teleport_notify(chat_id, "Syncing working directory...")
-                print(f"[teleport] {name}: syncing {source_cwd} → {target_cwd}")
-                ok = self._sync_working_directory(
-                    source_cwd, target_cwd, source_host, target_host, full_sync)
-                print(f"[teleport] {name}: working dir sync ok={ok}")
-                if not ok:
-                    self._teleport_rollback(name, tmux_name, source_host, source_cwd,
-                                            session_id, backend_name, chat_id,
-                                            "working directory sync failed")
-                    return
-
-            if session_id:
-                self._teleport_notify(chat_id, "Syncing session transcript...")
-                self._sync_session_transcript(
-                    session_id, source_cwd, target_cwd, source_host, target_host)
-                print(f"[teleport] {name}: transcript sync done")
-
-            # On teleport out: push team configs + install hooks on target
-            # On teleback: skip — VPS is source of truth for team-scope config
-            if not is_teleback:
-                self._teleport_notify(chat_id, "Syncing team config and hooks...")
-                self._sync_shared_repos(target_host, chat_id)
-                self._install_hooks_on_target(target_host)
-                print(f"[teleport] {name}: team config + hooks synced")
-
-            # ── PHASE 2: Commit ──
-
-            state_file.write_text(json.dumps({
-                "phase": 2, "source_host": source_host,
-                "target_host": target_host, "target_cwd": target_cwd,
-                "started_at": int(time.time()),
-            }))
-
-            # Save remapped CWD BEFORE _start_worker_on_target so that
-            # _sync_session_files_to_target copies the correct (remapped) path
-            # to the target machine, not the stale VPS path.
-            save_claude_session_cwd(name, target_cwd)
-
-            # Clear local session ID cache — the target may create a new session
-            # (e.g., different project, expired session). Without clearing, VPS
-            # returns the stale ID instead of SSH-fetching the real one from target.
-            # The hook's /response POST will repopulate it on first response.
-            clear_claude_session_id(name)
-
-            self._teleport_notify(chat_id,
-                f"Starting {name} on {target_host or 'local'}...")
-            print(f"[teleport] {name}: calling _start_worker_on_target(target_cwd={target_cwd}, session_id={session_id}, backend={backend_name})")
-            ok = self._start_worker_on_target(
-                name, target_host, target_cwd, session_id, backend_name)
-            print(f"[teleport] {name}: _start_worker_on_target returned {ok}")
-            if not ok:
-                # Clean up target, restart source
-                _remote_run(["tmux", "kill-session", "-t", tmux_name],
-                            host=target_host, capture_output=True)
-                self._teleport_rollback(name, tmux_name, source_host, source_cwd,
-                                        session_id, backend_name, chat_id,
-                                        "failed to start on target")
-                return
-
-            # Update registry BEFORE killing source (crash-safe: if we crash
-            # between here and kill, bridge still knows where the worker is)
-            if is_teleback:
-                _registry_clear_teleport(name)
-            else:
-                _registry_update_teleport(
-                    name, host=target_host,
-                    home_host=source_host, home_cwd=source_cwd)
-
-            # Point of no return: kill source
-            _remote_run(["tmux", "kill-session", "-t", tmux_name],
-                        host=source_host, capture_output=True)
-
-            # On teleback: sync only worker-scoped data back
-            # VPS is source of truth — workers don't override team-scope config
-            if is_teleback:
-                self._sync_worker_data_back(name, source_host)
-
-            # Auto-inject worker context so teleported worker knows about
-            # the Telegram bridge (without waiting for next SessionStart event)
-            if not is_teleback:
-                try:
-                    backend_obj = get_backend(backend_name)
-                    welcome = self.workers._build_welcome(name, backend_obj)
-                    time.sleep(3)  # Let Claude finish loading
-                    self.workers.send(name, welcome)
-                except Exception as e:
-                    print(f"[teleport] Warning: failed to send welcome to {name}: {e}")
-
-            state_file.unlink(missing_ok=True)
-
-            dest_label = target_host or "local"
-            action = "teleported back" if is_teleback else "teleported"
-            msg = f"{name} {action} to {dest_label}:{target_cwd}"
-            if session_id:
-                msg += f"\nSession resumed ({session_id[:8]}...)."
-            if not is_teleback:
-                msg += f"\nUse /teleback {name} to bring it back."
-            self._teleport_notify(chat_id, msg)
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self._teleport_notify(chat_id, f"Teleport failed: {e}")
-            try:
-                state_file = SESSIONS_DIR / name / "teleport_state"
-                state_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    def _stop_worker_for_teleport(self, name, tmux_name, host=None):
-        """Gracefully stop Claude Code and return session_id."""
-        session_id = get_claude_session_id(name, authoritative=True)
-
-        # Send /exit for graceful shutdown
-        _remote_run(["tmux", "send-keys", "-t", tmux_name, "/exit", "Enter"],
-                     host=host, capture_output=True)
-
-        # Wait for process to exit (up to 10s)
-        for _ in range(20):
-            time.sleep(0.5)
-            r = _remote_run(
-                ["tmux", "display-message", "-t", tmux_name, "-p", "#{pane_pid}"],
-                host=host, capture_output=True, text=True)
-            if r.returncode != 0:
-                break
-            pane_pid = r.stdout.strip()
-            if pane_pid:
-                claude_pid = _get_claude_pid(pane_pid, host=host)
-                if not claude_pid:
-                    break
-        else:
-            # Force stop
-            _remote_run(["tmux", "send-keys", "-t", tmux_name, "C-c", ""],
-                         host=host, capture_output=True)
-            time.sleep(1)
-
-        # Re-read session ID (hook may have updated it during /exit)
-        return get_claude_session_id(name, authoritative=True) or session_id
-
-    def _sync_working_directory(self, source_cwd, target_cwd,
-                                 source_host=None, target_host=None,
-                                 full=False):
-        """Sync working directory from source to target.
-
-        Prefers git-based sync (fast, delta-only) for git repos.
-        Falls back to rsync for non-git dirs or on git failure.
-        Use full=True to force rsync (skip git entirely).
-        """
-        if not full and _is_git_repo(source_cwd, host=source_host):
-            project = _get_project_name(source_cwd, host=source_host)
-            if project:
-                try:
-                    bare_repo = _ensure_bare_repo(project)
-                    meta = _git_push_state(source_cwd, project, bare_repo,
-                                           host=source_host)
-                    if meta:
-                        bare_url = _bare_repo_url(bare_repo, target_host=target_host)
-                        if _git_pull_state(target_cwd, project, bare_url, meta,
-                                           host=target_host):
-                            print(f"[teleport] git sync succeeded for {project}")
-                            return True
-                        print("[teleport] git pull failed, falling back to rsync")
-                    else:
-                        print("[teleport] git push failed, falling back to rsync")
-                except Exception as e:
-                    print(f"[teleport] git sync error, falling back to rsync: {e}")
-
-        return self._rsync_working_directory(
-            source_cwd, target_cwd, source_host, target_host, full)
-
-    def _rsync_working_directory(self, source_cwd, target_cwd,
-                                  source_host=None, target_host=None,
-                                  full=False):
-        """rsync working directory from source to target (fallback path)."""
-        _remote_run(["mkdir", "-p", target_cwd],
-                     host=target_host, capture_output=True)
-
-        cmd = ["rsync", "-az", "--delete"]
-        gitignore_tmpfile = None
-        if not full:
-            try:
-                gi_result = _remote_run(
-                    ["git", "-C", source_cwd, "ls-files",
-                     "--others", "--ignored", "--exclude-standard",
-                     "--directory"],
-                    host=source_host, capture_output=True, text=True, timeout=15)
-                if gi_result.returncode == 0 and gi_result.stdout.strip():
-                    fd, gitignore_tmpfile = tempfile.mkstemp(
-                        prefix="rsync-gitignore-", suffix=".txt")
-                    os.write(fd, gi_result.stdout.encode())
-                    os.close(fd)
-                    cmd.extend(["--exclude-from", gitignore_tmpfile])
-            except Exception as e:
-                print(f"[teleport] git ls-files failed, skipping gitignore excludes: {e}")
-
-            for excl in TELEPORT_RSYNC_EXCLUDES:
-                cmd.extend(["--exclude", excl])
-
-        src = source_cwd.rstrip("/") + "/"
-        dst = target_cwd.rstrip("/") + "/"
-
-        if source_host:
-            cmd.extend([f"{source_host}:{src}", dst])
-        elif target_host:
-            cmd.extend([src, f"{target_host}:{dst}"])
-        else:
-            cmd.extend([src, dst])
-
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if r.returncode != 0:
-                print(f"[teleport] rsync failed: cmd={cmd} rc={r.returncode} stderr={r.stderr[:500]}")
-            return r.returncode == 0
-        finally:
-            if gitignore_tmpfile and os.path.exists(gitignore_tmpfile):
-                os.unlink(gitignore_tmpfile)
-
-    def _sync_session_transcript(self, session_id, source_cwd, target_cwd,
-                                  source_host=None, target_host=None):
-        """Sync Claude Code session transcript between machines."""
-        if not session_id:
-            return
-
-        source_slug = _project_slug(source_cwd)
-        target_slug = _project_slug(target_cwd)
-
-        # _remote_run shell-quotes args, so ~ won't expand. Use $HOME instead
-        # for remote commands, and os.path.expanduser for local paths.
-        source_dir = f".claude/projects/{source_slug}"
-        target_dir = f".claude/projects/{target_slug}"
-
-        # Ensure target directory exists (use bash -c for $HOME expansion)
-        if target_host:
-            _remote_run(["bash", "-c", f"mkdir -p $HOME/{target_dir}"],
-                         host=target_host, capture_output=True)
-        else:
-            os.makedirs(os.path.expanduser(f"~/{target_dir}"), exist_ok=True)
-
-        # Sync session JSONL and subdirectory
-        jsonl = f"{session_id}.jsonl"
-        for item in [jsonl, f"{session_id}/"]:
-            if source_host:
-                # rsync handles ~ in remote paths (not shell-quoted by _remote_run)
-                src_path = f"~/{source_dir}/{item}"
-                local_dst = os.path.expanduser(f"~/{target_dir}/")
-                cmd = ["rsync", "-az", f"{source_host}:{src_path}", local_dst]
-            elif target_host:
-                local_src = os.path.expanduser(f"~/{source_dir}/{item}")
-                dst_path = f"~/{target_dir}/"
-                cmd = ["rsync", "-az", local_src, f"{target_host}:{dst_path}"]
-            else:
-                local_src = os.path.expanduser(f"~/{source_dir}/{item}")
-                local_dst = os.path.expanduser(f"~/{target_dir}/")
-                cmd = ["rsync", "-az", local_src, local_dst]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                print(f"[teleport] transcript sync failed for {item}: {r.stderr[:200]}")
-
-    def _sync_shared_repos(self, target_host, chat_id=None):
-        """Sync team and agent-config git repos between VPS and target.
-
-        VPS hosts bare repos at ~/git/{team,agent-config}.git.
-        Both VPS working copies and target clones use these as origin.
-        Push from source, pull on target.
-        """
-        if not target_host:
-            return  # Local — already in sync
-
-        home = os.path.expanduser("~")
-        git_repos = {
-            "team": os.path.join(home, "team"),
-            "agent-config": os.path.join(home, "agent-config"),
-        }
-
-        # Push local changes to bare repo (VPS side)
-        for repo_name, repo_path in git_repos.items():
-            if os.path.isdir(os.path.join(repo_path, ".git")):
-                try:
-                    subprocess.run(
-                        ["git", "-C", repo_path, "add", "-A"],
-                        capture_output=True, timeout=10)
-                    subprocess.run(
-                        ["git", "-C", repo_path, "commit", "-m",
-                         f"teleport sync: {repo_name}"],
-                        capture_output=True, timeout=10)
-                    subprocess.run(
-                        ["git", "-C", repo_path, "push", "origin", "master"],
-                        capture_output=True, timeout=60)
-                    print(f"[teleport] git sync succeeded for {repo_name}")
-                except subprocess.TimeoutExpired:
-                    print(f"[teleport] git sync timed out for {repo_name}, continuing")
-
-        # Pull on target
-        for repo_name in git_repos:
-            _remote_run(
-                ["bash", "-c",
-                 f"cd ~/{repo_name} 2>/dev/null && git pull origin master 2>/dev/null || true"],
-                host=target_host, capture_output=True, timeout=30)
-
-        # Deploy agent-config to ~/.claude/ on target (skills, hooks, scripts)
-        # This replaces the old symlink approach which broke macOS find.
-        for subdir in ["skills", "hooks", "scripts"]:
-            _remote_run(
-                ["bash", "-c",
-                 f"[ -d ~/agent-config/.claude/{subdir} ] && "
-                 f"rsync -az --checksum ~/agent-config/.claude/{subdir}/ ~/.claude/{subdir}/"],
-                host=target_host, capture_output=True, timeout=30)
-
-        # Adapt settings.json paths for target $HOME
-        r_home = _remote_run(["bash", "-c", "echo $HOME"], host=target_host,
-                              capture_output=True, text=True, timeout=5)
-        remote_home = r_home.stdout.strip() if r_home.returncode == 0 else ""
-        local_home = home
-        if remote_home and remote_home != local_home:
-            settings_src = os.path.expanduser("~/.claude/settings.json")
-            if os.path.exists(settings_src):
-                with open(settings_src) as f:
-                    settings_text = f.read()
-                settings_text = settings_text.replace(local_home, remote_home)
-                fd, tmp = tempfile.mkstemp(suffix=".json")
-                os.write(fd, settings_text.encode())
-                os.close(fd)
-                subprocess.run(
-                    ["rsync", "-az", tmp, f"{target_host}:.claude/settings.json"],
-                    capture_output=True, timeout=10)
-                os.unlink(tmp)
-
-    def _sync_worker_data_back(self, name, source_host):
-        """Sync worker-scoped data back from remote after teleback.
-
-        Only syncs:
-        - ~/team/<worker>/ — worker's own team dir (kanban, playbook, etc.)
-        - ~/.claude/projects/*/memory/ — worker's auto-memory
-        Working directory and session transcript are already synced
-        by _sync_working_directory and _sync_session_transcript.
-
-        VPS is source of truth for team-scope config — workers don't
-        override ~/team/playbook.md, ~/agent-config/, etc.
-        """
-        if not source_host:
-            return
-
-        home = os.path.expanduser("~")
-
-        # 1. Sync worker's team dir (~/team/<name>/)
-        worker_team_dir = os.path.join(home, "team", name)
-        if os.path.isdir(worker_team_dir):
-            subprocess.run(
-                ["rsync", "-az",
-                 f"{source_host}:team/{name}/",
-                 f"{worker_team_dir}/"],
-                capture_output=True, timeout=30)
-
-        # 2. Sync auto-memory files back
-        # Memory lives in ~/.claude/projects/<slug>/memory/
-        r = _remote_run(
-            ["bash", "-c",
-             "find ~/.claude/projects/*/memory -name '*.md' 2>/dev/null | head -50"],
-            host=source_host, capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            for remote_file in r.stdout.strip().splitlines():
-                # Convert remote path to local: replace remote $HOME with local
-                r_home = _remote_run(
-                    ["bash", "-c", "echo $HOME"], host=source_host,
-                    capture_output=True, text=True, timeout=5)
-                remote_home = r_home.stdout.strip() if r_home.returncode == 0 else ""
-                if remote_home and remote_file.startswith(remote_home):
-                    local_file = home + remote_file[len(remote_home):]
-                    local_dir = os.path.dirname(local_file)
-                    os.makedirs(local_dir, exist_ok=True)
-                    subprocess.run(
-                        ["rsync", "-az",
-                         f"{source_host}:{remote_file}", local_file],
-                        capture_output=True, timeout=10)
-
-    def _run_teleport_preflight(self, target_host, worker_name, backend_name):
-        """Run team-defined preflight check scripts against target.
-
-        Scripts live in agent-config/teleport-preflight.d/*.sh (team-managed)
-        and ~/.config/claudecode-telegram/teleport-preflight.d/*.sh (local).
-
-        Each script receives env vars: TARGET_HOST, WORKER_NAME, BACKEND,
-        BRIDGE_URL. Exit 0 = pass, exit 1 = fail (stdout = reason).
-        """
-        fails = []
-        preflight_dirs = [
-            os.path.expanduser("~/agent-config/teleport-preflight.d"),
-            os.path.expanduser("~/.config/claudecode-telegram/teleport-preflight.d"),
-        ]
-
-        env = os.environ.copy()
-        env["TARGET_HOST"] = target_host or ""
-        env["WORKER_NAME"] = worker_name
-        env["BACKEND"] = backend_name
-        env["BRIDGE_URL"] = BRIDGE_PUBLIC_URL or BRIDGE_URL
-
-        seen_scripts = set()  # Deduplicate symlinked scripts
-        for pdir in preflight_dirs:
-            if not os.path.isdir(pdir):
-                continue
-            scripts = sorted(
-                f for f in os.listdir(pdir)
-                if f.endswith(".sh") and os.access(os.path.join(pdir, f), os.X_OK))
-            for script in scripts:
-                script_path = os.path.join(pdir, script)
-                real_path = os.path.realpath(script_path)
-                if real_path in seen_scripts:
-                    continue
-                seen_scripts.add(real_path)
-                try:
-                    r = subprocess.run(
-                        [script_path], env=env,
-                        capture_output=True, text=True, timeout=10)
-                    if r.returncode != 0:
-                        reason = r.stdout.strip().split("\n")[0] if r.stdout.strip() else f"{script} failed"
-                        fails.append(reason)
-                except subprocess.TimeoutExpired:
-                    fails.append(f"{script} timed out")
-                except Exception as e:
-                    fails.append(f"{script} error: {e}")
-
-        return fails
-
-    def _install_hooks_on_target(self, target_host):
-        """Install Claude Code hooks and settings on target machine.
-
-        With git-synced agent-config, this is a lightweight fallback
-        for any files not covered by the repo (e.g., .claude.json).
-        Hooks/skills/settings are synced via _sync_shared_repos.
-        """
-        if not target_host:
-            return  # Local — hooks already installed
-
-        # Ensure hooks dir has correct permissions
-        _remote_run(["chmod", "-R", "700", ".claude/hooks"],
-                     host=target_host, capture_output=True)
-
-        # Sync .claude.json (onboarding, trust dialogs, project config)
-        claude_json = os.path.expanduser("~/.claude.json")
-        if os.path.exists(claude_json):
-            subprocess.run(
-                ["rsync", "-az", claude_json, f"{target_host}:.claude.json"],
-                capture_output=True, timeout=10)
-        else:
-            # Create minimal .claude.json to skip first-time prompts
-            _remote_run(
-                ["python3", "-c",
-                 'import json,os,pathlib;'
-                 'p=pathlib.Path(os.path.expanduser("~/.claude.json"));'
-                 'd=json.loads(p.read_text()) if p.exists() else {};'
-                 'd["hasCompletedOnboarding"]=True;'
-                 'd.setdefault("numStartups",1);'
-                 'p.write_text(json.dumps(d))'],
-                host=target_host, capture_output=True, timeout=10)
-
-    def _sync_session_files_to_target(self, name, target_sessions_dir, target_host):
-        """Copy session files (chat_id, session_id, cwd) to target machine.
-
-        The Stop hook reads chat_id from SESSIONS_DIR/<worker>/chat_id to
-        route responses to Telegram. Without these files, the hook exits
-        silently and responses never reach Telegram.
-        """
-        local_session_dir = SESSIONS_DIR / name
-        if not local_session_dir.is_dir():
-            return
-        remote_session_dir = f"{target_sessions_dir}/{name}"
-        _remote_run(["mkdir", "-p", remote_session_dir],
-                     host=target_host, capture_output=True)
-        for fname in ["chat_id", "claude_session_id", "claude_session_cwd"]:
-            local_file = local_session_dir / fname
-            if local_file.exists():
-                subprocess.run(
-                    ["rsync", "-az", str(local_file),
-                     f"{target_host}:{remote_session_dir}/{fname}"],
-                    capture_output=True, timeout=10)
-
-    def _sync_credentials_to_target(self, target_host):
-        """Copy Claude credentials to target if target has no valid token.
-
-        ~/.claude/.credentials.json has the actual access/refresh tokens.
-        Without it, Claude starts unauthenticated on the target machine.
-        Skip if target already has a valid (non-expired) token with a DIFFERENT
-        refresh token — means target was logged in independently.
-        """
-        local_creds = os.path.expanduser("~/.claude/.credentials.json")
-        if not os.path.exists(local_creds):
-            return
-
-        # Check if target already has valid credentials with a different token
-        try:
-            r = _remote_run(["cat", ".claude/.credentials.json"],
-                             host=target_host, capture_output=True, text=True, timeout=5)
-            if r.returncode == 0 and r.stdout.strip():
-                remote_data = json.loads(r.stdout)
-                local_data = json.loads(open(local_creds).read())
-                remote_oauth = remote_data.get("claudeAiOauth", {})
-                local_oauth = local_data.get("claudeAiOauth", {})
-                remote_refresh = remote_oauth.get("refreshToken", "")
-                local_refresh = local_oauth.get("refreshToken", "")
-                remote_exp = remote_oauth.get("expiresAt", 0)
-                now_ms = int(time.time() * 1000)
-                # Skip if target has a DIFFERENT refresh token that hasn't expired
-                if remote_refresh and remote_refresh != local_refresh and remote_exp > now_ms:
-                    print(f"[creds] Target {target_host} has independent valid credentials, skipping sync")
-                    return
-        except Exception:
-            pass  # Can't check — fall through to sync
-
-        _remote_run(["mkdir", "-p", ".claude"],
-                     host=target_host, capture_output=True)
-        # Atomic: rsync to tmp, then mv (avoids truncated file on crash)
-        subprocess.run(
-            ["rsync", "-az", local_creds,
-             f"{target_host}:.claude/.credentials.json.tmp"],
-            capture_output=True, timeout=10)
-        _remote_run(["mv", ".claude/.credentials.json.tmp",
-                      ".claude/.credentials.json"],
-                     host=target_host, capture_output=True)
-        _remote_run(["chmod", "600", ".claude/.credentials.json"],
-                     host=target_host, capture_output=True)
-        print(f"[creds] Synced credentials to {target_host}")
-
-    def _start_worker_on_target(self, name, target_host, target_cwd,
-                                 session_id, backend_name, skip_session_sync=False):
-        """Create tmux session on target and start Claude Code with --resume."""
-        tmux_name = f"{TMUX_PREFIX}{name}"
-
-        # Clean up any leftover session
-        _remote_run(["tmux", "kill-session", "-t", tmux_name],
-                     host=target_host, capture_output=True)
-        time.sleep(0.3)
-
-        # Create new session
-        r = _remote_run(
-            ["tmux", "new-session", "-d", "-s", tmux_name, "-x", "200", "-y", "50"],
-            host=target_host, capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"[teleport] tmux new-session failed: rc={r.returncode} stderr={r.stderr[:200] if r.stderr else ''}")
-            return False
-
-        time.sleep(0.5)
-
-        # Remap SESSIONS_DIR for target $HOME (e.g. /home/claude → /Users/user)
-        target_sessions_dir = str(SESSIONS_DIR)
-        local_home = os.path.expanduser("~")
-        if target_host:
-            r_home = _remote_run(
-                ["bash", "-c", "echo $HOME"], host=target_host,
-                capture_output=True, text=True, timeout=5)
-            remote_home = r_home.stdout.strip() if r_home.returncode == 0 else ""
-            if remote_home and remote_home != local_home and target_sessions_dir.startswith(local_home):
-                target_sessions_dir = remote_home + target_sessions_dir[len(local_home):]
-
-        # Sync session files (chat_id, session_id, cwd) to target
-        # Skip for remote restarts — worker was already on target, target files are authoritative
-        if target_host and not skip_session_sync:
-            self._sync_session_files_to_target(name, target_sessions_dir, target_host)
-
-        # Sync credentials if target lacks them
-        if target_host:
-            self._sync_credentials_to_target(target_host)
-
-        # Export hook env vars (BRIDGE_URL points back to bridge)
-        for key, value in {
-            "PORT": str(PORT),
-            "TMUX_PREFIX": TMUX_PREFIX,
-            "SESSIONS_DIR": target_sessions_dir,  # Remapped for target $HOME
-            "WORKER_BACKEND": normalize_backend(backend_name),
-            "BRIDGE_URL": BRIDGE_PUBLIC_URL or BRIDGE_URL,
-        }.items():
-            _remote_run(["tmux", "set-environment", "-t", tmux_name, key, value],
-                         host=target_host, capture_output=True)
-
-        time.sleep(0.3)
-
-        # Source env and unset CLAUDECODE
-        _remote_run(
-            ["tmux", "send-keys", "-t", tmux_name,
-             'eval "$(tmux show-environment -s)" && unset CLAUDECODE', "Enter"],
-            host=target_host, capture_output=True)
-        time.sleep(0.3)
-
-        # Build and send start command
-        backend = get_backend(backend_name)
-        cli_cmd = backend.start_cmd(session_id)
-
-        # Claude Code refuses --dangerously-skip-permissions as root
-        if target_host:
-            r_id = _remote_run(["id", "-u"], host=target_host,
-                               capture_output=True, text=True)
-            if r_id.returncode == 0 and r_id.stdout.strip() == "0":
-                cli_cmd = cli_cmd.replace(" --dangerously-skip-permissions", "")
-
-        start_cmd = f'unset CLAUDECODE && {cli_cmd}'
-        if target_cwd:
-            start_cmd = f'cd {shlex.quote(target_cwd)} && {start_cmd}'
-
-        print(f"[teleport] start_cmd={start_cmd}")
-        _remote_run(
-            ["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"],
-            host=target_host, capture_output=True)
-
-        if backend.is_interactive:
-            # Claude may show first-time prompts (theme picker, permission
-            # mode). Navigate them: Enter accepts defaults, "2" selects
-            # auto-accept permission mode. Multiple Enter presses are safe.
-            for delay, key in [(3.0, "Enter"), (2.0, "Enter"),
-                               (1.0, "Enter"), (1.0, "Enter")]:
-                time.sleep(delay)
-                _remote_run(["tmux", "send-keys", "-t", tmux_name, key],
-                             host=target_host, capture_output=True)
-
-        # Verify Claude is running (retry up to 30s for startup)
-        for attempt in range(30):
-            time.sleep(1)
-            r = _remote_run(
-                ["tmux", "display-message", "-t", tmux_name, "-p", "#{pane_pid}"],
-                host=target_host, capture_output=True, text=True)
-            if r.returncode != 0:
-                if attempt % 10 == 0:
-                    print(f"[teleport] verify attempt {attempt}: tmux display-message failed rc={r.returncode}")
-                continue
-            pane_pid = r.stdout.strip()
-            claude_pid = _get_claude_pid(pane_pid, host=target_host) if pane_pid else None
-            if claude_pid:
-                print(f"[teleport] verified: claude running as pid {claude_pid} (pane {pane_pid})")
-                return True
-            if attempt % 10 == 0:
-                print(f"[teleport] verify attempt {attempt}: pane_pid={pane_pid}, no claude yet")
-                # Capture pane to see what's happening
-                cap = _remote_run(
-                    ["tmux", "capture-pane", "-t", tmux_name, "-p"],
-                    host=target_host, capture_output=True, text=True, timeout=5)
-                if cap.returncode == 0:
-                    print(f"[teleport] pane content: {cap.stdout[:300]}")
-        print("[teleport] verify FAILED after 30 attempts")
-        return False
-
-    def _teleport_rollback(self, name, tmux_name, source_host, source_cwd,
-                            session_id, backend_name, chat_id, reason):
-        """Roll back a failed teleport by restarting on source."""
-        self._teleport_notify(chat_id, f"Teleport failed: {reason}. Rolling back...")
-        try:
-            # Restore source CWD (may have been overwritten with target path)
-            if source_cwd:
-                save_claude_session_cwd(name, source_cwd)
-
-            # Ensure tmux session exists on source
-            if not tmux_exists(tmux_name, host=source_host):
-                _remote_run(
-                    ["tmux", "new-session", "-d", "-s", tmux_name, "-x", "200", "-y", "50"],
-                    host=source_host, capture_output=True)
-
-            # Restart Claude Code on source
-            backend = get_backend(backend_name)
-            start_cmd = f'unset CLAUDECODE && {backend.start_cmd(session_id)}'
-            if source_cwd:
-                start_cmd = f'cd {shlex.quote(source_cwd)} && {start_cmd}'
-            _remote_run(
-                ["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"],
-                host=source_host, capture_output=True)
-
-            self._teleport_notify(chat_id, f"{name} restarted on source. Teleport cancelled.")
-        except Exception as e:
-            self._teleport_notify(chat_id, f"Rollback also failed: {e}")
-
-        try:
-            state_file = SESSIONS_DIR / name / "teleport_state"
-            state_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    def _teleport_notify(self, chat_id, text):
-        """Send progress notification during teleport."""
-        try:
-            transport.send_text(chat_id, text)
-        except Exception:
-            pass
-
     def cmd_voice(self, arg, chat_id):
         """Toggle auto-TTS for worker responses. /voice on|off or /voice to show status."""
         arg = arg.strip().lower()
@@ -9081,9 +6689,8 @@ class CommandRouter:
             f"Webhook verification: {redact(WEBHOOK_SECRET) if WEBHOOK_SECRET else '(disabled)'}",
             f"Team storage: {SESSIONS_DIR.parent}",
             "",
-            "Team state",
-            f"Focused worker: {state['active'] or '(none)'}",
-            f"Workers: {team_list}",
+            "話題 sessions",
+            f"Sessions: {team_list}",
         ]
 
         lines.append("")
@@ -9176,67 +6783,6 @@ class CommandRouter:
             if candidate in registered:
                 return candidate
         return None
-
-    def _resolve_media_target(self, caption, msg):
-        """Determine which worker's inbox to download media into.
-
-        Uses same priority as _route_media_message: @mentions > reply-to > active.
-        Returns the target worker name (or state["active"] as fallback).
-        """
-        if caption:
-            targets, _ = self.parse_at_mentions(caption)
-            if targets:
-                return targets[0]
-        reply_worker = self._worker_from_reply(msg)
-        if reply_worker:
-            return reply_worker
-        return state["active"]
-
-    def _route_media_message(self, media_text, caption, chat_id, msg_id, msg=None):
-        """Route a media message, honoring @mentions in caption or reply-to context."""
-        if caption:
-            targets, _ = self.parse_at_mentions(caption)
-            if targets:
-                for name in targets:
-                    self.route_message(name, media_text, chat_id, msg_id, one_off=True)
-                return
-        # Check reply-to: if replying to a worker's message, route to that worker
-        reply_worker = self._worker_from_reply(msg)
-        if reply_worker:
-            self.route_message(reply_worker, media_text, chat_id, msg_id, one_off=True)
-            return
-        self.route_to_active(media_text, chat_id, msg_id)
-
-    def route_to_active(self, text, chat_id, msg_id):
-        registered = self.workers.get_registered_sessions()
-
-        if not state["active"]:
-            if registered:
-                names = ", ".join(registered.keys())
-                self.reply(chat_id, f"No one assigned. Your team: {names}\nWho should I talk to?")
-                return
-            else:
-                self.reply(chat_id, "No team members yet. Add someone with /hire <name>.")
-                return
-
-        self.route_message(state["active"], text, chat_id, msg_id, one_off=False)
-
-    def route_to_all(self, text, chat_id, msg_id):
-        registered = self.workers.get_registered_sessions()
-        sessions = list(registered.keys())
-        if not sessions:
-            self.reply(chat_id, "No team members yet. Add someone with /hire <name>.")
-            return
-
-        sent_to = []
-        for name in sessions:
-            session = registered[name]
-            if self.workers.is_online(name, session):
-                self.route_message(name, text, chat_id, msg_id, one_off=True)
-                sent_to.append(name)
-
-        if not sent_to:
-            self.reply(chat_id, "No one's online to share with.")
 
     def route_message(self, session_name, text, chat_id, msg_id, one_off=False):
         registered = self.workers.get_registered_sessions()
@@ -11087,11 +8633,6 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_pr_merge(body)
             return
 
-        if self.path == "/register":
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-            self.handle_forge_register(body)
-            return
-
         # Only accept Telegram webhook on root path — 404 for unknown POST paths
         parsed = urlparse(self.path)
         if parsed.path != "/":
@@ -11173,25 +8714,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(500)
             self.end_headers()
             self.wfile.write(str(e).encode())
-
-    def handle_forge_register(self, body: bytes = b""):
-        """Accept registration from forge-built worker binaries.
-
-        POST /register — worker announces itself to the bridge.
-        Body: {"Name": "workerName", "Host": "hostname", "Version": "1.0.0", "Tools": {...}}
-        Response: {"ok": true}
-        """
-        try:
-            data = json.loads(body) if body else {}
-            name = data.get("Name", data.get("name", ""))
-            host = data.get("Host", data.get("host", ""))
-            version = data.get("Version", data.get("version", ""))
-            if name:
-                print(f"Forge worker registered: {name} (host={host}, version={version})")
-            self._send_json(200, {"ok": True})
-        except Exception as e:
-            print(f"Register error: {e}")
-            self._send_json(500, {"ok": False, "error": str(e)})
 
     def handle_hook_response(self, body: bytes = b""):
         """Handle response forwarded from Claude hook.
@@ -11439,13 +8961,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "Messages during restart may be lost.",
                                 )
 
-                            if host:
-                                # Teleported worker: use remote restart
-                                backend_obj_r = get_backend(backend_name)
-                                ok, err = command_router._restart_remote_worker(
-                                    name, backend_name, backend_obj_r, tmux_name, host, "relaunch")
-                            else:
-                                ok, err = worker_manager.restart(name, mode="relaunch")
+                            ok, err = worker_manager.restart(name, mode="relaunch")
 
                             _recent_restarts[name] = time.time()
                             print(f"[checkin] {name}: restart result ok={ok}, err={err}")
@@ -12111,13 +9627,6 @@ def graceful_shutdown(signum, frame):
 
     print(f"\n[{timestamp}] Received {sig_name} ({parent_info}), shutting down...")
 
-    if grpc_server is not None:
-        try:
-            grpc_server.stop()
-            print("gRPC server stopped")
-        except Exception as e:
-            print(f"gRPC server stop failed: {e}")
-
     if gmail_connector_instance is not None:
         try:
             gmail_connector_instance.stop()
@@ -12137,7 +9646,7 @@ def graceful_shutdown(signum, frame):
 
 
 def main():
-    global admin_chat_id, grpc_server, gmail_connector_instance, github_connector_instance
+    global admin_chat_id, gmail_connector_instance, github_connector_instance
 
     if TRANSPORT_MODE == "telegram" and not BOT_TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN not set")
@@ -12232,22 +9741,6 @@ def main():
 
     watchdog = threading.Thread(target=watchdog_loop, daemon=True)
     watchdog.start()
-
-    if BridgeGRPCServer is not None:
-        try:
-            grpc_server = BridgeGRPCServer(
-                on_worker_response=handle_grpc_worker_response,
-                on_worker_register=handle_grpc_worker_register,
-                on_worker_disconnect=handle_grpc_worker_disconnect,
-                on_jsonl_received=handle_grpc_jsonl_received,
-            )
-            grpc_server.start(GRPC_PORT)
-            print(f"gRPC server on {BRIDGE_BIND}:{GRPC_PORT}")
-        except Exception as e:
-            grpc_server = None
-            print(f"gRPC server disabled: {e}")
-    elif BRIDGE_GRPC_IMPORT_ERROR is not None:
-        print(f"gRPC server disabled: {BRIDGE_GRPC_IMPORT_ERROR}")
 
     gmail_connector_instance = None
     if GMAIL_ENABLED and GmailConnector is not None:
