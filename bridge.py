@@ -5,6 +5,7 @@ VERSION = "0.29.1"
 
 import os
 import json
+import hashlib
 import mimetypes
 import secrets
 import shutil
@@ -3040,6 +3041,25 @@ def _norm_under_root(path):
     return root
 
 
+# Telegram caps callback_data at 64 bytes, so the folder navigator can't embed
+# absolute paths (deep folders overflow -> BUTTON_DATA_INVALID 400, picker "no
+# reaction"). Map each path to a short stable token and resolve it on callback.
+_folder_tokens = {}
+
+
+def _folder_token(path):
+    """Short, stable callback token for an absolute folder path (<= 15 bytes)."""
+    real = os.path.realpath(path)
+    tok = hashlib.sha1(real.encode()).hexdigest()[:12]
+    _folder_tokens[tok] = real
+    return tok
+
+
+def _folder_from_token(tok):
+    """Resolve a folder token to its path, or None if unknown (e.g. post-restart)."""
+    return _folder_tokens.get(tok)
+
+
 def build_folder_keyboard(path):
     """Build a Telegram inline_keyboard for browsing folders under TOPIC_ROOT.
 
@@ -3067,13 +3087,13 @@ def build_folder_keyboard(path):
     subdirs.sort(key=lambda e: e.name)
 
     for entry in subdirs[:30]:
-        rows.append([{"text": f"📁 {entry.name}", "callback_data": f"cd:{entry.path}"}])
+        rows.append([{"text": f"📁 {entry.name}", "callback_data": f"cd:{_folder_token(entry.path)}"}])
 
     if here != root:
         parent = _norm_under_root(os.path.dirname(here))
-        rows.append([{"text": "⬆️ 上一層", "callback_data": f"cd:{parent}"}])
+        rows.append([{"text": "⬆️ 上一層", "callback_data": f"cd:{_folder_token(parent)}"}])
 
-    rows.append([{"text": "✅ 用這層", "callback_data": f"use:{here}"}])
+    rows.append([{"text": "✅ 用這層", "callback_data": f"use:{_folder_token(here)}"}])
     return rows
 
 
@@ -6508,7 +6528,9 @@ class CommandRouter:
 
         try:
             if data.startswith("cd:"):
-                path = _norm_under_root(data[3:])
+                # Resolve the short token back to a path (fall back to root if the
+                # token is stale, e.g. the picker survived a bridge restart).
+                path = _norm_under_root(_folder_from_token(data[3:]) or TOPIC_ROOT)
                 telegram_api(
                     "editMessageReplyMarkup",
                     {
@@ -6518,7 +6540,7 @@ class CommandRouter:
                     },
                 )
             elif data.startswith("use:"):
-                path = _norm_under_root(data[4:])
+                path = _norm_under_root(_folder_from_token(data[4:]) or TOPIC_ROOT)
                 pending = _pending_topic_text.pop((chat_id, thread_id), None)
                 self.open_topic_session(
                     chat_id, thread_id, cwd=path, pending_text=pending

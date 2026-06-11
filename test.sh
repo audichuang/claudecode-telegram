@@ -491,9 +491,13 @@ cr = bridge.command_router
 cr.open_topic_session = lambda chat_id, thread_id, cwd, pending_text=None: calls.__setitem__('opened', (chat_id, thread_id, cwd))
 def upd(data):
     return {'callback_query': {'data': data, 'id': 'q', 'message': {'message_id': 7, 'chat': {'id': 555}, 'message_thread_id': 4321}}}
-cr.handle_callback(upd('cd:' + str(root / 'web')))
+# callback_data is now a short token (not the path); pull the real 'web' token
+# from the keyboard. The token hashes the realpath, so cd: and use: share it.
+cd_data = [b['callback_data'] for r in bridge.build_folder_keyboard(str(root)) for b in r if b['callback_data'].startswith('cd:')][0]
+tok = cd_data[3:]
+cr.handle_callback(upd('cd:' + tok))
 assert calls['edit'] >= 1, 'cd should edit the keyboard'
-cr.handle_callback(upd('use:' + str(root / 'web')))
+cr.handle_callback(upd('use:' + tok))
 assert calls['opened'] == (555, 4321, str(root / 'web')), calls['opened']
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
@@ -1064,6 +1068,37 @@ print('OK')
         success "topic welcome drops multi-worker framing"
     else
         fail "topic welcome test failed"
+    fi
+}
+
+test_topic_folder_callback_data_within_limit() {
+    info "Testing folder-picker callback_data stays <= 64 bytes for deep paths (token, not full path)..."
+    if python3 -c "
+import os, tempfile
+import bridge
+root = tempfile.mkdtemp()
+deep = os.path.join(root, 'research', 'claudecode-telegram', 'docs', 'superpowers')
+os.makedirs(deep)
+bridge.TOPIC_ROOT = root
+# A deep level whose buttons (subdir + up + use) would overflow 64 bytes with full paths.
+for level in (root, os.path.dirname(deep), deep):
+    for row in bridge.build_folder_keyboard(level):
+        for btn in row:
+            cd = btn['callback_data']
+            assert len(cd.encode()) <= 64, ('callback_data too long:', len(cd.encode()), cd)
+# Round-trip: a cd: token resolves back to a real path under root.
+tok = None
+for row in bridge.build_folder_keyboard(root):
+    for btn in row:
+        if btn['callback_data'].startswith('cd:'):
+            tok = btn['callback_data'][3:]
+assert tok and bridge._folder_from_token(tok), ('token must resolve back to a path:', tok)
+assert bridge._folder_from_token(tok).startswith(os.path.realpath(root))
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "folder-picker callback_data within Telegram's 64-byte limit"
+    else
+        fail "topic folder callback_data limit test failed"
     fi
 }
 
@@ -19413,6 +19448,7 @@ run_unit_tests() {
     run_test test_topic_command_menu_is_slim
     run_test test_topic_welcome_drops_multiworker_framing
     run_test test_topic_welcome_folded_into_first_message
+    run_test test_topic_folder_callback_data_within_limit
     run_test test_topic_typing_targets_thread
     run_test test_hook_reply_targets_thread
     run_test test_quota_render
