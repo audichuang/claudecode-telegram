@@ -1071,6 +1071,29 @@ print('OK')
     fi
 }
 
+test_topic_picker_shown_on_topic_creation() {
+    info "Testing the folder picker is shown on topic creation (no throwaway first message needed)..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+cr.workers.get_registered_sessions = lambda registered=None: {}
+bridge.find_topic_session = lambda c, t, r: None
+shown = []
+cr._send_folder_picker = lambda chat_id, thread_id: shown.append((chat_id, thread_id))
+msg = {'message_thread_id': 70, 'forum_topic_created': {'name': '測試'}, 'chat': {'id': 555}}
+cr._handle_topic_message(msg, '', 555, 7)
+assert shown == [(555, 70)], ('picker should show on creation:', shown)
+assert bridge._topic_titles.get((555, 70)) == '測試', bridge._topic_titles.get((555, 70))
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "folder picker shown on topic creation"
+    else
+        fail "topic picker-on-creation test failed"
+    fi
+}
+
 test_topic_folder_callback_data_within_limit() {
     info "Testing folder-picker callback_data stays <= 64 bytes for deep paths (token, not full path)..."
     if python3 -c "
@@ -19448,6 +19471,7 @@ run_unit_tests() {
     run_test test_topic_command_menu_is_slim
     run_test test_topic_welcome_drops_multiworker_framing
     run_test test_topic_welcome_folded_into_first_message
+    run_test test_topic_picker_shown_on_topic_creation
     run_test test_topic_folder_callback_data_within_limit
     run_test test_topic_typing_targets_thread
     run_test test_hook_reply_targets_thread

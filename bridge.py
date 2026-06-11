@@ -6618,6 +6618,12 @@ class CommandRouter:
         if created:
             tid = msg.get("message_thread_id") or msg.get("message_id") or thread_id
             _topic_titles[(int(chat_id), int(tid))] = created.get("name", "")
+            # Show the folder picker right away on topic creation, so the user
+            # doesn't have to send a throwaway message just to summon it (which
+            # would then get answered by the worker). Guarded so a re-fired event
+            # never re-prompts an already-bound topic.
+            if not find_topic_session(chat_id, tid, self.workers.get_registered_sessions()):
+                self._send_folder_picker(chat_id, tid)
             return
 
         registered = self.workers.get_registered_sessions()
