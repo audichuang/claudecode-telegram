@@ -522,12 +522,11 @@ cr = bridge.command_router
 cr.route_message = lambda name, text, chat_id, msg_id, one_off=False: routed.update({'name': name, 'text': text})
 bridge._set_worker_cwd = lambda name, c: created.update({'cwd': c})
 (tmp / 't4321').mkdir(parents=True, exist_ok=True)
-cr.open_topic_session(555, 4321, str(cwd), pending_text='hello')
+cr.open_topic_session(555, 4321, str(cwd))
 assert created.get('name') == 't4321', created
 assert created.get('cwd') == str(cwd), created
-# The first message now folds the welcome in (single reply), so assert the
-# pending text is delivered within it rather than equality.
-assert 'hello' in routed.get('text', ''), routed
+# The trigger message is never forwarded; the worker just gets the welcome.
+assert routed.get('text'), routed
 cid, tid = bridge.load_topic_meta('t4321')
 assert cid == 555 and tid == 4321, (cid, tid)
 print('OK')
@@ -561,7 +560,8 @@ cr.handle_message(msg(4321, 'do it'))
 assert routed == {'name': 't4321', 'text': 'do it'}, routed
 cr.handle_message(msg(8888, 'new one'))
 assert pickers['n'] == 1, 'unknown thread should show picker'
-assert bridge._pending_topic_text.get((555, 8888)) == 'new one', bridge._pending_topic_text
+# The trigger message must NOT be routed anywhere (it is not a task).
+assert routed == {'name': 't4321', 'text': 'do it'}, ('unknown thread must not route', routed)
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
         success "topic routing works"
@@ -1125,8 +1125,8 @@ print('OK')
     fi
 }
 
-test_topic_welcome_folded_into_first_message() {
-    info "Testing open_topic_session sends ONE combined welcome+first-message (no double greeting)..."
+test_topic_open_sends_welcome_only() {
+    info "Testing open_topic_session sends exactly ONE welcome (trigger text never forwarded)..."
     if python3 -c "
 import bridge
 bridge.TOPIC_MODE = True
@@ -1139,17 +1139,86 @@ cr.workers.get_registered_sessions = lambda registered=None: {}
 cr.workers._build_welcome = lambda n, b: 'WELCOME-TEXT'
 routed = []
 cr.route_message = lambda name, text, chat_id, msg_id: routed.append(text)
-cr.open_topic_session(555, 4321, '/tmp', 'do the thing')
-assert len(routed) == 1, ('expected one combined send, got:', routed)
-assert 'WELCOME-TEXT' in routed[0] and 'do the thing' in routed[0], routed
-routed.clear()
-cr.open_topic_session(555, 4322, '/tmp', None)
-assert routed == ['WELCOME-TEXT'], routed
+cr.open_topic_session(555, 4321, '/tmp')
+assert routed == ['WELCOME-TEXT'], ('expected one welcome-only send, got:', routed)
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
-        success "welcome folded into first message (single reply)"
+        success "open_topic_session sends welcome only (single reply)"
     else
-        fail "topic welcome-fold test failed"
+        fail "topic welcome-only test failed"
+    fi
+}
+
+test_topic_first_message_trigger_not_forwarded() {
+    info "Testing the topic-creating first message is a trigger only (picker, never forwarded)..."
+    if python3 -c "
+import tempfile
+import bridge
+bridge.TOPIC_MODE = True
+bridge.TOPIC_ROOT = tempfile.mkdtemp()
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+bridge._picker_sent_at.clear()
+cr.workers.get_registered_sessions = lambda registered=None: {}
+routed = []
+sent = []
+cr.route_message = lambda name, text, chat_id, msg_id: routed.append((name, text))
+bridge.telegram_api = lambda m, d: sent.append((m, d)) or {'ok': True}
+# 1) the junk message that created the topic triggers the picker, no routing
+msg = {'message_thread_id': 880, 'text': '879', 'chat': {'id': 555}}
+cr._handle_topic_message(msg, '879', 555, 7)
+assert any(m == 'sendMessage' for m, d in sent), sent
+assert routed == [], ('trigger must not be routed:', routed)
+# 2) picking a folder opens the session with the welcome ONLY — no '879'
+bridge.resolve_topic_session_name = lambda c, t, r: 'tQ'
+bridge._set_worker_cwd = lambda n, c: None
+bridge.create_session = lambda name, chat_id=None: None
+bridge.save_topic_meta = lambda n, c, t: None
+cr.workers._build_welcome = lambda n, b: 'WELCOME'
+tok = bridge._folder_token(bridge.TOPIC_ROOT)
+cb = {'callback_query': {'id': 'x', 'data': 'use:' + tok,
+      'message': {'chat': {'id': 555}, 'message_id': 1, 'message_thread_id': 880}}}
+cr.handle_callback(cb)
+assert routed and routed[0][1] == 'WELCOME', routed
+assert all('879' not in t for n, t in routed), ('trigger text leaked to worker:', routed)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "first message is trigger-only (never forwarded to the worker)"
+    else
+        fail "topic trigger-only test failed"
+    fi
+}
+
+test_topic_trigger_swallowed_in_grace_window() {
+    info "Testing the creation-companion message is silently swallowed inside the picker grace window..."
+    if python3 -c "
+import bridge
+bridge.TOPIC_MODE = True
+cr = bridge.command_router
+bridge._awaiting_folder.clear()
+bridge._picker_sent_at.clear()
+cr.workers.get_registered_sessions = lambda registered=None: {}
+routed = []
+replies = []
+cr.route_message = lambda name, text, chat_id, msg_id: routed.append((name, text))
+cr.reply = lambda chat_id, text, **kw: replies.append(text)
+key = (555, 881)
+bridge._awaiting_folder.add(key)
+# Inside the grace window: swallow silently (it is the topic-creation trigger)
+bridge._picker_sent_at[key] = bridge.time.time()
+msg = {'message_thread_id': 881, 'text': 'junk', 'chat': {'id': 555}}
+cr._handle_topic_message(msg, 'junk', 555, 7)
+assert routed == [] and replies == [], ('grace window must be silent:', routed, replies)
+# After the window: nudge the user to tap a button
+bridge._picker_sent_at[key] = bridge.time.time() - 60
+cr._handle_topic_message(msg, 'junk2', 555, 8)
+assert routed == [], routed
+assert replies and '按鈕' in replies[0], replies
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "creation trigger swallowed in grace window; later text nudges"
+    else
+        fail "grace-window test failed"
     fi
 }
 
@@ -19470,7 +19539,9 @@ run_unit_tests() {
     run_test test_topic_global_command_delegated
     run_test test_topic_command_menu_is_slim
     run_test test_topic_welcome_drops_multiworker_framing
-    run_test test_topic_welcome_folded_into_first_message
+    run_test test_topic_open_sends_welcome_only
+    run_test test_topic_first_message_trigger_not_forwarded
+    run_test test_topic_trigger_swallowed_in_grace_window
     run_test test_topic_picker_shown_on_topic_creation
     run_test test_topic_folder_callback_data_within_limit
     run_test test_topic_typing_targets_thread

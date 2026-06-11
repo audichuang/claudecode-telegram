@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIG + GLOBALS
 # ============================================================
 
-VERSION="0.33.0"
+VERSION="0.34.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # uv-managed interpreter: prefer the synced .venv, fall back to system python3.

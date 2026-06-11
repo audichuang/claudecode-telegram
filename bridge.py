@@ -3181,14 +3181,17 @@ def find_topic_session(chat_id, thread_id, registered):
     return None
 
 
-# Pending first message per (chat_id, thread_id), captured when the folder
-# picker is shown and consumed when a folder is selected (Task 5).
-_pending_topic_text = {}
-
 # Topics whose folder picker is open (or whose session is still being created).
 # While present, a typed reply must NOT be routed to a worker — it is a
 # mis-attempt to "pick option N". Cleared once the session is bound.
 _awaiting_folder = set()
+
+# When the folder picker was sent, per (chat_id, thread_id). Telegram only
+# commits a new topic when its first message is sent, so that message is just
+# the trigger the platform requires — within this grace window after the
+# picker appears it is silently swallowed (no nudge, never forwarded).
+_picker_sent_at = {}
+_PICKER_GRACE_SECS = 5.0
 
 
 # External usage snapshot written by claude-hud (subscriber rate-limit data).
@@ -6523,7 +6526,7 @@ class CommandRouter:
         if thread_id is None:
             # Symmetric to _handle_topic_message: a non-forum DM carries no
             # message_thread_id, so normalize to the default thread (0 -> 'tmain')
-            # so the pending-text key and open_topic_session line up.
+            # so the awaiting-folder key and open_topic_session line up.
             thread_id = 0
 
         try:
@@ -6541,10 +6544,7 @@ class CommandRouter:
                 )
             elif data.startswith("use:"):
                 path = _norm_under_root(_folder_from_token(data[4:]) or TOPIC_ROOT)
-                pending = _pending_topic_text.pop((chat_id, thread_id), None)
-                self.open_topic_session(
-                    chat_id, thread_id, cwd=path, pending_text=pending
-                )
+                self.open_topic_session(chat_id, thread_id, cwd=path)
         finally:
             # Always clear the spinner on the tapped button.
             if cq_id is not None:
@@ -6553,15 +6553,14 @@ class CommandRouter:
                 except Exception:
                     pass
 
-    def open_topic_session(self, chat_id, thread_id, cwd, pending_text=None):
-        """Spawn the session for a forum Topic thread in ``cwd`` and deliver
-        the pending first message.
+    def open_topic_session(self, chat_id, thread_id, cwd):
+        """Spawn the session for a forum Topic thread in ``cwd``.
 
         Names the worker ``topic_session_name(thread_id)`` (e.g. ``t4321``),
         sets its startup cwd before launch (reusing the ``/checkin`` cwd path),
-        creates it, persists the ``(chat_id, message_thread_id)`` binding, and
-        forwards ``pending_text`` (the message captured when the picker was
-        shown) to it.
+        creates it, and persists the ``(chat_id, message_thread_id)`` binding.
+        Text typed before the folder pick is never forwarded — it is just the
+        trigger Telegram requires to create the topic.
         """
         name = resolve_topic_session_name(
             chat_id, thread_id, self.workers.get_registered_sessions()
@@ -6572,13 +6571,11 @@ class CommandRouter:
         save_topic_meta(name, chat_id, thread_id)
         # Session is bound now — stop treating typed replies as folder-pick attempts.
         _awaiting_folder.discard((chat_id, thread_id))
-        # hire() skips the standalone welcome in TOPIC_MODE; deliver it here folded
-        # into the first message so the worker replies ONCE (not a greeting to the
-        # welcome plus a reply to the first message). route_message keeps the
-        # typing/request tracking.
+        _picker_sent_at.pop((chat_id, thread_id), None)
+        # hire() skips the standalone welcome in TOPIC_MODE; deliver it here so
+        # the worker greets ONCE. route_message keeps the typing/request tracking.
         welcome = self.workers._build_welcome(name, get_backend(DEFAULT_BACKEND))
-        first = f"{welcome}\n\n{pending_text}" if pending_text else welcome
-        self.route_message(name, first, chat_id, None)
+        self.route_message(name, welcome, chat_id, None)
 
     def _send_folder_picker(self, chat_id, thread_id):
         """Show the root-confined folder navigator in a 話題 thread.
@@ -6587,15 +6584,23 @@ class CommandRouter:
         user can pick the cwd for a new topic session.
         """
         _awaiting_folder.add((chat_id, thread_id))
-        telegram_api(
+        _picker_sent_at[(chat_id, thread_id)] = time.time()
+        resp = telegram_api(
             "sendMessage",
             {
                 "chat_id": chat_id,
-                "text": "選擇這個話題要在哪個資料夾開工（請點下方按鈕，輸入數字無法選擇）：",
+                "text": (
+                    "選擇這個話題要在哪個資料夾開工（請點下方按鈕）：\n"
+                    "📌 第一則訊息只是開啟選單的觸發，不會傳給 AI；"
+                    "選好資料夾後再下指令。"
+                ),
                 "message_thread_id": thread_id,
                 "reply_markup": {"inline_keyboard": build_folder_keyboard(TOPIC_ROOT)},
             },
         )
+        # Fail loudly: a silently-dropped picker looks like "the bot ignored me".
+        if isinstance(resp, dict) and not resp.get("ok", True):
+            print(f"Folder picker send FAILED (thread={thread_id}): {resp}", flush=True)
 
     def _handle_topic_message(self, msg, text, chat_id, msg_id):
         """Route an inbound message by forum thread (話題) when TOPIC_MODE is on.
@@ -6603,8 +6608,8 @@ class CommandRouter:
         - No thread (plain DM / general chat) → fixed default session (thread 0,
           named ``tmain``), using the same open/route logic keyed by chat only.
         - Known thread → deliver to its bound session.
-        - Unknown thread → stash the text and show the folder picker so the user
-          can open a new session there.
+        - Unknown thread → the message is just the trigger Telegram requires to
+          create the topic; show the folder picker and never forward it.
         """
         thread_id = msg.get("message_thread_id")
         if thread_id is None:
@@ -6614,14 +6619,14 @@ class CommandRouter:
 
         # A forum_topic_created service message carries the 話題 title; capture
         # it (keyed by the topic's thread id) so the session is named after it.
+        # Telegram only commits a topic when its first message is sent, so this
+        # event arrives TOGETHER with that message — the picker can never appear
+        # before the user types something. Show it now; the companion message
+        # lands moments later and is swallowed by the grace window below.
         created = msg.get("forum_topic_created")
         if created:
             tid = msg.get("message_thread_id") or msg.get("message_id") or thread_id
             _topic_titles[(int(chat_id), int(tid))] = created.get("name", "")
-            # Show the folder picker right away on topic creation, so the user
-            # doesn't have to send a throwaway message just to summon it (which
-            # would then get answered by the worker). Guarded so a re-fired event
-            # never re-prompts an already-bound topic.
             if not find_topic_session(chat_id, tid, self.workers.get_registered_sessions()):
                 self._send_folder_picker(chat_id, tid)
             return
@@ -6691,16 +6696,20 @@ class CommandRouter:
 
         name = find_topic_session(chat_id, thread_id, registered)
         if (chat_id, thread_id) in _awaiting_folder:
-            # Picker open / session still being created: never route a typed reply
-            # to a worker (it's a mis-attempt to "pick option N"). Keep the first
-            # message as the pending text and nudge the user to tap a button.
-            if not name:
-                _pending_topic_text.setdefault((chat_id, thread_id), text)
+            # Picker open / session still being created: never route a typed
+            # reply to a worker. The message that created the topic lands here
+            # right after the picker — swallow it silently (the picker text
+            # already explains it). Later text gets a nudge.
+            sent_at = _picker_sent_at.get((chat_id, thread_id), 0)
+            if time.time() - sent_at <= _PICKER_GRACE_SECS:
+                return
             self.reply(chat_id, "請點上面的資料夾按鈕來選擇工作目錄（輸入文字無法選擇）。")
         elif name:
             self.route_message(name, text, chat_id, msg_id)
         else:
-            _pending_topic_text[(chat_id, thread_id)] = text
+            # Unknown topic with no picker yet (created-event missed, e.g.
+            # after a bridge restart): the message is just the trigger — show
+            # the picker, never forward the text.
             self._send_folder_picker(chat_id, thread_id)
 
     def handle_message(self, update):

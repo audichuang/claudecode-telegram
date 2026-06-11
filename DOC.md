@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 0.33.0
+> Version: 0.34.0
 
 ## Current Philosophy (Summary)
 
@@ -339,6 +339,28 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v0.34.0 - First message is a trigger, never a task
+
+**Root cause (confirmed via getUpdates/getWebhookInfo):** Telegram does not
+commit a forum topic until its first message is sent — creating a topic without
+typing produces **zero** updates for the bot (`pending_update_count: 0`), so
+"show the picker on creation, before any typing" is physically impossible.
+The `forum_topic_created` service message arrives *together with* the first
+user message (≈1s apart).
+
+**New design — the first message is the trigger Telegram requires, nothing more:**
+- An unknown topic's first message only summons the folder picker. It is never
+  stashed, never forwarded — the `_pending_topic_text` mechanism is removed, and
+  `open_topic_session()` always sends the welcome alone.
+- Grace window (`_PICKER_GRACE_SECS = 5s`): the creation-companion message that
+  lands right after the picker is swallowed silently (no "請點按鈕" noise).
+  Text typed later, while the picker is still open, gets the nudge.
+- The picker text explains itself: "第一則訊息只是開啟選單的觸發，不會傳給 AI"。
+- Picker send failures are logged loudly (a dropped picker reads as "bot 已讀不回").
+
+**Flow:** 建話題（Telegram 強制要打一句）→ 選單出現（那句話被吞掉）→
+點資料夾 → worker 在該目錄誕生並打一次招呼 → 之後的訊息才是任務。
 
 ### v0.33.0 - Topic spawn fix + topic-native command surface
 
