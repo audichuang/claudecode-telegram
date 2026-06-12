@@ -4941,8 +4941,12 @@ class CommandRouter:
         )
         # Set startup cwd before launch so the worker starts in the chosen folder.
         _set_worker_cwd(name, cwd)
-        create_session(name, chat_id=chat_id)
+        # Persist the (chat_id, thread_id) binding BEFORE the (slow, multi-second)
+        # session launch: updates run in their own threads, so a /close arriving
+        # mid-launch must already find the binding or the session becomes
+        # unclosable (find_topic_session would miss it).
         save_topic_meta(name, chat_id, thread_id)
+        create_session(name, chat_id=chat_id)
         # Session is bound now — stop treating typed replies as folder-pick attempts.
         _awaiting_folder.discard((chat_id, thread_id))
         _picker_sent_at.pop((chat_id, thread_id), None)
