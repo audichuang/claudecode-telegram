@@ -3232,7 +3232,7 @@ def is_pending(name):
         if (time.time() - ts) > PENDING_TIMEOUT:
             return False
         return True
-    except:
+    except Exception:
         return False
 
 
@@ -4134,7 +4134,6 @@ def _normalize_activity(raw: str) -> str:
     # Pattern: single capitalized gerund word optionally followed by (duration)
     m = re.match(r'^([A-Z][a-z]+ing)\s*(?:\((.+)\))?\s*$', raw)
     if m:
-        verb = m.group(1)
         dur = m.group(2)
         # Known multi-word prefixes that happen to start with a gerund are handled
         # by the regex requiring the FULL string to be one word + optional duration.
@@ -4833,7 +4832,7 @@ class WorkerManager:
                         "protocol": "none",
                         "address": "",
                         "status": "exited",
-                        "note": f"Worker exited. Reopen its 話題 (or /cd <path> inside it) to restart.",
+                        "note": "Worker exited. Reopen its 話題 (or /cd <path> inside it) to restart.",
                     })
                 continue
 
@@ -5605,7 +5604,9 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
     _, topic_thread_id = load_topic_meta(name)
     topic_thread_id = topic_thread_id or None
     if host:
-        _accept_all = lambda p: (True, Path(p))
+        def _accept_all(p):
+            return True, Path(p)
+
         clean_text, images = _parse_media_tags(text, "image", _accept_all)
         clean_text, files = _parse_media_tags(clean_text, "file", _accept_all)
     else:
@@ -6469,7 +6470,7 @@ class CommandRouter:
                 url += f"&host={urllib.parse.quote(worker_host)}"
             req = urllib.request.Request(url, method="POST")
             with urllib.request.urlopen(req, timeout=5) as resp:
-                data = _json.loads(resp.read())
+                _json.loads(resp.read())
             # Derive host from BRIDGE_PUBLIC_URL (auto-detected at startup)
             from urllib.parse import urlparse
             host = urlparse(BRIDGE_PUBLIC_URL).hostname if BRIDGE_PUBLIC_URL else "localhost"

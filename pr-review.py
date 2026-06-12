@@ -599,7 +599,6 @@ def generate_html(meta, files, pr_num, owner, repo, comments=None, reviews=None,
     # Commits (with inline diffs)
     for ci, commit in enumerate(commits):
         sha = commit.get('sha', '')[:8]
-        sha_full = commit.get('sha', '')
         msg = commit.get('message', '')
         msg_first = msg.split('\n')[0] if msg else '(no message)'
         msg_rest = '\n'.join(msg.split('\n')[1:]).strip() if '\n' in msg else ''
@@ -858,7 +857,6 @@ def generate_html(meta, files, pr_num, owner, repo, comments=None, reviews=None,
     } for f in files])
 
     # ---- Merge readiness bar ----
-    merge_bar_html = ''
     pr_state = meta.get('state', 'open')
     pr_merged = meta.get('merged', False)
     pr_draft = meta.get('draft', False)
