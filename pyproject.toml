@@ -18,7 +18,6 @@ package = false
 [tool.ruff]
 target-version = "py312"
 line-length = 120
-extend-exclude = ["forge/proto/python"]
 
 [tool.ruff.lint]
 # Conservative ruleset for a large, stdlib-heavy codebase: pyflakes (F) + pycodestyle errors (E).
