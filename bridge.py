@@ -26,20 +26,6 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Optional
 
-try:
-    from gmail_connector import GmailConnector
-    GMAIL_IMPORT_ERROR = None
-except ImportError as e:
-    GmailConnector = None
-    GMAIL_IMPORT_ERROR = e
-
-try:
-    from github_connector import GitHubConnector
-    GITHUB_IMPORT_ERROR = None
-except ImportError as e:
-    GitHubConnector = None
-    GITHUB_IMPORT_ERROR = e
-
 
 # ============================================================
 # CONFIGURATION
@@ -60,9 +46,6 @@ if NODE_NAME and not os.environ.get("PORT"):
     PORT = _DEFAULT_PORTS.get(NODE_NAME, 8270)
 else:
     PORT = int(os.environ.get("PORT", "8270"))
-
-gmail_connector_instance = None  # initialized in main()
-github_connector_instance = None  # initialized in main()
 
 BRIDGE_BIND = os.environ.get("BRIDGE_BIND", "127.0.0.1")  # Bind address (localhost-only by default)
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")  # Optional webhook verification
@@ -161,21 +144,6 @@ FILE_INBOX_ROOT = Path(f"/tmp/claudecode-telegram/{_node_name}")
 DEFAULT_BACKEND = "claude"
 DEFAULT_WORKER_BACKEND = DEFAULT_BACKEND
 PENDING_TIMEOUT = 600
-
-# Gmail connector: poll Gmail for manager emails with @worker mentions
-GMAIL_ENABLED = os.environ.get("GMAIL_ENABLED", "0") == "1"
-GMAIL_POLL_INTERVAL = int(os.environ.get("GMAIL_POLL_INTERVAL", "45"))
-GMAIL_FROM_FILTER = os.environ.get("GMAIL_FROM_FILTER", "ngocthinhdp@gmail.com")
-GMAIL_GWS_BIN = os.environ.get("GMAIL_GWS_BIN", os.path.expanduser("~/bin/gws"))
-if GMAIL_ENABLED and not GMAIL_FROM_FILTER.strip():
-    raise RuntimeError("GMAIL_FROM_FILTER must be set when GMAIL_ENABLED=1 (security: sender filter required)")
-
-GITHUB_ENABLED = os.environ.get("BRIDGE_GHPOLL_ENABLED", "0") == "1"
-GITHUB_POLL_INTERVAL = int(os.environ.get("BRIDGE_GHPOLL_INTERVAL", "60"))
-GITHUB_REPO = os.environ.get("BRIDGE_GHPOLL_REPO", "BasedHardware/omi")
-GITHUB_FROM_USER = os.environ.get("BRIDGE_GHPOLL_USER", "beastoin")
-if GITHUB_ENABLED and not GITHUB_FROM_USER.strip():
-    raise RuntimeError("BRIDGE_GHPOLL_USER must be set when BRIDGE_GHPOLL_ENABLED=1 (security: sender filter required)")
 
 # Team directory: shared knowledge base (soul docs, kanban, playbook, etc.)
 TEAM_DIR = os.path.expanduser(os.environ.get("TEAM_DIR", "~/team"))
@@ -8212,26 +8180,12 @@ def graceful_shutdown(signum, frame):
 
     print(f"\n[{timestamp}] Received {sig_name} ({parent_info}), shutting down...")
 
-    if gmail_connector_instance is not None:
-        try:
-            gmail_connector_instance.stop()
-            print("Gmail connector stopped")
-        except Exception:
-            pass
-
-    if github_connector_instance is not None:
-        try:
-            github_connector_instance.stop()
-            print("GitHub connector stopped")
-        except Exception:
-            pass
-
     send_shutdown_message()
     sys.exit(0)
 
 
 def main():
-    global admin_chat_id, gmail_connector_instance, github_connector_instance
+    global admin_chat_id
 
     if TRANSPORT_MODE == "telegram" and not BOT_TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN not set")
@@ -8322,100 +8276,6 @@ def main():
 
     watchdog = threading.Thread(target=watchdog_loop, daemon=True)
     watchdog.start()
-
-    gmail_connector_instance = None
-    if GMAIL_ENABLED and GmailConnector is not None:
-        def _gmail_on_message(targets, html_text, plain_text=None, attachments=None):
-            if plain_text is None:
-                plain_text = html_text
-            if admin_chat_id:
-                try:
-                    send_telegram_message(admin_chat_id, html_text, parse_mode="HTML")
-                except Exception:
-                    send_telegram_message(admin_chat_id, plain_text)
-                for att in (attachments or []):
-                    fpath = att.get("path", "")
-                    fname = att.get("filename", "")
-                    if not fpath or not os.path.isfile(fpath):
-                        continue
-                    ext = os.path.splitext(fname)[1].lower()
-                    caption = f"📧 {fname}"
-                    if ext in ALLOWED_IMAGE_EXTENSIONS:
-                        send_photo(admin_chat_id, fpath, caption)
-                    elif ext in VIDEO_EXTENSIONS:
-                        send_video(admin_chat_id, fpath, caption)
-                    else:
-                        send_document(admin_chat_id, fpath, caption)
-                    print(f"[gmail] attachment -> Telegram: {fname}")
-            if targets:
-                for name in targets:
-                    send_to_worker(name, plain_text)
-                    print(f"[gmail] -> {name}: {plain_text[:80]}...")
-            else:
-                print(f"[gmail] -> Telegram only (no mentions): {plain_text[:80]}...")
-
-        def _gmail_get_workers():
-            return set(get_registered_sessions().keys())
-
-        def _gmail_on_alert(text):
-            if admin_chat_id:
-                try:
-                    send_telegram_message(admin_chat_id, text)
-                except Exception as e:
-                    print(f"[gmail] Failed to send Telegram alert: {e}")
-
-        gmail_connector_instance = GmailConnector(
-            gws_bin=GMAIL_GWS_BIN,
-            from_filter=GMAIL_FROM_FILTER,
-            poll_interval=GMAIL_POLL_INTERVAL,
-            on_message=_gmail_on_message,
-            get_registered_workers=_gmail_get_workers,
-            on_alert=_gmail_on_alert,
-        )
-        gmail_connector_instance.start()
-        print(f"Gmail connector: polling every {GMAIL_POLL_INTERVAL}s for {GMAIL_FROM_FILTER}")
-    elif GMAIL_ENABLED and GmailConnector is None:
-        print(f"Gmail connector disabled: {GMAIL_IMPORT_ERROR}")
-
-    github_connector_instance = None
-    if GITHUB_ENABLED and GitHubConnector is not None:
-        def _github_on_message(targets, html_text, plain_text=None, attachments=None):
-            if plain_text is None:
-                plain_text = html_text
-            if admin_chat_id:
-                try:
-                    send_telegram_message(admin_chat_id, html_text, parse_mode="HTML")
-                except Exception:
-                    send_telegram_message(admin_chat_id, plain_text)
-            if targets:
-                for name in targets:
-                    send_to_worker(name, plain_text)
-                    print(f"[github] -> {name}: {plain_text[:80]}...")
-            else:
-                print(f"[github] -> Telegram only (no mentions): {plain_text[:80]}...")
-
-        def _github_get_workers():
-            return set(get_registered_sessions().keys())
-
-        def _github_on_alert(text):
-            if admin_chat_id:
-                try:
-                    send_telegram_message(admin_chat_id, text)
-                except Exception as e:
-                    print(f"[github] Failed to send Telegram alert: {e}")
-
-        github_connector_instance = GitHubConnector(
-            repo=GITHUB_REPO,
-            from_user=GITHUB_FROM_USER,
-            poll_interval=GITHUB_POLL_INTERVAL,
-            on_message=_github_on_message,
-            get_registered_workers=_github_get_workers,
-            on_alert=_github_on_alert,
-        )
-        github_connector_instance.start()
-        print(f"GitHub connector: polling every {GITHUB_POLL_INTERVAL}s for {GITHUB_FROM_USER} on {GITHUB_REPO}")
-    elif GITHUB_ENABLED and GitHubConnector is None:
-        print(f"GitHub connector disabled: {GITHUB_IMPORT_ERROR}")
 
     try:
         ReuseAddrServer((BRIDGE_BIND, PORT), Handler).serve_forever()
