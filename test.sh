@@ -146,8 +146,8 @@ cleanup() {
         kill "$(cat "$TEST_NODE_DIR/bridge.pid")" 2>/dev/null || true
         rm -f "$TEST_NODE_DIR/bridge.pid"
     fi
-    [[ -n "$BRIDGE_PID" ]] && kill "$BRIDGE_PID" 2>/dev/null; true
-    [[ -n "$TUNNEL_PID" ]] && kill "$TUNNEL_PID" 2>/dev/null; true
+    [[ -n "$BRIDGE_PID" ]] && kill "$BRIDGE_PID" 2>/dev/null || true
+    [[ -n "$TUNNEL_PID" ]] && kill "$TUNNEL_PID" 2>/dev/null || true
     # Kill any test sessions we created (using test prefix)
     tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${TEST_TMUX_PREFIX}" | while read -r session; do
         tmux kill-session -t "$session" 2>/dev/null || true
@@ -177,7 +177,7 @@ wait_for_port() {
     local port="$1" attempts=0
     while ! nc -z localhost "$port" 2>/dev/null && [[ $attempts -lt 30 ]]; do
         sleep 0.1
-        ((attempts++))
+        ((attempts++)) || true
     done
     nc -z localhost "$port" 2>/dev/null
 }
@@ -204,7 +204,7 @@ wait_for_session() {
     local session="$1" attempts=0
     while ! tmux has-session -t "${TEST_TMUX_PREFIX}${session}" 2>/dev/null && [[ $attempts -lt 20 ]]; do
         sleep 0.1
-        ((attempts++))
+        ((attempts++)) || true
     done
     tmux has-session -t "${TEST_TMUX_PREFIX}${session}" 2>/dev/null
 }
@@ -213,7 +213,7 @@ wait_for_session_gone() {
     local session="$1" attempts=0
     while tmux has-session -t "${TEST_TMUX_PREFIX}${session}" 2>/dev/null && [[ $attempts -lt 20 ]]; do
         sleep 0.1
-        ((attempts++))
+        ((attempts++)) || true
     done
     ! tmux has-session -t "${TEST_TMUX_PREFIX}${session}" 2>/dev/null
 }
