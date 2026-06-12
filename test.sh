@@ -2076,116 +2076,6 @@ test_webhook_secret() {
     rm -rf "$secret_sessions_dir"
 }
 
-test_mention_routing() {
-    info "Testing @mention and @all routing..."
-
-    # Create second session first
-    send_message "/hire testbot2" >/dev/null
-    wait_for_session "testbot2"
-
-    # @mention routing
-    local result
-    result=$(send_message "@testbot1 hello from mention")
-    if [[ "$result" == "OK" ]]; then
-        success "@mention routing works"
-    else
-        fail "@mention routing failed"
-    fi
-
-    # @all broadcast
-    result=$(send_message "@all hello everyone")
-    if [[ "$result" == "OK" ]]; then
-        success "@all broadcast accepted"
-    else
-        fail "@all broadcast failed"
-    fi
-}
-
-test_reply_routing_and_context() {
-    info "Testing reply routing and context..."
-
-    # Create worker
-    send_message "/hire replybot" >/dev/null
-    wait_for_session "replybot"
-
-    # Reply to worker message
-    local result
-    result=$(send_reply "follow up question" "replybot: I fixed the bug")
-    if [[ "$result" == "OK" ]]; then
-        success "Reply to worker message routed correctly"
-    else
-        fail "Reply routing failed"
-    fi
-
-    # Create another worker for context test
-    send_message "/hire contextbot" >/dev/null
-    wait_for_session "contextbot"
-    send_message "/focus contextbot" >/dev/null
-
-    # Reply to own message (non-bot) includes context
-    result=$(send_reply "." "my original message" "false")
-    if [[ "$result" == "OK" ]]; then
-        success "Reply to own message includes context"
-    else
-        fail "Reply context failed"
-    fi
-
-    # Cleanup
-    send_message "/end replybot" >/dev/null 2>&1 || true
-    send_message "/end contextbot" >/dev/null 2>&1 || true
-}
-
-test_shortcuts_and_unknown_commands() {
-    info "Testing worker shortcuts and unknown command passthrough..."
-
-    # Create workers
-    send_message "/hire shortcut1" >/dev/null
-    wait_for_session "shortcut1"
-    send_message "/hire shortcut2" >/dev/null
-    wait_for_session "shortcut2"
-
-    # Focus switch via shortcut
-    local result
-    result=$(send_message "/shortcut1")
-    if [[ "$result" == "OK" ]]; then
-        success "/<worker> focus switch works"
-    else
-        fail "/<worker> focus switch failed"
-    fi
-
-    # Route message via shortcut
-    send_message "/hire shortcut3" >/dev/null
-    wait_for_session "shortcut3"
-    result=$(send_message "/shortcut3 hello from shortcut")
-    if [[ "$result" == "OK" ]]; then
-        success "/<worker> <message> routing works"
-    else
-        fail "/<worker> <message> routing failed"
-    fi
-
-    # Command with @botname suffix
-    result=$(send_message "/team@TestBot")
-    if [[ "$result" == "OK" ]]; then
-        success "Command with @botname suffix handled"
-    else
-        fail "Command with @botname suffix failed"
-    fi
-
-    # Unknown command passthrough (focused worker exists)
-    send_message "/focus shortcut1" >/dev/null
-    result=$(send_message "/unknowncmd hello")
-    if [[ "$result" == "OK" ]]; then
-        success "Unknown command passed through to worker"
-    else
-        fail "Unknown command passthrough failed"
-    fi
-
-    # Cleanup
-    send_message "/end shortcut1" >/dev/null 2>&1 || true
-    send_message "/end shortcut2" >/dev/null 2>&1 || true
-    send_message "/end shortcut3" >/dev/null 2>&1 || true
-}
-
 test_cli_webhook_commands() {
     info "Testing CLI webhook commands..."
 
@@ -4922,18 +4812,6 @@ test_admin_registration() {
     fi
 }
 
-test_open_session_creates_tmux() {
-    info "Testing /hire command..."
-
-    send_message "/hire testbot1" >/dev/null
-
-    if wait_for_session "testbot1"; then
-        success "/hire creates tmux session"
-    else
-        fail "/hire failed to create session"
-    fi
-}
-
 test_backend_env_metadata() {
     info "Testing worker backend env exports claude..."
 
@@ -4969,16 +4847,17 @@ print('OK')
 test_tmux_mode_session_stays_alive() {
     info "Testing tmux mode session stays alive after creation..."
 
-    # Clean up any existing test worker
-    send_message "/end tmuxalive" >/dev/null 2>&1 || true
+    # Clean up any existing test session
+    python3 -c "import bridge; bridge.session_manager.close_session('tmuxalive')" >/dev/null 2>&1 || true
     wait_for_session_gone "tmuxalive" 2>/dev/null || true
 
-    # Create worker via /hire
-    local result
-    result=$(send_message "/hire tmuxalive")
-
-    if [[ "$result" != "OK" ]]; then
-        fail "Tmux session alive: /hire failed: $result"
+    # Create session via the product path (topic flow calls open_session)
+    if ! python3 -c "
+import bridge
+ok, msg = bridge.session_manager.open_session('tmuxalive', chat_id=123456)
+assert ok, msg
+" 2>/dev/null; then
+        fail "Tmux session alive: open_session failed"
         return
     fi
 
@@ -5000,25 +4879,30 @@ test_tmux_mode_session_stays_alive() {
         return
     fi
 
-    # Cleanup
-    send_message "/end tmuxalive" >/dev/null 2>&1 || true
-    wait_for_session_gone "tmuxalive" 2>/dev/null || true
+    # Cleanup via close_session (covers the close path end-to-end)
+    python3 -c "import bridge; bridge.session_manager.close_session('tmuxalive')" >/dev/null 2>&1 || true
+    if wait_for_session_gone "tmuxalive"; then
+        success "close_session removes tmux session"
+    else
+        fail "close_session failed to remove session"
+    fi
 }
 
-# BEHAVIOR TEST: Verify message actually reaches tmux session (parity with direct mode)
+# BEHAVIOR TEST: Verify message actually reaches the tmux session pane
 test_tmux_mode_message_delivery() {
     info "Testing tmux mode message delivery to session..."
 
-    # Clean up any existing test worker
-    send_message "/end tmuxmsg" >/dev/null 2>&1 || true
+    # Clean up any existing test session
+    python3 -c "import bridge; bridge.session_manager.close_session('tmuxmsg')" >/dev/null 2>&1 || true
     wait_for_session_gone "tmuxmsg" 2>/dev/null || true
 
-    # Create worker
-    local result
-    result=$(send_message "/hire tmuxmsg")
-
-    if [[ "$result" != "OK" ]]; then
-        fail "Message delivery: /hire failed: $result"
+    # Create session via the product path
+    if ! python3 -c "
+import bridge
+ok, msg = bridge.session_manager.open_session('tmuxmsg', chat_id=123456)
+assert ok, msg
+" 2>/dev/null; then
+        fail "Message delivery: open_session failed"
         return
     fi
 
@@ -5029,18 +4913,18 @@ test_tmux_mode_message_delivery() {
     fi
 
     local tmux_name="${TEST_TMUX_PREFIX}tmuxmsg"
-
-    # Focus the worker
-    send_message "/focus tmuxmsg" >/dev/null
     sleep 0.5
 
-    # KEY BEHAVIOR TEST: Send a unique message and verify it appears in tmux pane
+    # KEY BEHAVIOR TEST: deliver via the product send path (topic handler calls
+    # session_manager.send) and verify the message appears in the tmux pane
     local unique_msg="test_msg_${RANDOM}"
-    result=$(send_message "$unique_msg")
-
-    if [[ "$result" != "OK" ]]; then
-        fail "Message delivery: Message send failed: $result"
-        send_message "/end tmuxmsg" >/dev/null 2>&1 || true
+    if ! python3 -c "
+import sys, bridge
+ok = bridge.session_manager.send('tmuxmsg', sys.argv[1], chat_id=123456)
+assert ok, 'send returned False'
+" "$unique_msg" 2>/dev/null; then
+        fail "Message delivery: session_manager.send failed"
+        python3 -c "import bridge; bridge.session_manager.close_session('tmuxmsg')" >/dev/null 2>&1 || true
         return
     fi
 
@@ -5058,14 +4942,26 @@ test_tmux_mode_message_delivery() {
     fi
 
     # Cleanup
-    send_message "/end tmuxmsg" >/dev/null 2>&1 || true
+    python3 -c "import bridge; bridge.session_manager.close_session('tmuxmsg')" >/dev/null 2>&1 || true
     wait_for_session_gone "tmuxmsg" 2>/dev/null || true
 }
 
 test_session_files() {
     info "Testing session file permissions..."
 
-    local session_dir="$TEST_SESSION_DIR/testbot1"
+    # Create a session of our own (no dependency on other tests' sessions)
+    python3 -c "import bridge; bridge.session_manager.close_session('permbot')" >/dev/null 2>&1 || true
+    if ! python3 -c "
+import bridge
+ok, msg = bridge.session_manager.open_session('permbot', chat_id=123456)
+assert ok, msg
+" 2>/dev/null; then
+        fail "Session files: open_session failed"
+        return
+    fi
+    wait_for_session "permbot" >/dev/null 2>&1 || true
+
+    local session_dir="$TEST_SESSION_DIR/permbot"
 
     if [[ -d "$session_dir" ]]; then
         # Check directory permissions (should be 0700)
@@ -5098,117 +4994,10 @@ test_session_files() {
     else
         fail "Session directory not created"
     fi
+
+    # Cleanup
+    python3 -c "import bridge; bridge.session_manager.close_session('permbot')" >/dev/null 2>&1 || true
 }
-
-test_end_command() {
-    info "Testing /end command..."
-
-    local result
-    result=$(send_message "/end testbot2")
-    wait_for_session_gone "testbot2"
-
-    if ! tmux has-session -t "${TEST_TMUX_PREFIX}testbot2" 2>/dev/null; then
-        success "/end removes tmux session"
-    else
-        fail "/end failed to remove session"
-    fi
-}
-
-test_dynamic_bot_command_list_update() {
-    info "Testing dynamic bot command list updates..."
-
-    local worker="cmdlist$RANDOM"
-    local added=0
-    local removed=0
-    local api_error=0
-
-    # Ensure clean start
-    send_message "/end $worker" >/dev/null 2>&1 || true
-    wait_for_session_gone "$worker" 2>/dev/null || true
-
-    send_message "/hire $worker" >/dev/null
-    if ! wait_for_session "$worker"; then
-        fail "Dynamic bot commands: /hire failed"
-        return
-    fi
-
-    # Wait for command to appear in Telegram
-    for _ in $(seq 1 15); do
-        if curl -s "https://api.telegram.org/bot${TEST_BOT_TOKEN}/getMyCommands" | \
-            python3 -c 'import json,sys
-name=sys.argv[1]
-try:
-    data=json.load(sys.stdin)
-except Exception:
-    sys.exit(2)
-if not data.get("ok"):
-    sys.exit(2)
-cmds=[c.get("command") for c in data.get("result", [])]
-sys.exit(0 if name in cmds else 1)
-' "$worker" >/dev/null 2>&1; then
-            added=1
-            break
-        else
-            local status=$?
-            if [[ $status -ne 1 ]]; then
-                api_error=1
-                break
-            fi
-        fi
-        sleep 0.3
-    done
-
-    if [[ $api_error -eq 1 ]]; then
-        fail "Dynamic bot commands: getMyCommands API error"
-    elif [[ $added -eq 1 ]]; then
-        success "Dynamic bot commands: /$worker added"
-    else
-        fail "Dynamic bot commands: /$worker not added"
-    fi
-
-    send_message "/end $worker" >/dev/null 2>&1 || true
-    wait_for_session_gone "$worker" 2>/dev/null || true
-
-    # Wait for command to be removed
-    api_error=0
-    for _ in $(seq 1 15); do
-        if curl -s "https://api.telegram.org/bot${TEST_BOT_TOKEN}/getMyCommands" | \
-            python3 -c 'import json,sys
-name=sys.argv[1]
-try:
-    data=json.load(sys.stdin)
-except Exception:
-    sys.exit(2)
-if not data.get("ok"):
-    sys.exit(2)
-cmds=[c.get("command") for c in data.get("result", [])]
-sys.exit(0 if name in cmds else 1)
-' "$worker" >/dev/null 2>&1; then
-            sleep 0.3
-            continue
-        else
-            local status=$?
-            if [[ $status -eq 1 ]]; then
-                removed=1
-                break
-            fi
-            api_error=1
-            break
-        fi
-    done
-
-    if [[ $api_error -eq 1 ]]; then
-        fail "Dynamic bot commands: getMyCommands API error (remove)"
-    elif [[ $removed -eq 1 ]]; then
-        success "Dynamic bot commands: /$worker removed"
-    else
-        fail "Dynamic bot commands: /$worker still present"
-    fi
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# New feature tests (v0.8.0+)
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_notify_endpoint() {
     info "Testing /notify endpoint..."
@@ -11112,23 +10901,11 @@ run_integration_tests() {
     log ""
     log "── Admin Tests ─────────────────────────────────────────────────────────"
     run_test test_admin_registration
-    # Bot command tests
-    log ""
-    log "── Bot Command Tests ───────────────────────────────────────────────────"
-    run_test test_open_session_creates_tmux
-    run_test test_end_command
-    run_test test_dynamic_bot_command_list_update
     # Worker naming tests (integration)
     log ""
     log "── Worker Naming Tests (Integration) ───────────────────────────────────"
     run_test test_reserved_names_rejection
-    run_test test_shortcuts_and_unknown_commands
-    # Routing tests
-    log ""
-    log "── Routing Tests ───────────────────────────────────────────────────────"
-    run_test test_mention_routing
-    run_test test_reply_routing_and_context
-    # Tmux mode behavior tests (parity with direct mode)
+    # Tmux mode behavior tests (session lifecycle + delivery via product paths)
     log ""
     log "── Tmux Mode Behavior Tests ────────────────────────────────────────────"
     run_test test_tmux_mode_session_stays_alive
