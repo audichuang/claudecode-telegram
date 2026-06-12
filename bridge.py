@@ -441,7 +441,7 @@ class ClaudeBackend:
         return is_process_running(tmux_name, "claude")
 
 
-# Claude is the only backend (codex/gemini/opencode adapters removed in v1.0.0).
+# Claude is the only backend; legacy adapters were removed in v1.0.0.
 BACKENDS = {
     "claude": ClaudeBackend(),
 }
