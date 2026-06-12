@@ -7061,9 +7061,15 @@ test_token_isolation() {
     local tmux_name="${TEST_TMUX_PREFIX}tmain"
 
     if tmux has-session -t "$tmux_name" 2>/dev/null; then
-        # Check tmux environment - token should NOT be present
-        local tmux_env
-        tmux_env=$(tmux show-environment -t "$tmux_name" 2>/dev/null || echo "")
+        # export_hook_env injects vars ~0.5-0.8s into the launch chain — poll
+        # for PORT= instead of reading once (single read races the injection).
+        local tmux_env="" attempts=0
+        while [[ $attempts -lt 50 ]]; do
+            tmux_env=$(tmux show-environment -t "$tmux_name" 2>/dev/null || echo "")
+            echo "$tmux_env" | grep -q "PORT=" && break
+            sleep 0.1
+            ((attempts++)) || true
+        done
 
         if echo "$tmux_env" | grep -q "TELEGRAM_BOT_TOKEN"; then
             fail "Token leaked to tmux session environment!"
