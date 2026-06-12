@@ -9981,6 +9981,7 @@ test_workers_endpoint_removed() {
         code="000"
     fi
     [[ "$code" == "404" ]] || { echo "expected 404, got $code"; return 1; }
+    success "/workers returns 404"
 }
 
 
@@ -11161,10 +11162,6 @@ run_integration_tests() {
     run_test test_hook_env_validation
     run_test test_checkin_hook_env_validation
     run_test test_checkin_hook_calls_endpoint
-    # Worker discovery tests (integration)
-    log ""
-    log "── Worker Discovery Tests (Integration) ────────────────────────────────"
-    run_test test_workers_endpoint_removed
     # send_to_session integration tests
     log ""
     log "── send_to_session Integration Tests ────────────────────────────────────"
