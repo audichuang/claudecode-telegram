@@ -51,7 +51,7 @@ fi
 # 2. Relaunch fully detached: setsid + </dev/null so no terminal/session
 #    teardown can ever SIGHUP/SIGKILL it (PPID must end up 1).
 setsid bash -c "
-  source '$ENV_FILE'
+  set -a; source '$ENV_FILE'; set +a  # env files have no 'export' lines — without set -a the token dies at exec
   export TOPIC_ROOT='$TOPIC_ROOT' PORT='$PORT' \
          SESSIONS_DIR='$SESSIONS_DIR' TMUX_PREFIX='$TMUX_PREFIX'
   ${ADMIN_CHAT_ID:+export ADMIN_CHAT_ID='$ADMIN_CHAT_ID'}

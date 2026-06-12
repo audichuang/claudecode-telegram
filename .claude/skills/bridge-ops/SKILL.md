@@ -37,6 +37,20 @@ Per-node config comes from `~/.config/claudecode-telegram/<node>.env`
 (TELEGRAM_BOT_TOKEN required; ADMIN_CHAT_ID optional — first sender is
 auto-learned otherwise). Actual ports on this machine: dev=8270, test=8295.
 
+## Start the poll forwarder (getUpdates delivery)
+
+```bash
+.claude/skills/bridge-ops/scripts/poll-forwarder.sh dev
+```
+
+restart-node.sh only brings the bridge up — delivery needs a webhook OR this
+forwarder. If verify-node says "no poll forwarder" AND `getWebhookInfo` shows
+an empty url, nothing can reach the bridge: start the forwarder. It deletes
+any webhook (the two modes conflict), launches setsid-detached (PPID=1), is
+idempotent, and logs to `<node_dir>/poll-fallback.log`. Prefer it over the
+launcher's tunnel+webhook mode for dev — trycloudflare DNS propagation has
+failed a launch and left the whole node dead (2026-06-12).
+
 ## Verify health (read-only, safe anytime)
 
 ```bash
