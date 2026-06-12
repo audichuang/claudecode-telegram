@@ -5041,7 +5041,9 @@ class CommandRouter:
         service message, and the dead-topic reaper. Returns the ended session
         name, or None if the topic had no session.
         """
-        key = (int(chat_id), int(thread_id))
+        # thread_id is None for the DM (non-forum) fallback session — int(None)
+        # would TypeError and leave the session running after /close.
+        key = (int(chat_id), int(thread_id) if thread_id is not None else None)
         _awaiting_folder.discard(key)
         _picker_sent_at.pop(key, None)
         _topic_titles.pop(key, None)

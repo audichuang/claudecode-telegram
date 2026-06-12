@@ -15,6 +15,11 @@
 #
 set -euo pipefail
 
+# Pin a locale that exists everywhere: hosts without en_US.UTF-8 emit
+# "bash: warning: setlocale" on every subprocess, polluting hook-output
+# assertions (tests expect empty output).
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Run tests against the uv-managed venv so inline `python3 -c` assertions exercise the
@@ -5159,13 +5164,21 @@ test_incoming_image_e2e() {
     # Create worker to receive image
     open_dm_session
 
-    # Create a test image
+    # Create a test image (pure stdlib — PIL is not a project dependency)
     python3 << 'PYEOF'
-from PIL import Image, ImageDraw
-img = Image.new('RGB', (200, 100), color='#28A745')
-draw = ImageDraw.Draw(img)
-draw.text((20, 40), "E2E Test Image", fill='white')
-img.save('/tmp/e2e-test-incoming.png')
+import struct, zlib
+
+def chunk(tag, data):
+    c = tag + data
+    return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+
+w = h = 64
+raw = b''.join(b'\x00' + b'\x28\xa7\x45' * w for _ in range(h))  # solid green rows
+png = (b'\x89PNG\r\n\x1a\n'
+       + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+       + chunk(b'IDAT', zlib.compress(raw))
+       + chunk(b'IEND', b''))
+open('/tmp/e2e-test-incoming.png', 'wb').write(png)
 PYEOF
 
     # Upload image to Telegram to get a real file_id
