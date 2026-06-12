@@ -72,6 +72,7 @@ The project is **uv-managed**. `pyproject.toml` declares deps (`markdown-it-py` 
 | File | Purpose |
 |------|---------|
 | `bridge.py` | Telegram webhook handler, session management |
+| `viewer.py` | Transcript / team-chat HTML viewer (extracted from bridge.py in v1.1.0; lazy `import bridge` for config so test monkeypatches keep working) |
 | `claudecode-telegram.sh` | CLI wrapper, tunnel/webhook setup, `$PY`/uv-sync launch |
 | `hooks/send-to-telegram.sh` | Claude Stop hook, sends responses |
 | `hooks/on-tool-failure.sh` | PostToolUseFailure hook (POISONED detection) |

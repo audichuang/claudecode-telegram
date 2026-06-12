@@ -1,14 +1,16 @@
 # Claude Code - Telegram
 
-Run multiple AI workers from Telegram—research, operations, and development in one chat.
+Run Claude Code from Telegram forum topics: one 話題 = one long-lived Claude session.
 
 <img width="400" alt="image" src="https://github.com/user-attachments/assets/a12cbdbf-cf18-4ba4-8645-08a3a359559a" />
 
 ## What This Is
 
-Claude Code - Telegram is a Telegram bot + local bridge that lets you run and coordinate parallel AI workers from one Telegram chat.
+Claude Code - Telegram is a Telegram bot + local bridge that maps each Telegram
+forum topic to its own Claude Code session running in tmux.
 
-In plain English: you message your bot, the bot sends the task to a Claude worker running on your computer, and the worker replies back in Telegram.
+In plain English: create a forum topic, pick a project folder, then talk to
+Claude in that topic. Replies return to the same topic.
 
 What you need:
 - A Mac or Linux/Ubuntu computer
@@ -18,7 +20,7 @@ What you need:
 Important terms (zero assumed knowledge):
 - **API key**: a secret key that lets Claude CLI use your Anthropic account.
 - **Bot token**: a secret key from Telegram that lets this project control your bot.
-- **tmux**: a terminal session manager; this project uses it to keep workers running in the background.
+- **tmux**: a terminal session manager; this project uses it to keep Claude sessions running in the background.
 - **Webhook**: a secure URL where Telegram sends new messages so your bot can react instantly.
 - **cloudflared**: creates a secure public tunnel so Telegram can reach your computer.
 
@@ -26,7 +28,7 @@ Important terms (zero assumed knowledge):
 
 ## Step-by-Step Setup Guide
 
-If you skip steps, workers can appear to start but fail later. Follow each step in order.
+If you skip steps, Claude sessions can appear to start but fail later. Follow each step in order.
 
 ### Part 1: Get Your Accounts Ready (5 min)
 
@@ -59,7 +61,7 @@ If this fails:
 
 #### Step 2: Create an Anthropic API key
 
-Why this matters: workers cannot call Claude without your API key.
+Why this matters: Claude sessions cannot run without your API key.
 
 1. Open `https://console.anthropic.com` and sign in.
 2. Open API keys and create a new key.
@@ -127,7 +129,7 @@ You should see output like: `v20.11.1` (v18+ is required).
 
 #### Step 3: Install Claude CLI
 
-Why this matters: this is the `claude` command workers actually run.
+Why this matters: this is the `claude` command each topic session runs.
 
 > [!WARNING]
 > Common failure before this step: `npm ERR! code EACCES`.
@@ -147,7 +149,7 @@ You should see output like: `1.0.x`.
 
 #### Step 4: Install tmux
 
-Why this matters: tmux keeps multiple workers alive in parallel background sessions.
+Why this matters: tmux keeps topic sessions alive in the background.
 
 ```bash
 brew install tmux
@@ -269,7 +271,7 @@ sudo apt install -y nodejs
 
 #### Step 3: Install Claude CLI
 
-Why this matters: this provides the `claude` executable used by worker sessions.
+Why this matters: this provides the `claude` executable used by topic sessions.
 
 > [!WARNING]
 > Common failure before this step: `npm ERR! code EACCES`.
@@ -375,9 +377,9 @@ If this fails:
 
 #### Step 1: Save your Anthropic API key permanently
 
-Why this matters: workers run in tmux sessions, and tmux must inherit `ANTHROPIC_API_KEY` from your shell startup file.
+Why this matters: topic sessions run in tmux, and tmux must inherit `ANTHROPIC_API_KEY` from your shell startup file.
 
-Important detail: this bridge propagates bridge-specific variables into workers, but it does **not** inject `ANTHROPIC_API_KEY` for you.
+Important detail: this bridge propagates bridge-specific variables into Claude sessions, but it does **not** inject `ANTHROPIC_API_KEY` for you.
 
 > [!WARNING]
 > Do **not** create `~/.claude/.credentials.json` for API-key auth.
@@ -429,7 +431,7 @@ If this fails:
 
 #### Step 2: Complete Claude CLI first-run wizard once
 
-Why this matters: first-run setup must finish once interactively, or workers can get stuck in setup and never answer.
+Why this matters: first-run setup must finish once interactively, or topic sessions can get stuck in setup and never answer.
 
 ```bash
 claude --dangerously-skip-permissions
@@ -522,7 +524,7 @@ cd claudecode-telegram
 
 #### Step 1: Install Claude hooks
 
-Why this matters: hooks are small scripts that send worker replies from Claude sessions back into Telegram.
+Why this matters: hooks are small scripts that send Claude replies from tmux sessions back into Telegram.
 
 ```bash
 ./claudecode-telegram.sh hook install
@@ -558,7 +560,7 @@ If this fails:
 
 #### Step 3: Run the bridge
 
-Why this matters: this starts bridge + tunnel + webhook so Telegram can reach your workers.
+Why this matters: this starts bridge + tunnel + webhook so Telegram can reach your topic sessions.
 
 > [!WARNING]
 > Common failure before this step: `tmux: command not found`.
@@ -705,9 +707,9 @@ Claude is the only backend (codex/gemini/opencode were removed in v1.0.0).
 
 ## What to Expect (Message Flow)
 
-1. You send a task.
+1. You send a task inside a Telegram 話題.
 2. Bot reacts with `👀` to confirm delivery.
-3. Worker replies later as `worker_name: ...`.
+3. Claude replies later in the same 話題.
 
 ## Full Troubleshooting Guide
 
@@ -716,7 +718,7 @@ Claude is the only backend (codex/gemini/opencode were removed in v1.0.0).
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | Bot doesn't respond | Bridge down or wrong admin | Run `./claudecode-telegram.sh status` and restart if needed |
-| `👀` but no reply | Session busy or stuck | Watch the reaction: `✍` = working, `😴` = stalled → `/cd <path>` to restart in place |
+| `👀` but no reply | Session busy or stuck | Watch the reaction: `✍` = working, `😴` = stalled -> `/cd <path>` to restart in place |
 | Picker never appears | Topic not committed | Type any message in the new 話題 (Telegram needs a first message) |
 
 ### `OAuth error: Invalid code`
@@ -905,21 +907,21 @@ The bridge includes built-in security defaults. These optional steps add defense
 ### Already enabled by default
 
 - **Localhost-only binding**: Bridge binds to `127.0.0.1` — only cloudflared (on the same machine) can reach it. Override with `BRIDGE_BIND=0.0.0.0` if needed.
-- **HMAC-signed hook endpoints**: `/response` and `/notify` require `X-Hook-Signature` headers. The bridge generates a per-run secret and exports it to worker sessions automatically. Rogue local processes cannot inject messages without the secret.
+- **Hook endpoints keep the token isolated**: `/response` and `/notify` are local bridge endpoints used by hooks/watchdogs so Claude never needs the Telegram bot token.
 - **Webhook secret**: Set `TELEGRAM_WEBHOOK_SECRET` to verify incoming Telegram webhooks. The bridge rejects forged webhook requests.
-- **Token isolation**: Workers never see `TELEGRAM_BOT_TOKEN`. Responses flow through the bridge, which holds the token.
+- **Token isolation**: Claude sessions never see `TELEGRAM_BOT_TOKEN`. Responses flow through the bridge, which holds the token.
 
 ### Recommended system-level hardening
 
 #### 1. Run bridge under a dedicated Unix user
 
-Why: prevents workers from reading bridge environment (including the bot token) via `/proc`.
+Why: prevents Claude sessions from reading bridge environment (including the bot token) via `/proc`.
 
 ```bash
 sudo useradd --system --create-home --shell /usr/sbin/nologin bridge-user
 ```
 
-Run the bridge as `bridge-user` and workers as your normal user. Workers cannot read `/proc/<bridge-pid>/environ`.
+Run the bridge as `bridge-user` and Claude sessions as your normal user. They cannot read `/proc/<bridge-pid>/environ`.
 
 #### 2. Hide process information between users
 
@@ -974,20 +976,20 @@ claudecode-telegram/
 
 ## Manager Outcomes
 
-- **Throughput while offline.** Run multiple workers in parallel so work continues after hours.
-- **Less context tax.** Long-lived workers keep state, so you do not re-explain.
-- **One place to coordinate.** Broadcast, delegate, and check status from a single chat.
+- **Throughput while offline.** Run multiple topic sessions in parallel so work continues after hours.
+- **Less context tax.** Long-lived topic sessions keep state, so you do not re-explain.
+- **Native coordination.** Telegram forum topics separate workstreams without focus commands.
 
 ## Real Results (From Our Team)
 
-- **@chen** triaged 290 issues in one session and tagged priorities + root causes.
-- **@geni** did deep research on 2 OSS projects, tracing end-to-end flows and dependencies.
-- **Ops manager** keeps 5 workers running; code ships while they are offline.
+- **Triage topic** handled 290 issues in one session and tagged priorities + root causes.
+- **Research topic** did deep research on 2 OSS projects, tracing end-to-end flows and dependencies.
+- **Ops topics** keep long-running workflows moving while the operator is offline.
 
 ## Where Data Lives
 
 - **Messages stay in Telegram.** The bridge does not store message history elsewhere.
-- **Worker context is the chat.** Each worker continues from the same ongoing Telegram thread.
+- **Topic context is the chat.** Each Claude session continues from its own Telegram topic.
 - **Easy to resume.** Pick up any time from the existing chat history.
 
 ## Why This Architecture

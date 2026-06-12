@@ -1,152 +1,168 @@
 # Design Philosophy
 
-> Version: 1.0.0
+> Version: 1.1.0
 
 ## Current Philosophy (Summary)
 
 | Principle | Description |
 |-----------|-------------|
-| **tmux IS persistence** | No database, no state.json - tmux sessions are the source of truth |
-| **`claude-<name>` naming** | Configurable prefix via `TMUX_PREFIX` (default: `claude-`) |
-| **RAM state only** | Derived on demand from tmux, never persisted |
+| **話題 IS the addressing** | One Telegram forum topic = one Claude session; no focus, active state, worker names, or mentions |
+| **First message is a trigger** | Telegram requires a first message to create a topic; that message only opens the folder picker |
+| **tmux IS persistence** | tmux sessions are the source of truth; restart scans existing sessions and resumes |
+| **`TMUX_PREFIX + t<id>-<slug>` naming** | Topic sessions are node-isolated tmux sessions, not user-addressed worker names |
+| **Claude-only** | The only backend is Claude Code in tmux; Codex/Gemini/OpenCode adapters are gone |
+| **RAM state only** | Runtime maps are rebuilt from tmux and per-session files; no focus/active preference is stored |
 | **Per-session files** | Minimal hook↔gateway coordination via filesystem |
 | **Fail loudly** | No silent errors, no hidden retries |
 | **Token isolation** | `TELEGRAM_BOT_TOKEN` never leaves bridge process |
 | **Admin config** | Pre-set via `ADMIN_CHAT_ID` or auto-learn first user |
 | **Secure by default** | 0o700 dirs, 0o600 files, silent rejection of non-admins |
-| **話題 IS the addressing** | One forum topic = one session; no focus/active state, no worker names to type |
 
 ---
 
+## Core Principle: 話題 IS the Addressing
+
+The current product model is intentionally narrow:
+
+```
+Telegram forum topic  ->  one tmux session  ->  one Claude Code process
+```
+
+Typing in a topic selects the session. There is no global focus, active worker,
+`/hire`, `/team`, `@mention`, broadcast, teleport, or worker-to-worker protocol.
+
+```
+建話題（第一則訊息=純觸發）
+  -> 資料夾選單
+  -> tmux starts the Claude session in that folder
+  -> later topic messages/media go to that same Claude session
+  -> Claude Stop hook posts the reply back to the same topic
+  -> 關閉話題 ends the session
+```
+
+Deleted Telegram topics do not emit a Telegram event. The bridge reaps those
+sessions when a later reply bounces with `message thread not found`.
+
 ## Core Principle: tmux IS the Persistence
 
-The most important design decision: **no database, no state files, no JSON persistence**. tmux sessions ARE the source of truth.
+The most important persistence decision remains: tmux sessions are the source of
+truth for live Claude sessions.
 
 ```
 Traditional approach:          This approach:
-┌─────────────────┐            ┌─────────────────┐
-│   state.json    │            │   tmux sessions │ ← source of truth
-│   database      │            │   claude-backend│
-│   config files  │            │   claude-frontend
-└────────┬────────┘            └────────┬────────┘
+┌─────────────────┐            ┌────────────────────────┐
+│   topic state   │            │   tmux sessions        │ ← source of truth
+│   database      │            │   claude-prod-t123-ui  │
+│   focus prefs   │            │   claude-dev-t456-api  │
+└────────┬────────┘            └────────┬───────────────┘
          │                              │
     read/write                     scan on demand
          │                              │
     ┌────▼────┐                    ┌────▼────┐
-    │ gateway │                    │ gateway │
+    │ bridge  │                    │ bridge  │
     └─────────┘                    └─────────┘
 ```
 
 ### Why This Matters
 
-1. **Gateway crashes? No problem.** Restart it, scan tmux, continue working.
+1. **Bridge crashes? No problem.** Restart it, scan tmux, continue working.
 2. **No sync issues.** Can't have stale state if there's no stored state.
-3. **Manual tmux usage works.** Start `claude` in any `claude-*` session, gateway finds it.
+3. **Manual tmux debugging works.** `tmux list-sessions` shows what is alive.
 4. **Debugging is trivial.** `tmux list-sessions` shows exactly what exists.
 
-## Naming Convention: `claude-<name>`
+## Naming Convention: `TMUX_PREFIX + t<id>-<slug>`
 
-User says `/hire backend` → tmux session `claude-backend`
+Topic sessions use the configured tmux prefix plus a topic-derived name:
+
+```
+TMUX_PREFIX=claude-prod-
+Telegram thread 123 titled "API Fix" -> claude-prod-t123-api-fix
+```
+
+When a topic title cannot produce a safe slug, the fallback is `t<thread_id>`.
 
 This prefix pattern enables:
 - **Auto-discovery**: `tmux list-sessions | grep ^claude-` finds all managed sessions
-- **Namespace isolation**: Won't conflict with user's other tmux sessions
+- **Node isolation**: prod/dev/test prefixes do not collide
 - **Clear ownership**: Obvious which sessions belong to the bridge
 
 ## RAM State: Ephemeral by Design
 
 ```python
-state = {
-    "active": "backend",      # Which session receives bare messages
-    "pending_registration": None
-}
+_topic_titles = {}        # topic title captured from Telegram service updates
+_awaiting_folder = set()  # topics waiting for a folder pick
+_worker_cwds = {}         # RAM startup cwd hints
+_topic_request_msg = {}   # current topic message receiving liveness reactions
 ```
 
 This state is:
 - Derived on demand from tmux
 - Never persisted to disk
-- Authoritative only for "active" selection (user preference)
+- Only coordination state for the current process
+- Not an addressing source; the topic is the addressing
 
 ## Per-Session Files: Minimal Coordination
 
 ```
 ~/.claude/telegram/sessions/
-├── backend/
-│   ├── pending      # Timestamp when request started
-│   └── chat_id      # Where to send the response
-└── frontend/
+└── t123-api-fix/
     ├── pending
-    └── chat_id
+    ├── chat_id
+    ├── message_thread_id
+    ├── claude_session_id
+    └── claude_session_cwd
 ```
 
 Why files instead of IPC?
 - **Hook runs in Claude's process**, not the gateway's
 - Files are the simplest cross-process communication
 - Hook just needs: "where do I send this?" and "should I send at all?"
+- Topic metadata lets hook replies return to the same forum topic
 
 ## Message Routing: Simple Rules
 
 ```
-Input                    → Routes to
-─────────────────────────────────────
-/hire backend            → creates claude-backend, sets active
-/focus frontend          → sets active = frontend
-@backend do something    → claude-backend (one-off, focus unchanged)
-fix the bug              → active session (currently frontend)
+Input inside a topic           -> Routes to
+────────────────────────────────────────────────────
+First message in unknown topic -> folder picker only
+Folder button                  -> creates the topic session
+Regular text/media             -> that topic's Claude session
+/cd <path>                     -> restart that topic session in a new cwd
+/close or topic closed         -> end that topic session
 ```
 
-`@name` mentions route messages without changing focus. Use `/focus <name>` to switch.
+Messages outside a topic are not a focus fallback. Topic mode is hardwired on.
 
 ## Feedback Philosophy
 
-- 👀 means the message hit the worker.
-- The worker reply is the confirmation: `worker_name: response`.
-- Text replies only for errors and state/info commands (`/hire`, `/end`, `/focus`, `/team`, `/progress`).
-- Regular messages and `@mentions` are silent.
-- Managers want clean chat; the emoji is instant feedback.
-- If no worker reply is coming, then we speak.
-
-## Registration Flow: Adopt Existing Sessions
-
-What if someone manually started `tmux new -s claude` and ran `claude`?
-
-```
-User: hello
-Bot: Unregistered session detected: claude
-     Register with: {"name": "your-session-name"}
-
-User: {"name": "myproject"}
-Bot: ✓ Registered "myproject" (now active)
-     [tmux session renamed: claude → claude-myproject]
-```
-
-This makes the bridge non-destructive. It adopts existing work rather than requiring users to start fresh.
+- 👀 means the topic message hit Claude.
+- ✍/😴 communicate live watchdog state while the request is pending.
+- 👍 means the Stop hook delivered the reply and cleared pending state.
+- Text replies are reserved for commands, errors, and folder selection.
+- Regular prompts stay clean; the topic itself already names the session.
 
 ## No Summaries, No Magic
 
-The `/team` command shows sessions and their pending status. That's it.
-
-```
-  backend ← active
-  frontend (busy)
-  api
-```
+There is no `/team` orchestration view in the topic product. Use the Telegram
+forum topic list and tmux when you need a system-level view.
 
 We deliberately avoid:
-- AI-generated summaries of what each Claude is doing
-- Automatic context sharing between sessions
+- AI-generated summaries of what each topic session is doing
+- Automatic context sharing between topic sessions
 - "Smart" routing based on message content
 
 Why? Because:
 1. Each Claude session has its own context and project
-2. The user knows which session should handle what
+2. The topic is already the routing decision
 3. Magic routing would be wrong often enough to be frustrating
 
 ## Error Handling: Fail Loudly, Recover Gracefully
 
 - Session doesn't exist? Tell the user immediately.
 - tmux died? Next message will report it.
-- Gateway restarted? Scan and continue.
+- Bridge restarted? Scan and continue.
+- Folder picker failed? Log it loudly.
+- Hook delivery hit `message thread not found`? Reap the dead topic session.
 
 No silent failures. No retry loops that hide problems.
 
@@ -161,97 +177,34 @@ No silent failures. No retry loops that hide problems.
 
 The hook runs on EVERY Claude stop event. Most of the time it should do nothing. The checks ensure it only acts when the gateway initiated the request.
 
-## Why Single Chat?
+## Why Forum Topics?
 
-One Telegram DM manages all Claude instances because:
-1. **Context stays in one place.** Scroll up to see what you asked any Claude.
-2. **No channel/group management.** Just DM the bot.
-3. **Mobile-friendly.** One conversation, explicit routing via commands.
+Forum topics give the UX that the old focus model tried to fake:
 
-The `@name` syntax and `/focus` command give you full control without the overhead of multiple chats.
+1. **Addressing is visible.** The topic you type in is the session you talk to.
+2. **History is naturally grouped.** Project context stays in the topic.
+3. **No command ceremony.** No `/focus`, `@name`, or worker prefix.
+4. **Mobile-friendly.** Telegram already knows how to switch topics.
 
-## Bridge Architecture (v0.19.0)
+## Bridge Architecture (v1.1.0)
 
-The bridge is now organized around small, explicit classes:
+The bridge is organized around small, explicit seams:
 
-- **Backend Protocol** (`typing.Protocol`): `Backend` interface with `name`, `is_interactive`, `start_cmd()` (supports optional `append_system_prompt`), `send()`, `is_online()`.
-- **Backend implementations**: `ClaudeBackend` (interactive), `CodexBackend`, `GeminiBackend`, `OpenCodeBackend` (non-interactive) — all in `bridge.py`.
-- **WorkerManager**: worker lifecycle + routing (`hire`, `end`, `send`, `is_online`, `get_workers`, `scan_tmux_sessions`).
-- **TelegramAPI**: wraps all Telegram API calls (sendMessage/sendPhoto/sendDocument/etc.).
-- **CommandRouter**: all `/command` handlers and message routing; delegates to `WorkerManager` + `TelegramAPI`.
+- **SessionManager**: Claude/tmux session lifecycle, tmux scanning, send, restart,
+  close, and startup cwd handling.
+- **ClaudeBackend**: the only backend implementation; launches and talks to
+  Claude Code inside tmux.
+- **Telegram transport**: real Telegram transport plus a local transport seam for
+  tests and extension commands.
+- **CommandRouter**: Telegram update parsing, topic lifecycle, folder picker,
+  command handling, media routing, and liveness reactions.
+- **viewer.py**: extracted HTML rendering/query helpers for transcript, team-chat,
+  and PR-review viewers. `bridge.py` re-exports these helpers for compatibility
+  with the existing tests.
 
-Interactive vs non-interactive detection is backend-driven (`backend.is_interactive`), not hardcoded to a specific backend.
-
-## Inter-Worker Messaging (Decentralized Discovery)
-
-**Status:** Available (tmux send-keys + named pipes)
-
-**Design philosophy:** Bridge provides discovery only; workers communicate directly using the provided protocol. The bridge does NOT route messages between workers - it only tells workers how to reach each other. This means:
-- **No manager visibility:** Private worker-to-worker conversations stay private
-- **Direct P2P communication:** Workers talk to each other without bridge involvement
-- **Protocol flexibility:** Each worker advertises how to reach it (tmux, pipe, etc.)
-
-**Current state:**
-- **tmux backends:** Workers use `echo 'message' | tmux load-buffer - && tmux paste-buffer -r -t claude-<node>-<worker> && tmux send-keys -t claude-<node>-<worker> Enter`
-- **All backends:** Each worker gets a named pipe at `/tmp/claudecode-telegram/<node>/<worker>/in.pipe`
-  - Node name derived from `TMUX_PREFIX` (`claude-test-` → `test`, `claude-` → `default`)
-
-**Discovery endpoint:**
-
-```
-GET /workers
-```
-
-Response:
-```json
-{
-  "workers": [
-    {
-      "name": "alice",
-      "protocol": "tmux",
-      "address": "claude-prod-alice",
-      "send_example": "echo 'your message here' | tmux load-buffer - && tmux paste-buffer -r -t claude-prod-alice && tmux send-keys -t claude-prod-alice Enter"
-    },
-    {
-      "name": "bob",
-      "protocol": "pipe",
-      "address": "/tmp/claudecode-telegram/<node>/bob/in.pipe",
-      "send_example": "echo 'your message here' > /tmp/claudecode-telegram/<node>/bob/in.pipe"
-    }
-  ]
-}
-```
-
-**Protocol types:**
-
-| Protocol | Address Format | How to Send | Backends |
-|----------|---------------|-------------|------|
-| `tmux` | Session name | `echo "msg" \| tmux load-buffer - && tmux paste-buffer -r -t <address> && tmux send-keys -t <address> Enter` | tmux only |
-| `pipe` | Named pipe path | `echo "message" > <address>` | All backends |
-
-**Recommended: Named pipes as unified protocol**
-
-Named pipes (FIFOs) work across all backends:
-```bash
-# Bridge creates on worker startup
-mkfifo /tmp/claudecode-telegram/<node>/<worker>/in.pipe
-
-# Worker A sends to Worker B
-echo "Hey bob, can you review PR #42?" > /tmp/claudecode-telegram/<node>/bob/in.pipe
-
-# Worker B reads (poll or inotifywait)
-cat /tmp/claudecode-telegram/<node>/<worker>/in.pipe
-```
-
-**Why this design:**
-- Workers collaborate without manager overhead
-- Standard Unix mechanism, no custom protocol
-- Works consistently across tmux and exec backends
-- Bridge stays simple - just discovery, no message routing
-
-**Tests:**
-- `test_worker_pipe_creation_on_startup` - pipes created on worker startup
-- `test_worker_to_worker_pipe` - end-to-end worker communication via pipe
+There is no live inter-worker discovery protocol. `/workers`, named pipes,
+non-interactive adapters, gRPC, forge registration, teleport, `/pilot`, and
+`/remote-run` are deleted product surface.
 
 ---
 
@@ -339,6 +292,37 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.1.0 - Deep-clean documentation baseline and viewer extraction
+
+**What:** Re-baselined the docs to the topic-only reality after the deep-clean
+series. The current philosophy now describes only one Telegram forum topic =
+one Claude Code session, with no legacy focus/router model presented as live
+behavior.
+
+**Deleted surface now treated as gone everywhere in current docs:**
+- Multi-worker orchestration: `/hire`, `/focus`, `/team`, `/end`,
+  `/progress`, `/pause`, `/restart`, per-worker slash shortcuts, `@mention`,
+  `@all`, active/focus state, and last-active restoration.
+- Worker-to-worker transport: `/workers`, named pipes, send examples,
+  cross-machine discovery, and pipe-based tests as live product behavior.
+- Non-Claude backends: Codex, Gemini, OpenCode, non-interactive adapter
+  processes, adapter logs, and backend selection language.
+- Remote/distributed machinery: teleport, remote run, host-aware routing,
+  git state sync, SSH dispatch, gRPC, forge `/register`, and connector-era
+  registration language.
+- Legacy product naming: "manager/worker/team" as the user model. Historical
+  code names may still appear internally where compatibility would make a
+  rename noisy, but docs describe sessions and topics.
+
+**Architecture/doc changes:**
+- `WorkerManager` documentation is replaced with `SessionManager` and the
+  topic lifecycle.
+- Transcript, team-chat, and PR-review rendering are documented as
+  `viewer.py` responsibilities. `bridge.py` imports/re-exports the helpers so
+  existing tests and endpoints keep their contracts.
+- API surface is documented from `API_ENDPOINTS`; deleted endpoints such as
+  `/workers`, `/pilot`, and `/remote-run` must not reappear there.
 
 ### v1.0.0 - Topic-only bridge (the multi-worker era is deleted)
 
