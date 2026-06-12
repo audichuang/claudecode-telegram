@@ -85,7 +85,7 @@ forum topic = one Claude session.
 | Folder/CWD | `test_folder_navigator_keyboard`, `test_topic_cd_rejects_bad_path`, `test_checkin_cwd_stores_in_memory` | Folder picker and `/cd` stay under `TOPIC_ROOT` |
 | Lifecycle | `test_topic_closed_ends_session`, `test_topic_reopened_unbound_shows_picker`, `test_deleted_topic_reaped_on_send_failure` | Close/reopen/delete behavior |
 | Legacy command deletion | `test_topic_legacy_command_rejected`, `test_topic_command_menu_is_slim`, `test_workers_endpoint_removed` | `/hire`, `/focus`, `/team`, `/workers` are not live product surface |
-| Claude/tmux | `test_open_session_creates_tmux`, `test_tmux_mode_session_stays_alive`, `test_tmux_mode_message_delivery` | Claude-only tmux execution path |
+| Claude/tmux | `test_tmux_mode_session_stays_alive`, `test_tmux_mode_message_delivery` | Claude-only tmux execution path |
 | Backend registry | `test_backend_registry_exists`, `test_backend_env_metadata`, `test_claude_start_cmd` | Registry is Claude-only; `codex` is rejected |
 | Extension seam | `test_extension_seam_command` | `EXTRA_COMMANDS` callbacks can handle topic-safe commands without leaking to Claude |
 | API endpoints | `test_api_index_returns_json`, `test_known_endpoints_unchanged`, `test_unknown_get_returns_404`, `test_unknown_post_returns_404` | `API_ENDPOINTS` is the source for the index/404 help |

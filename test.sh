@@ -85,7 +85,10 @@ run_test() {
     local test_name="$1"
     should_run_test "$test_name" || return 0
     ((tests_run++)) || true
-    "$test_name"
+    # Invoke in a guarded context: one test's unexpected non-zero exit must be
+    # recorded as a failure, never abort the whole suite (set -e would otherwise
+    # kill the run mid-suite — CLI/integration/summary never executed).
+    "$test_name" || fail "$test_name aborted (unexpected non-zero exit)"
 }
 
 collect_run_tests() {
@@ -227,6 +230,37 @@ send_message() {
                 "text": "'"$text"'"
             }
         }'
+}
+
+# Open the DM-fallback session (topic-only's non-forum path; session name "tmain").
+# /cd both sets the cwd and (re)starts the session — no folder-picker dance needed.
+open_dm_session() {
+    local dir="${1:-$TEST_SESSION_DIR}"
+    send_message "/cd $dir" >/dev/null
+    wait_for_session "tmain"
+}
+
+close_dm_session() {
+    send_message "/close" >/dev/null 2>&1 || true
+    wait_for_session_gone "tmain" 2>/dev/null || true
+}
+
+test_dm_session_lifecycle() {
+    info "Testing DM fallback session lifecycle (/cd opens, /close ends)..."
+    close_dm_session
+    open_dm_session
+    if tmux has-session -t "${TEST_TMUX_PREFIX}tmain" 2>/dev/null; then
+        success "DM /cd opened the tmain fallback session"
+    else
+        fail "DM /cd did not open tmain"
+        return
+    fi
+    send_message "/close" >/dev/null
+    if wait_for_session_gone "tmain"; then
+        success "/close ended the tmain session"
+    else
+        fail "/close did not end tmain"
+    fi
 }
 
 send_reply() {
@@ -5016,10 +5050,7 @@ test_document_message_routing() {
     info "Testing document message routing to focused worker..."
 
     # Create and focus a worker
-    send_message "/hire doctest" >/dev/null
-    wait_for_session "doctest"
-    send_message "/focus doctest" >/dev/null
-    sleep 0.3
+    open_dm_session
 
     # Send a document message
     local result
@@ -5028,7 +5059,7 @@ test_document_message_routing() {
     if [[ "$result" == "OK" ]]; then
         # Check bridge log for the document handling
         sleep 0.3
-        if grep -q "doctest" "$BRIDGE_LOG" 2>/dev/null; then
+        if grep -q "tmain" "$BRIDGE_LOG" 2>/dev/null; then
             success "Document message routed to focused worker"
         else
             success "Document message accepted (routing attempted)"
@@ -5038,7 +5069,7 @@ test_document_message_routing() {
     fi
 
     # Cleanup
-    send_message "/end doctest" >/dev/null 2>&1 || true
+    close_dm_session
 }
 
 test_incoming_document_e2e() {
@@ -5051,10 +5082,7 @@ test_incoming_document_e2e() {
     fi
 
     # Create worker to receive document
-    send_message "/hire docrecv" >/dev/null
-    wait_for_session "docrecv"
-    send_message "/focus docrecv" >/dev/null
-    sleep 0.3
+    open_dm_session
 
     # Create a test text file
     echo "This is a test document for e2e testing." > /tmp/e2e-test-document.txt
@@ -5072,7 +5100,7 @@ test_incoming_document_e2e() {
 
     if [[ -z "$file_id" ]]; then
         fail "Could not upload test document to get file_id"
-        send_message "/end docrecv" >/dev/null 2>&1 || true
+    close_dm_session
         return
     fi
 
@@ -5101,7 +5129,7 @@ test_incoming_document_e2e() {
     sleep 3
 
     # Check if document was downloaded to inbox
-    local inbox_dir="/tmp/claudecode-telegram/docrecv/inbox"
+    local inbox_dir="/tmp/claudecode-telegram/tmain/inbox"
     if ls "$inbox_dir"/*.txt 2>/dev/null; then
         success "Incoming document downloaded to inbox"
         ls -la "$inbox_dir"/ 2>/dev/null | head -3
@@ -5115,7 +5143,7 @@ test_incoming_document_e2e() {
     fi
 
     # Cleanup
-    send_message "/end docrecv" >/dev/null 2>&1 || true
+    close_dm_session
     rm -f /tmp/e2e-test-document.txt
 }
 
@@ -5129,10 +5157,7 @@ test_incoming_image_e2e() {
     fi
 
     # Create worker to receive image
-    send_message "/hire imgrecv" >/dev/null
-    wait_for_session "imgrecv"
-    send_message "/focus imgrecv" >/dev/null
-    sleep 0.3
+    open_dm_session
 
     # Create a test image
     python3 << 'PYEOF'
@@ -5156,7 +5181,7 @@ PYEOF
 
     if [[ -z "$file_id" ]]; then
         fail "Could not upload test image to get file_id"
-        send_message "/end imgrecv" >/dev/null 2>&1 || true
+    close_dm_session
         return
     fi
 
@@ -5182,7 +5207,7 @@ PYEOF
     sleep 3
 
     # Check if image was downloaded to inbox
-    local inbox_dir="$TEST_SESSION_DIR/imgrecv/inbox"
+    local inbox_dir="$TEST_SESSION_DIR/tmain/inbox"
     if ls "$inbox_dir"/*.png 2>/dev/null || ls "$inbox_dir"/*.jpg 2>/dev/null; then
         success "Incoming image downloaded to inbox"
         ls -la "$inbox_dir"/ 2>/dev/null | head -3
@@ -5196,22 +5221,20 @@ PYEOF
     fi
 
     # Cleanup
-    send_message "/end imgrecv" >/dev/null 2>&1 || true
+    close_dm_session
 }
 
 test_inbox_directory() {
     info "Testing inbox directory creation..."
 
     # Create worker
-    send_message "/hire inboxtest" >/dev/null
-    wait_for_session "inboxtest"
-    send_message "/focus inboxtest" >/dev/null
+    open_dm_session
 
     if python3 -c "
 from bridge import ensure_inbox_dir, get_inbox_dir
 import os
 
-inbox = ensure_inbox_dir('inboxtest')
+inbox = ensure_inbox_dir('tmain')
 assert inbox.exists(), 'inbox should exist'
 perms = oct(inbox.stat().st_mode)[-3:]
 assert perms == '700', f'inbox perms should be 700, got {perms}'
@@ -5223,30 +5246,29 @@ print('OK')
     fi
 
     # Cleanup
-    send_message "/end inboxtest" >/dev/null 2>&1 || true
+    close_dm_session
 }
 
 test_response_with_image_tags() {
     info "Testing /response endpoint with image tags..."
 
     # Create a session
-    send_message "/hire imageresponsetest" >/dev/null
-    wait_for_session "imageresponsetest"
+    open_dm_session
 
     # Set up session files
-    local session_dir="$TEST_SESSION_DIR/imageresponsetest"
+    local session_dir="$TEST_SESSION_DIR/tmain"
     mkdir -p "$session_dir"
     echo "$CHAT_ID" > "$session_dir/chat_id"
 
     # Test response with image tag (image won't exist, but parsing should work)
     local result body
-    body='{"session":"imageresponsetest","text":"Here is the result [[image:/tmp/nonexistent.png|test caption]]"}'
+    body='{"session":"tmain","text":"Here is the result [[image:/tmp/nonexistent.png|test caption]]"}'
     result=$(hook_curl "http://localhost:$PORT/response" "$body")
 
     if [[ "$result" == "OK" ]]; then
         # Check bridge log for image handling attempt
         sleep 0.3
-        if grep -q "imageresponsetest" "$BRIDGE_LOG" 2>/dev/null; then
+        if grep -q "tmain" "$BRIDGE_LOG" 2>/dev/null; then
             success "/response endpoint handles image tags"
         else
             fail "/response endpoint did not process message"
@@ -5256,7 +5278,7 @@ test_response_with_image_tags() {
     fi
 
     # Cleanup
-    send_message "/end imageresponsetest" >/dev/null 2>&1 || true
+    close_dm_session
 }
 
 test_response_endpoint() {
@@ -5268,24 +5290,23 @@ test_response_endpoint() {
     [[ -n "${TEST_CHAT_ID:-}" ]] && expect_real="true"
 
     # Create a new session for this test
-    send_message "/hire responsetest" >/dev/null
-    wait_for_session "responsetest"
+    open_dm_session
 
     # Set up pending file (simulates waiting for response)
-    local session_dir="$TEST_SESSION_DIR/responsetest"
+    local session_dir="$TEST_SESSION_DIR/tmain"
     mkdir -p "$session_dir"
     date +%s > "$session_dir/pending"
     echo "$test_chat_id" > "$session_dir/chat_id"
 
     # Simulate hook calling /response endpoint
     local result body
-    body='{"session":"responsetest","text":"Test response from hook"}'
+    body='{"session":"tmain","text":"Test response from hook"}'
     result=$(hook_curl "http://localhost:$PORT/response" "$body")
 
     if [[ "$result" == "OK" ]]; then
         # Check bridge log for success
         sleep 0.3
-        if grep -q "Response sent: responsetest -> Telegram OK" "$BRIDGE_LOG" 2>/dev/null; then
+        if grep -q "Response sent: tmain -> Telegram OK" "$BRIDGE_LOG" 2>/dev/null; then
             if [[ "$expect_real" == "true" ]]; then
                 success "/response endpoint sends to Telegram (check your Telegram!)"
             else
@@ -5308,7 +5329,7 @@ test_response_endpoint() {
     fi
 
     # Cleanup
-    send_message "/end responsetest" >/dev/null 2>&1 || true
+    close_dm_session
 }
 
 test_last_chat_id_persistence() {
@@ -5340,12 +5361,11 @@ test_response_without_pending() {
     info "Testing /response works without pending file (v0.6.2 behavior)..."
 
     # Create a session for this test
-    send_message "/hire nopendingtest" >/dev/null
-    wait_for_session "nopendingtest"
+    open_dm_session
 
     # Set up ONLY chat_id file - NO pending file
     # This tests v0.6.2 change: pending is not a gate for sending
-    local session_dir="$TEST_SESSION_DIR/nopendingtest"
+    local session_dir="$TEST_SESSION_DIR/tmain"
     mkdir -p "$session_dir"
     echo "$CHAT_ID" > "$session_dir/chat_id"
     # Explicitly ensure no pending file
@@ -5353,7 +5373,7 @@ test_response_without_pending() {
 
     # Simulate hook calling /response endpoint
     local result body
-    body='{"session":"nopendingtest","text":"Test without pending"}'
+    body='{"session":"tmain","text":"Test without pending"}'
     result=$(hook_curl "http://localhost:$PORT/response" "$body")
 
     if [[ "$result" == "OK" ]]; then
@@ -5363,7 +5383,7 @@ test_response_without_pending() {
     fi
 
     # Cleanup
-    send_message "/end nopendingtest" >/dev/null 2>&1 || true
+    close_dm_session
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7023,10 +7043,9 @@ test_token_isolation() {
 
     # Verify TELEGRAM_BOT_TOKEN is NOT exposed to tmux sessions
     # Create a worker and check its environment
-    send_message "/hire tokentest" >/dev/null
-    wait_for_session "tokentest"
+    open_dm_session
 
-    local tmux_name="${TEST_TMUX_PREFIX}tokentest"
+    local tmux_name="${TEST_TMUX_PREFIX}tmain"
 
     if tmux has-session -t "$tmux_name" 2>/dev/null; then
         # Check tmux environment - token should NOT be present
@@ -7056,7 +7075,7 @@ test_token_isolation() {
     fi
 
     # Cleanup
-    send_message "/end tokentest" >/dev/null 2>&1 || true
+    close_dm_session
 }
 
 test_secure_directory_permissions() {
@@ -8007,8 +8026,10 @@ print('OK')
 
     if [ -f "$result_file" ]; then
         local has_paste has_enter
-        has_paste=$(grep -c "PASTE:" "$result_file" 2>/dev/null || echo 0)
-        has_enter=$(grep -c "ENTER_AFTER_PASTE" "$result_file" 2>/dev/null || echo 0)
+        has_paste=$(grep -c "PASTE:" "$result_file" 2>/dev/null || true)
+        has_paste=${has_paste:-0}
+        has_enter=$(grep -c "ENTER_AFTER_PASTE" "$result_file" 2>/dev/null || true)
+        has_enter=${has_enter:-0}
         if [ "$has_paste" -gt 0 ] && [ "$has_enter" -gt 0 ]; then
             success "60-line text + Enter delivered via bracketed paste"
         elif [ "$has_paste" -gt 0 ]; then
@@ -9782,11 +9803,10 @@ test_send_to_session_integration() {
     info "Testing send_to_session with real tmux worker..."
 
     # Create a worker first
-    send_message "/hire sendworkertest" >/dev/null
-    wait_for_session "sendworkertest"
+    open_dm_session
     sleep 0.3
 
-    local tmux_name="${TEST_TMUX_PREFIX}sendworkertest"
+    local tmux_name="${TEST_TMUX_PREFIX}tmain"
 
     # Use send_to_session to send a unique message
     local unique_msg="test_send_to_session_${RANDOM}"
@@ -9803,7 +9823,7 @@ from bridge import send_to_session, TMUX_PREFIX
 print('TMUX_PREFIX:', TMUX_PREFIX)
 
 # Send message using the generic function
-result = send_to_session('sendworkertest', '$unique_msg')
+result = send_to_session('tmain', '$unique_msg')
 print('sent:', result)
 " 2>/dev/null | grep -q "sent: True"; then
         # Verify message appeared in tmux pane
@@ -9821,8 +9841,7 @@ print('sent:', result)
     fi
 
     # Cleanup
-    send_message "/end sendworkertest" >/dev/null 2>&1 || true
-    wait_for_session_gone "sendworkertest" 2>/dev/null || true
+    close_dm_session
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -10901,6 +10920,8 @@ run_integration_tests() {
     log ""
     log "── Admin Tests ─────────────────────────────────────────────────────────"
     run_test test_admin_registration
+    log "── Topic/DM Session Lifecycle Tests ────────────────────────────────────"
+    run_test test_dm_session_lifecycle
     # Worker naming tests (integration)
     log ""
     log "── Worker Naming Tests (Integration) ───────────────────────────────────"
