@@ -5769,7 +5769,6 @@ shutil.which = mock_which
 class FakeBackend:
     name = 'fake'
     binary = 'fakecli'
-    is_interactive = False
     def start_cmd(self, resume_id='', append_system_prompt=''): return 'echo hi'
     def send(self, *a, **kw): return True
     def is_online(self, *a): return True
@@ -5957,48 +5956,6 @@ print('OK')
         success "get_any_session_id works"
     else
         fail "get_any_session_id test failed"
-    fi
-}
-
-test_progress_continuity_for_noninteractive() {
-    info "Testing /progress shows Continuity for non-interactive backends..."
-
-    if python3 -c "
-from bridge import format_progress_lines
-
-# Non-interactive with continuity line
-lines = format_progress_lines(
-    name='alice',
-    pending=True,
-    backend='codex',
-    online=True,
-    ready=True,
-    mode='codex (non-interactive)',
-    continuity_line='Continuity: on (codex thread abc12345...)'
-)
-text = '\\n'.join(lines)
-assert 'Continuity: on' in text, f'Expected Continuity line: {text}'
-assert 'Resume' not in text, f'Should not have Resume for non-interactive: {text}'
-
-# Interactive with resume line
-lines = format_progress_lines(
-    name='bob',
-    pending=False,
-    backend='claude',
-    online=True,
-    ready=True,
-    mode='tmux',
-    resume_line='Resume: available (session abc12345...)'
-)
-text = '\\n'.join(lines)
-assert 'Resume: available' in text, f'Expected Resume line: {text}'
-assert 'Continuity' not in text, f'Should not have Continuity for interactive: {text}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/progress shows Continuity for non-interactive"
-    else
-        fail "/progress Continuity test failed"
     fi
 }
 
@@ -6575,48 +6532,6 @@ print('OK')
     fi
 }
 
-test_backend_file_is_canonical() {
-    info "Testing backend file is canonical source (not registry or tmux env)..."
-
-    if python3 -c "
-import sys, tempfile; sys.path.insert(0, '.')
-from pathlib import Path
-import bridge
-
-tmp = Path(tempfile.mkdtemp())
-bridge.SESSIONS_DIR = tmp
-
-# Simulate drift: backend file says 'codex', but session dict says 'claude'
-session_dir = tmp / 'drifted'
-session_dir.mkdir()
-(session_dir / 'backend').write_text('codex')
-
-# get_worker_backend with a session dict that says 'claude'
-# Backend FILE must take priority over session dict when both exist
-result_with_session = bridge.get_worker_backend('drifted', {'backend': 'claude'})
-
-# get_worker_backend without session dict — must use file
-result_file_only = bridge.get_worker_backend('drifted')
-
-# Both should return 'codex' (file is canonical)
-# Currently session dict wins — this test documents the priority
-assert result_file_only == 'codex', f'file-only: expected codex, got {result_file_only}'
-
-# Session dict currently overrides file — this is the drift bug.
-# After fix, file should win. For now, document the current behavior:
-if result_with_session == 'claude':
-    # CURRENT BEHAVIOR: session dict wins over file — drift possible
-    print('DRIFT_BUG: session dict overrides backend file')
-    raise AssertionError('Backend file must be canonical over session dict')
-else:
-    print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Backend file is canonical source of truth"
-    else
-        fail "Backend file not canonical (session dict overrides)"
-    fi
-}
-
 test_flock_node_namespaced() {
     info "Testing flock path includes node name (multi-node isolation)..."
 
@@ -6665,7 +6580,7 @@ bridge.worker_manager.get_registered_sessions = lambda: {
 }
 
 try:
-    workers = bridge.get_workers()
+    workers = bridge.worker_manager.get_workers()
     bob = next((w for w in workers if w['name'] == 'bob'), None)
     assert bob is not None, f'bob not found in workers: {[w[\"name\"] for w in workers]}'
     assert bob['protocol'] == 'tmux', f'expected tmux protocol, got {bob[\"protocol\"]}'
@@ -6688,81 +6603,6 @@ finally:
     fi
 }
 
-test_pipe_forwarding_to_codex() {
-    info "Testing pipe forwarding routes to codex..."
-
-    if python3 -c "
-import tempfile
-from pathlib import Path
-import bridge
-
-tmp = Path(tempfile.mkdtemp())
-bridge.SESSIONS_DIR = tmp
-bridge.WORKER_PIPE_ROOT = tmp / 'pipes'
-bridge.worker_manager.scan_tmux_sessions = lambda: {}
-
-session_dir = tmp / 'alice'
-session_dir.mkdir()
-(session_dir / 'backend').write_text('codex')
-
-called = {'codex': 0}
-def fake_send(name, text, chat_id=None, session=None):
-    called['codex'] += 1
-    return True
-
-bridge.worker_manager.send = fake_send
-
-bridge._forward_pipe_message('alice', 'hello')
-assert called['codex'] == 1, f'expected codex send, got {called}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Pipe forwarding routes to codex"
-    else
-        fail "Pipe forwarding to codex test failed"
-    fi
-}
-
-test_adapter_pid_tracking() {
-    info "Testing adapter PID stored and kill_adapter terminates it..."
-
-    if python3 -c "
-import subprocess, time
-import bridge
-
-# Spawn a long-running process to simulate an adapter
-proc = subprocess.Popen(['sleep', '60'])
-bridge._adapter_pids['testworker'] = (proc, None)
-
-# Verify PID is stored and alive
-assert proc.poll() is None, 'process should be alive'
-assert 'testworker' in bridge._adapter_pids
-
-# Kill it
-bridge.kill_adapter('testworker')
-
-# Verify killed and removed from dict
-assert proc.poll() is not None, 'process should be dead after kill_adapter'
-assert 'testworker' not in bridge._adapter_pids, 'entry should be removed'
-
-# kill_adapter on unknown worker is a no-op
-bridge.kill_adapter('nonexistent')
-
-# kill_adapter on already-dead process is a no-op
-proc2 = subprocess.Popen(['true'])
-proc2.wait()
-bridge._adapter_pids['dead'] = (proc2, None)
-bridge.kill_adapter('dead')
-assert 'dead' not in bridge._adapter_pids
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Adapter PID tracking and kill_adapter work"
-    else
-        fail "Adapter PID tracking test failed"
-    fi
-}
-
 test_end_clears_pending() {
     info "Testing /end clears pending file..."
 
@@ -6774,7 +6614,6 @@ import bridge
 tmp = Path(tempfile.mkdtemp())
 bridge.SESSIONS_DIR = tmp
 bridge.FILE_INBOX_ROOT = tmp / 'inbox'
-bridge.WORKER_PIPE_ROOT = tmp / 'pipes'
 bridge.worker_manager.sessions_dir = tmp
 bridge.worker_manager.tmux_prefix = 'claude-test-'
 bridge.worker_manager.get_registered_sessions = lambda registered=None: {
@@ -6877,7 +6716,6 @@ import bridge
 tmp = Path(tempfile.mkdtemp())
 bridge.SESSIONS_DIR = tmp
 bridge.FILE_INBOX_ROOT = tmp / 'inbox'
-bridge.WORKER_PIPE_ROOT = tmp / 'pipes'
 bridge.worker_manager.sessions_dir = tmp
 bridge.worker_manager.tmux_prefix = 'claude-test-'
 bridge.worker_manager.get_registered_sessions = lambda registered=None: {
@@ -6930,49 +6768,6 @@ print('OK')
         success "get_registered_sessions does not auto-pick"
     else
         fail "get_registered_sessions auto-pick test failed"
-    fi
-}
-
-test_adapter_stderr_logging() {
-    info "Testing adapter stderr is logged to per-worker adapter.log..."
-
-    if python3 -c "
-import subprocess, tempfile, time, os
-from pathlib import Path
-import bridge
-
-tmp = Path(tempfile.mkdtemp())
-worker_dir = tmp / 'testworker'
-worker_dir.mkdir()
-
-# Create a tiny script that writes to stderr
-script = tmp / 'fake_adapter.py'
-script.write_text('import sys; print(\"adapter error output\", file=sys.stderr); sys.exit(0)')
-
-ok = bridge._spawn_adapter(script, 'testworker', 'hello', 'http://localhost:9999', tmp)
-assert ok, '_spawn_adapter should return True'
-
-# Wait for process to finish
-entry = bridge._adapter_pids.get('testworker')
-assert entry is not None, 'should be in _adapter_pids'
-proc, stderr_fh = entry
-proc.wait(timeout=5)
-
-# Flush and close
-if stderr_fh:
-    stderr_fh.flush()
-    stderr_fh.close()
-
-log_file = worker_dir / 'adapter.log'
-assert log_file.exists(), f'adapter.log should exist at {log_file}'
-content = log_file.read_text()
-assert 'adapter error output' in content, f'stderr should be in log, got: {content!r}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Adapter stderr logged to per-worker adapter.log"
-    else
-        fail "Adapter stderr logging test failed"
     fi
 }
 
@@ -7194,57 +6989,6 @@ print('OK')
     fi
 }
 
-test_compute_state_non_interactive() {
-    info "Testing compute_state for non-interactive backends..."
-
-    if python3 -c "
-import time
-import bridge
-
-now = time.time()
-
-state, reason = bridge.compute_state(
-    tmux_exists=True,
-    claude_pid=None,
-    pending=True,
-    pending_ts=None,
-    pending_age=5,
-    children=0,
-    last_child_ts=0.0,
-    cpu=0.0,
-    last_hook_ts=None,
-    last_seen_claude=None,
-    now=now,
-    is_interactive=False,
-    adapter_alive=True,
-)
-assert state == 'BUSY_TOOL', f'expected BUSY_TOOL, got {state} ({reason})'
-
-state, reason = bridge.compute_state(
-    tmux_exists=True,
-    claude_pid=None,
-    pending=False,
-    pending_ts=None,
-    pending_age=0.0,
-    children=0,
-    last_child_ts=0.0,
-    cpu=0.0,
-    last_hook_ts=None,
-    last_seen_claude=None,
-    now=now,
-    is_interactive=False,
-    adapter_alive=False,
-)
-assert state == 'READY', f'expected READY, got {state} ({reason})'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "compute_state handles non-interactive backends"
-    else
-        fail "compute_state non-interactive test failed"
-    fi
-}
-
 test_since_preserved_on_reason_change() {
     info "Testing watchdog since preserved when reason changes..."
 
@@ -7282,7 +7026,7 @@ now = time.time()
 state, reason = bridge.compute_state(
     tmux_exists=False, claude_pid=None, pending=False, pending_ts=None,
     pending_age=0, children=0, last_child_ts=0.0, cpu=0.0,
-    last_hook_ts=None, last_seen_claude=None, now=now, is_interactive=True,
+    last_hook_ts=None, last_seen_claude=None, now=now,
 )
 assert state == 'OFFLINE', f'OFFLINE case: expected OFFLINE, got {state} ({reason})'
 
@@ -7290,7 +7034,7 @@ assert state == 'OFFLINE', f'OFFLINE case: expected OFFLINE, got {state} ({reaso
 state, reason = bridge.compute_state(
     tmux_exists=True, claude_pid=None, pending=False, pending_ts=None,
     pending_age=0, children=0, last_child_ts=0.0, cpu=0.0,
-    last_hook_ts=None, last_seen_claude=now - 60, now=now, is_interactive=True,
+    last_hook_ts=None, last_seen_claude=now - 60, now=now,
 )
 assert state == 'DEAD', f'DEAD case: expected DEAD, got {state} ({reason})'
 
@@ -7298,7 +7042,7 @@ assert state == 'DEAD', f'DEAD case: expected DEAD, got {state} ({reason})'
 state, reason = bridge.compute_state(
     tmux_exists=True, claude_pid='12345', pending=False, pending_ts=None,
     pending_age=0, children=0, last_child_ts=0.0, cpu=1.0,
-    last_hook_ts=None, last_seen_claude=now, now=now, is_interactive=True,
+    last_hook_ts=None, last_seen_claude=now, now=now,
 )
 assert state == 'READY', f'READY case: expected READY, got {state} ({reason})'
 
@@ -7306,7 +7050,7 @@ assert state == 'READY', f'READY case: expected READY, got {state} ({reason})'
 state, reason = bridge.compute_state(
     tmux_exists=True, claude_pid='12345', pending=True, pending_ts=now - 5,
     pending_age=5, children=3, last_child_ts=now, cpu=50.0,
-    last_hook_ts=None, last_seen_claude=now, now=now, is_interactive=True,
+    last_hook_ts=None, last_seen_claude=now, now=now,
 )
 assert state == 'BUSY_TOOL', f'BUSY_TOOL case: expected BUSY_TOOL, got {state} ({reason})'
 
@@ -7314,7 +7058,7 @@ assert state == 'BUSY_TOOL', f'BUSY_TOOL case: expected BUSY_TOOL, got {state} (
 state, reason = bridge.compute_state(
     tmux_exists=True, claude_pid='12345', pending=True, pending_ts=now - 5,
     pending_age=5, children=0, last_child_ts=0.0, cpu=20.0,
-    last_hook_ts=None, last_seen_claude=now, now=now, is_interactive=True,
+    last_hook_ts=None, last_seen_claude=now, now=now,
 )
 assert state == 'BUSY_THINKING', f'BUSY_THINKING case: expected BUSY_THINKING, got {state} ({reason})'
 
@@ -7322,7 +7066,7 @@ assert state == 'BUSY_THINKING', f'BUSY_THINKING case: expected BUSY_THINKING, g
 state, reason = bridge.compute_state(
     tmux_exists=True, claude_pid='12345', pending=True, pending_ts=now - 100,
     pending_age=100, children=0, last_child_ts=0.0, cpu=2.0,
-    last_hook_ts=None, last_seen_claude=now, now=now, is_interactive=True,
+    last_hook_ts=None, last_seen_claude=now, now=now,
 )
 assert state == 'WAITING', f'WAITING case: expected WAITING, got {state} ({reason})'
 
@@ -7330,7 +7074,7 @@ assert state == 'WAITING', f'WAITING case: expected WAITING, got {state} ({reaso
 state, reason = bridge.compute_state(
     tmux_exists=True, claude_pid='12345', pending=True, pending_ts=now - 1200,
     pending_age=1200, children=0, last_child_ts=0.0, cpu=2.0,
-    last_hook_ts=None, last_seen_claude=now, now=now, is_interactive=True,
+    last_hook_ts=None, last_seen_claude=now, now=now,
 )
 assert state == 'STUCK', f'STUCK case: expected STUCK, got {state} ({reason})'
 
@@ -7355,7 +7099,7 @@ now = time.time()
 state, reason = bridge.compute_state(
     tmux_exists=True, claude_pid='12345', pending=False, pending_ts=None,
     pending_age=0, children=0, last_child_ts=0.0, cpu=1.0,
-    last_hook_ts=None, last_seen_claude=now, now=now, is_interactive=True,
+    last_hook_ts=None, last_seen_claude=now, now=now,
 )
 assert state == 'READY', f'Idle with baseline subtracted: expected READY, got {state} ({reason})'
 
@@ -7363,7 +7107,7 @@ assert state == 'READY', f'Idle with baseline subtracted: expected READY, got {s
 state, reason = bridge.compute_state(
     tmux_exists=True, claude_pid='12345', pending=False, pending_ts=None,
     pending_age=0, children=1, last_child_ts=now, cpu=1.0,
-    last_hook_ts=None, last_seen_claude=now, now=now, is_interactive=True,
+    last_hook_ts=None, last_seen_claude=now, now=now,
 )
 assert state == 'UNTRACKED_BUSY', f'Extra child above baseline: expected UNTRACKED_BUSY, got {state} ({reason})'
 
@@ -10851,297 +10595,6 @@ print('sent:', result)
     wait_for_session_gone "sendworkertest" 2>/dev/null || true
 }
 
-# Direct mode worker discovery test
-test_workers_endpoint_shows_direct_workers() {
-    info "Testing /workers endpoint shows direct mode workers..."
-
-    # This test requires direct mode bridge running
-    if [[ -z "$DIRECT_MODE_BRIDGE_PID" ]] || ! kill -0 "$DIRECT_MODE_BRIDGE_PID" 2>/dev/null; then
-        info "Skipping (direct mode bridge not running)"
-        return 0
-    fi
-
-    # Create a direct worker
-    send_direct_mode_message "/hire directdiscover1" >/dev/null
-    wait_for_direct_worker "directdiscover1"
-    sleep 0.3
-
-    if python3 -c "
-import urllib.request
-import json
-
-url = 'http://localhost:$DIRECT_MODE_PORT/workers'
-with urllib.request.urlopen(url) as response:
-    data = json.loads(response.read())
-
-# Find our test worker
-found = None
-for worker in data['workers']:
-    if worker['name'] == 'directdiscover1':
-        found = worker
-        break
-
-assert found, f'directdiscover1 should be in workers list'
-assert found['protocol'] == 'pipe', f'direct worker should have pipe protocol, got {found[\"protocol\"]}'
-assert 'in.pipe' in found['address'], 'address should be pipe path'
-assert 'echo' in found['send_example'], 'send_example should show echo command'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/workers shows direct workers with pipe protocol"
-    else
-        fail "/workers direct worker structure incorrect"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end directdiscover1" >/dev/null 2>&1 || true
-}
-
-test_worker_pipe_creation_on_startup() {
-    info "Testing worker pipe created on worker startup..."
-
-    if python3 -c "
-from bridge import get_worker_pipe_path, ensure_worker_pipe
-from pathlib import Path
-import os
-
-# Test ensure_worker_pipe function creates pipe
-test_name = 'pipetest'
-pipe_path = get_worker_pipe_path(test_name)
-
-# Ensure parent directory exists
-pipe_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-
-# Create the pipe
-ensure_worker_pipe(test_name)
-
-# Verify pipe exists and is a FIFO
-assert pipe_path.exists(), f'Pipe should exist at {pipe_path}'
-assert os.path.exists(str(pipe_path)), 'Pipe should exist'
-
-# Check if it's a FIFO (named pipe)
-import stat
-mode = os.stat(str(pipe_path)).st_mode
-assert stat.S_ISFIFO(mode), 'Should be a FIFO (named pipe)'
-
-# Cleanup
-if pipe_path.exists():
-    pipe_path.unlink()
-if pipe_path.parent.exists():
-    pipe_path.parent.rmdir()
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Worker pipe created correctly"
-    else
-        fail "Worker pipe creation failed"
-    fi
-}
-
-test_worker_pipe_cleanup_on_end() {
-    info "Testing worker pipe cleaned up on worker end..."
-
-    if python3 -c "
-from bridge import get_worker_pipe_path, ensure_worker_pipe, cleanup_worker_pipe
-from pathlib import Path
-import os
-
-test_name = 'pipecleanuptest'
-pipe_path = get_worker_pipe_path(test_name)
-
-# Create the pipe
-pipe_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-ensure_worker_pipe(test_name)
-
-# Verify pipe exists
-assert pipe_path.exists(), 'Pipe should exist before cleanup'
-
-# Clean up
-cleanup_worker_pipe(test_name)
-
-# Verify pipe is removed
-assert not pipe_path.exists(), 'Pipe should be removed after cleanup'
-
-# Also cleanup parent dir if exists
-if pipe_path.parent.exists():
-    try:
-        pipe_path.parent.rmdir()
-    except:
-        pass
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Worker pipe cleaned up correctly"
-    else
-        fail "Worker pipe cleanup failed"
-    fi
-}
-
-test_pipe_reader_liveness_check() {
-    info "Testing pipe reader restarts when thread dies..."
-
-    if python3 -c "
-import threading, time
-from bridge import (
-    start_pipe_reader, stop_pipe_reader, _pipe_reader_threads,
-    get_worker_pipe_path, ensure_worker_pipe, cleanup_worker_pipe
-)
-
-test_name = 'liveness_test'
-pipe_path = get_worker_pipe_path(test_name)
-
-# Setup: create pipe
-pipe_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-ensure_worker_pipe(test_name)
-
-# Verify reader thread is alive
-assert test_name in _pipe_reader_threads, 'Thread should be registered'
-thread1, stop1 = _pipe_reader_threads[test_name]
-assert thread1.is_alive(), 'Thread should be alive initially'
-thread1_id = thread1.ident
-
-# Simulate crash: stop the thread but leave a dead entry in the registry
-stop1.set()
-# Unblock reader by writing to pipe
-import os
-try:
-    fd = os.open(str(pipe_path), os.O_WRONLY | os.O_NONBLOCK)
-    os.write(fd, b'\n')
-    os.close(fd)
-except OSError:
-    pass
-thread1.join(timeout=2.0)
-
-# Manually re-insert the dead thread to simulate a crash leaving stale entry
-_pipe_reader_threads[test_name] = (thread1, stop1)
-assert not thread1.is_alive(), 'Thread should be dead after stop'
-assert test_name in _pipe_reader_threads, 'Stale entry should exist'
-
-# Now call start_pipe_reader — it should detect dead thread and restart
-start_pipe_reader(test_name)
-
-assert test_name in _pipe_reader_threads, 'New thread should be registered'
-thread2, stop2 = _pipe_reader_threads[test_name]
-assert thread2.is_alive(), 'New thread should be alive'
-assert thread2.ident is not thread1_id, 'Should be a different thread'
-
-# Cleanup
-cleanup_worker_pipe(test_name)
-if pipe_path.parent.exists():
-    try:
-        pipe_path.parent.rmdir()
-    except:
-        pass
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Pipe reader detects dead thread and restarts"
-    else
-        fail "Pipe reader liveness check failed"
-    fi
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Worker-to-Worker Pipe Communication Tests (TDD)
-# ─────────────────────────────────────────────────────────────────────────────
-
-test_worker_to_worker_pipe() {
-    info "Testing worker-to-worker pipe communication (e2e behavior)..."
-
-    # This is the missing test from FEATURES.md:
-    # End-to-end behavior test:
-    # 1. Start bridge (tmux mode - already running from test_bridge_starts)
-    # 2. Create Worker A (alice)
-    # 3. Create Worker B (bob)
-    # 4. Worker A writes message to Worker B's pipe
-    # 5. Verify Worker B received the message (check tmux pane)
-
-    # Clean up any existing test workers
-    send_message "/end alice" >/dev/null 2>&1 || true
-    send_message "/end bob" >/dev/null 2>&1 || true
-    wait_for_session_gone "alice" 2>/dev/null || true
-    wait_for_session_gone "bob" 2>/dev/null || true
-
-    # Step 2: Create Worker A (alice)
-    local result
-    result=$(send_message "/hire alice")
-    if [[ "$result" != "OK" ]]; then
-        fail "Worker-to-worker pipe: Failed to create worker alice: $result"
-        return
-    fi
-    if ! wait_for_session "alice"; then
-        fail "Worker-to-worker pipe: Worker alice session not created"
-        return
-    fi
-
-    # Step 3: Create Worker B (bob) with non-interactive backend (pipes only for non-interactive)
-    result=$(send_message "/hire bob --backend codex")
-    if [[ "$result" != "OK" ]]; then
-        fail "Worker-to-worker pipe: Failed to create worker bob: $result"
-        send_message "/end alice" >/dev/null 2>&1 || true
-        return
-    fi
-    if ! wait_for_session "bob"; then
-        fail "Worker-to-worker pipe: Worker bob session not created"
-        send_message "/end alice" >/dev/null 2>&1 || true
-        return
-    fi
-
-    # Verify bob's pipe was created
-    local bob_pipe="/tmp/claudecode-telegram/${TEST_NODE}/bob/in.pipe"
-    if [[ ! -p "$bob_pipe" ]]; then
-        fail "Worker-to-worker pipe: Bob's pipe not created at $bob_pipe"
-        send_message "/end alice" >/dev/null 2>&1 || true
-        send_message "/end bob" >/dev/null 2>&1 || true
-        return
-    fi
-
-    success "Worker-to-worker pipe: Both workers created with pipes"
-
-    # Step 4: Write message from Alice to Bob's pipe
-    # This simulates Alice sending a message to Bob via the named pipe
-    local unique_msg="hello_from_alice_${RANDOM}"
-
-    # Write to pipe in background (named pipes block if no reader)
-    # The pipe reader thread should be reading from bob's pipe and forwarding to tmux
-    echo "$unique_msg" > "$bob_pipe" &
-    local write_pid=$!
-
-    # Wait a bit for the message to be processed
-    sleep 2
-
-    # Check if the write completed (it will hang if no one reads the pipe)
-    if ! kill -0 "$write_pid" 2>/dev/null; then
-        # Write completed (reader consumed the message)
-        success "Worker-to-worker pipe: Message written to bob's pipe (reader consumed it)"
-    else
-        # Write is still blocking - no reader on the pipe
-        kill "$write_pid" 2>/dev/null || true
-        fail "Worker-to-worker pipe: Write blocked - no pipe reader thread running"
-        send_message "/end alice" >/dev/null 2>&1 || true
-        send_message "/end bob" >/dev/null 2>&1 || true
-        return
-    fi
-
-    # Step 5: Verify bridge logged the pipe message forwarding
-    # Non-interactive backends (codex) forward via adapter, not tmux send-keys,
-    # so we check the bridge log for the pipe reader's forwarding log line
-    sleep 1
-    if grep -q "Pipe message for 'bob': $unique_msg" "$BRIDGE_LOG" 2>/dev/null; then
-        success "Worker-to-worker pipe: Message forwarded by pipe reader (logged in bridge)"
-    else
-        fail "Worker-to-worker pipe: Pipe message NOT logged in bridge output"
-        info "  Bridge log (last 5 lines):"
-        tail -5 "$BRIDGE_LOG" 2>/dev/null | sed 's/^/    /'
-    fi
-
-    # Cleanup
-    send_message "/end alice" >/dev/null 2>&1 || true
-    send_message "/end bob" >/dev/null 2>&1 || true
-    wait_for_session_gone "alice" 2>/dev/null || true
-    wait_for_session_gone "bob" 2>/dev/null || true
-}
-
 # ─────────────────────────────────────────────────────────────────────────────
 # send_to_worker Abstraction Tests (TDD)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -11448,41 +10901,6 @@ print('OK')
         success "backend registry exists with expected backends"
     else
         fail "backend registry test failed"
-    fi
-}
-
-test_get_registered_sessions_includes_noninteractive_workers() {
-    info "Testing get_registered_sessions includes non-interactive workers..."
-
-    if python3 -c "
-import tempfile
-from pathlib import Path
-import bridge
-
-# Create temp sessions dir
-tmp = Path(tempfile.mkdtemp())
-bridge.SESSIONS_DIR = tmp
-bridge.worker_manager.scan_tmux_sessions = lambda: {}  # No tmux sessions
-
-# Create a non-interactive worker (like codex)
-session_dir = tmp / 'myworker'
-session_dir.mkdir()
-(session_dir / 'backend').write_text('codex')
-
-# get_registered_sessions should include non-interactive worker
-result = bridge.get_registered_sessions()
-assert 'myworker' in result, f'Should contain myworker, got {result}'
-assert result['myworker']['backend'] == 'codex', f'Backend should be codex'
-
-# Cleanup
-import shutil
-shutil.rmtree(tmp)
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "get_registered_sessions includes non-interactive workers"
-    else
-        fail "get_registered_sessions non-interactive test failed"
     fi
 }
 
@@ -12376,89 +11794,6 @@ test_direct_mode_e2e_progress() {
     send_direct_mode_message "/end progressworker" >/dev/null 2>&1 || true
 }
 
-test_worker_to_worker_pipe_direct() {
-    info "Testing worker-to-worker pipe communication in direct mode..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up any existing test workers
-    send_direct_mode_message "/end alice" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end bob" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    # Create Worker A (alice)
-    local result
-    result=$(send_direct_mode_message "/hire alice")
-    if [[ "$result" != "OK" ]]; then
-        fail "Pipe direct: Failed to create worker alice: $result"
-        return
-    fi
-    wait_for_direct_worker "alice" || {
-        fail "Pipe direct: Worker alice not started"
-        return
-    }
-
-    # Create Worker B (bob) with non-interactive backend (pipes only for non-interactive)
-    result=$(send_direct_mode_message "/hire bob --backend codex")
-    if [[ "$result" != "OK" ]]; then
-        fail "Pipe direct: Failed to create worker bob: $result"
-        send_direct_mode_message "/end alice" >/dev/null 2>&1 || true
-        return
-    fi
-    wait_for_direct_worker "bob" || {
-        fail "Pipe direct: Worker bob not started"
-        send_direct_mode_message "/end alice" >/dev/null 2>&1 || true
-        return
-    }
-
-    # Resolve bob's pipe path
-    local bob_pipe
-    bob_pipe=$(python3 -c "from bridge import get_worker_pipe_path; print(get_worker_pipe_path('bob'))" 2>/dev/null)
-    if [[ -z "$bob_pipe" || ! -p "$bob_pipe" ]]; then
-        fail "Pipe direct: Bob's pipe not created"
-        send_direct_mode_message "/end alice" >/dev/null 2>&1 || true
-        send_direct_mode_message "/end bob" >/dev/null 2>&1 || true
-        return
-    fi
-    success "Pipe direct: Named pipe created for worker"
-
-    # Clear log markers
-    local log_lines_before
-    log_lines_before=$(wc -l < "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "0")
-
-    # Write message to pipe
-    local unique_msg="pipe_test_${RANDOM}"
-    echo "$unique_msg" > "$bob_pipe" &
-    local write_pid=$!
-
-    # Wait for pipe reader to log the message
-    local attempts=0
-    local new_log_lines=""
-    while [[ $attempts -lt 20 ]]; do
-        new_log_lines=$(tail -n +"$((log_lines_before + 1))" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || true)
-        if echo "$new_log_lines" | grep -q "Pipe message for 'bob'"; then
-            break
-        fi
-        sleep 0.2
-        ((attempts++))
-    done
-
-    if echo "$new_log_lines" | grep -q "Pipe message for 'bob'"; then
-        success "Pipe direct: Pipe reader logged message for bob"
-    else
-        fail "Pipe direct: Pipe reader did not log message"
-    fi
-
-    kill "$write_pid" 2>/dev/null || true
-
-    # Cleanup
-    send_direct_mode_message "/end alice" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end bob" >/dev/null 2>&1 || true
-}
-
 test_direct_mode_image_handling() {
     info "Testing direct mode image handling..."
 
@@ -13143,11 +12478,10 @@ run_unit_tests() {
     run_test test_forward_to_bridge_escape_flag
     # test_forward_self_heal_on_403 removed (HOOK_SECRET removed)
     # test_forward_no_self_heal_on_other_errors removed (HOOK_SECRET removed)
-    # Unit tests - Backend registry / non-interactive mode
+    # Unit tests - Backend registry
     log ""
     log "── Backend Registry Tests (Unit) ───────────────────────────────────────"
     run_test test_backend_registry_exists
-    run_test test_get_registered_sessions_includes_noninteractive_workers
     # Unit tests - Worker naming
     log ""
     log "── Worker Naming Tests (Unit) ──────────────────────────────────────────"
@@ -13157,19 +12491,16 @@ run_unit_tests() {
     run_test test_progress_output_includes_backend
     run_test test_backend_env_metadata
     run_test test_watchdog_suppressed_after_restart
-    run_test test_adapter_pid_tracking
     run_test test_end_clears_pending
     run_test test_hook_response_clears_pending_on_send_failure
     run_test test_restart_clears_pending
     run_test test_end_clears_session_id_for_interactive
     run_test test_get_registered_sessions_no_autopick
-    run_test test_adapter_stderr_logging
     run_test test_poisoned_hook_signal_file
     run_test test_poisoned_hook_signal_stale_ignored
     run_test test_poisoned_hook_signal_below_threshold
     run_test test_on_tool_failure_hook_script
     run_test test_clear_hook_failures_on_restart
-    run_test test_compute_state_non_interactive
     run_test test_since_preserved_on_reason_change
     run_test test_compute_state_interactive
     run_test test_idle_child_baseline
@@ -13180,13 +12511,11 @@ run_unit_tests() {
     run_test test_send_response_html_formatting
     run_test test_format_response_strips_name_prefix
     run_test test_get_any_session_id
-    run_test test_progress_continuity_for_noninteractive
     run_test test_extract_worker_activity
     run_test test_activity_detects_interactive_prompt
     run_test test_activity_detects_plan_approval
     run_test test_watchdog_waiting_input_state
     run_test test_progress_shows_activity
-    run_test test_pipe_forwarding_to_codex
     # Unit tests - Bridge public URL
     log ""
     log "── Bridge Public URL Tests (Unit) ──────────────────────────────────────"
@@ -13218,7 +12547,6 @@ run_unit_tests() {
     run_test test_persistence_file_functions
     run_test test_pending_no_side_effect
     run_test test_stale_pending_survives_for_watchdog
-    run_test test_backend_file_is_canonical
     run_test test_pending_files
     # Unit tests - Worker Registry (persistent)
     log ""
@@ -13281,9 +12609,6 @@ run_unit_tests() {
     # Unit tests - Worker discovery
     log ""
     log "── Worker Discovery Tests (Unit) ───────────────────────────────────────"
-    run_test test_worker_pipe_creation_on_startup
-    run_test test_worker_pipe_cleanup_on_end
-    run_test test_pipe_reader_liveness_check
     # Unit tests - send_to_worker abstraction
     log ""
     log "── send_to_worker Abstraction Tests (Unit) ─────────────────────────────"
@@ -13497,7 +12822,6 @@ run_integration_tests() {
     # Worker-to-worker pipe communication tests (e2e behavior)
     log ""
     log "── Worker-to-Worker Pipe Tests (Integration) ───────────────────────────"
-    run_test test_worker_to_worker_pipe
     # Tmux and process inspection tests (integration)
     log ""
     log "── Tmux/Process Inspection Tests (Integration) ─────────────────────────"

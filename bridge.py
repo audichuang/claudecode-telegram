@@ -24,7 +24,7 @@ from urllib.parse import urlparse, parse_qs
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Dict, Optional, Protocol
+from typing import Optional
 
 try:
     from gmail_connector import GmailConnector
@@ -159,10 +159,6 @@ _node_name = TMUX_PREFIX.strip("-").removeprefix("claude-") or "default"
 # Temporary file inbox (session-isolated, auto-cleaned)
 FILE_INBOX_ROOT = Path(f"/tmp/claudecode-telegram/{_node_name}")
 
-# Worker pipe root for inter-worker communication
-# Each worker gets a named pipe at WORKER_PIPE_ROOT/<name>/in.pipe
-WORKER_PIPE_ROOT = Path(f"/tmp/claudecode-telegram/{_node_name}")
-
 DEFAULT_BACKEND = "claude"
 DEFAULT_WORKER_BACKEND = DEFAULT_BACKEND
 PENDING_TIMEOUT = 600
@@ -199,7 +195,7 @@ ALERT_COOLDOWN = 180
 
 
 # ============================================================
-# CORE: Backend Protocol + implementations
+# CORE: Backend implementation
 # ============================================================
 
 def build_claude_start_cmd(resume_id: str = "") -> str:
@@ -208,26 +204,6 @@ def build_claude_start_cmd(resume_id: str = "") -> str:
         cmd.extend(["--resume", resume_id])
     cmd.append("--dangerously-skip-permissions")
     return " ".join(shlex.quote(part) for part in cmd)
-
-
-class Backend(Protocol):
-    """Minimal backend interface. 3 methods, no more."""
-    name: str
-    binary: str  # CLI binary name (e.g. "claude", "codex")
-    is_interactive: bool
-
-    def start_cmd(self, resume_id: str = "") -> str:
-        """Return the shell command to start this CLI in tmux."""
-        ...
-
-    def send(self, worker_name: str, tmux_name: str, text: str,
-             bridge_url: str, sessions_dir: Path) -> bool:
-        """Send a message to the worker. Returns True if sent."""
-        ...
-
-    def is_online(self, tmux_name: str) -> bool:
-        """Check if worker is alive and ready to receive messages."""
-        ...
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,7 +458,6 @@ class ClaudeBackend:
     """Claude Code CLI - interactive mode with hook for responses."""
     name = "claude"
     binary = "claude"
-    is_interactive = True
 
     def start_cmd(self, resume_id: str = "") -> str:
         return build_claude_start_cmd(resume_id)
@@ -504,55 +479,7 @@ BACKENDS = {
     "claude": ClaudeBackend(),
 }
 
-# Track inflight adapter processes per worker (non-interactive backends only)
-# Each entry: (Popen, stderr_file_handle_or_None)
-_adapter_pids: dict[str, tuple[subprocess.Popen, object]] = {}
-
-
-def _spawn_adapter(adapter_path: Path, worker_name: str, text: str,
-                   bridge_url: str, sessions_dir: Path) -> bool:
-    """Spawn an adapter process with stderr logged to per-worker file."""
-    if not adapter_path.exists():
-        print(f"Adapter not found: {adapter_path}")
-        return False
-
-    # Open per-worker log file for adapter stderr (append mode)
-    log_file = sessions_dir / worker_name / "adapter.log"
-    try:
-        stderr_fh = open(log_file, "a")
-    except OSError:
-        stderr_fh = None  # Fall back to DEVNULL if dir doesn't exist yet
-
-    proc = subprocess.Popen(
-        ["python3", str(adapter_path), worker_name, text, bridge_url, str(sessions_dir)],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_fh if stderr_fh else subprocess.DEVNULL
-    )
-    _adapter_pids[worker_name] = (proc, stderr_fh)
-    return True
-
-
-def kill_adapter(name: str):
-    """Kill inflight adapter process for a worker."""
-    entry = _adapter_pids.pop(name, None)
-    if entry is None:
-        return
-    proc, stderr_fh = entry
-    if proc and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=1)
-    if stderr_fh:
-        try:
-            stderr_fh.close()
-        except OSError:
-            pass
-
-
-def get_backend(name: str) -> Backend:
+def get_backend(name: str) -> ClaudeBackend:
     return BACKENDS.get(name, BACKENDS[DEFAULT_BACKEND])
 
 
@@ -1475,207 +1402,6 @@ def cleanup_inbox(session_name):
                 f.unlink()
             except Exception as e:
                 print(f"Failed to delete {f}: {e}")
-
-
-# ============================================================
-# INTER-WORKER PIPES
-# ============================================================
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Worker Pipe Functions (inter-worker communication)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_worker_pipe_path(name):
-    """Get the named pipe path for a worker.
-
-    Path: /tmp/claudecode-telegram/<node>/<worker>/in.pipe
-    """
-    return WORKER_PIPE_ROOT / name / "in.pipe"
-
-
-def ensure_worker_pipe(name):
-    """Create the named pipe for a worker if it doesn't exist.
-
-    Creates: /tmp/claudecode-telegram/<node>/<worker>/in.pipe
-    Also starts a reader thread to forward messages to the worker.
-    """
-    pipe_path = get_worker_pipe_path(name)
-    pipe_dir = pipe_path.parent
-
-    # Create directory with secure permissions
-    pipe_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    pipe_dir.chmod(0o700)
-
-    # Create FIFO (named pipe) if it doesn't exist
-    if not pipe_path.exists():
-        os.mkfifo(str(pipe_path), mode=0o600)
-        print(f"Created worker pipe: {pipe_path}")
-
-    # Start the pipe reader thread to forward messages to worker
-    start_pipe_reader(name)
-
-    return pipe_path
-
-
-def cleanup_worker_pipe(name):
-    """Remove the named pipe for a worker."""
-    # Stop the pipe reader thread first
-    stop_pipe_reader(name)
-
-    pipe_path = get_worker_pipe_path(name)
-
-    if pipe_path.exists():
-        try:
-            pipe_path.unlink()
-            print(f"Removed worker pipe: {pipe_path}")
-        except Exception as e:
-            print(f"Failed to remove worker pipe {pipe_path}: {e}")
-
-    # Also try to remove parent directory if empty
-    pipe_dir = pipe_path.parent
-    if pipe_dir.exists():
-        try:
-            pipe_dir.rmdir()
-        except OSError:
-            pass  # Directory not empty, that's OK
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipe Reader Threads (for inter-worker communication)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Dict to track pipe reader threads: name -> (thread, stop_event)
-_pipe_reader_threads: Dict[str, tuple] = {}
-
-
-def pipe_reader_loop(name: str, stop_event: threading.Event):
-    """Background thread that reads messages from a worker's input pipe.
-
-    When another worker writes to this worker's pipe:
-      echo "message" > /tmp/claudecode-telegram/<node>/bob/in.pipe
-
-    This thread reads the message and forwards it to the worker's backend.
-
-    The reader uses blocking open() - this means the thread will block until
-    a writer opens the pipe. This is correct behavior for FIFOs. When the
-    writer closes, we get EOF, close our end, and re-open to wait for the
-    next writer.
-    """
-    pipe_path = get_worker_pipe_path(name)
-    print(f"Pipe reader started for worker '{name}' at {pipe_path}")
-
-    while not stop_event.is_set():
-        try:
-            # Check if we should stop before blocking on open
-            if stop_event.is_set():
-                break
-
-            # Open pipe for reading (blocks until a writer connects)
-            # Use regular open() which blocks - this is the correct way to read FIFOs
-            with open(str(pipe_path), 'r') as pipe:
-                # Read until EOF (writer closes their end)
-                while not stop_event.is_set():
-                    line = pipe.readline()
-                    if not line:
-                        # EOF - writer closed, break to re-open
-                        break
-
-                    message = line.strip()
-                    if message:
-                        print(f"Pipe message for '{name}': {message[:100]}{'...' if len(message) > 100 else ''}")
-                        # Forward to worker using backend routing
-                        try:
-                            _forward_pipe_message(name, message)
-                        except Exception as e:
-                            print(f"Error forwarding pipe message to '{name}': {e}")
-
-        except FileNotFoundError:
-            # Pipe was removed, stop the reader
-            print(f"Pipe for '{name}' no longer exists, stopping reader")
-            break
-        except OSError as e:
-            if stop_event.is_set():
-                break
-            print(f"Pipe reader error for '{name}': {e}")
-            # Wait a bit before retrying
-            stop_event.wait(0.5)
-
-    # Clean up registry so start_pipe_reader can restart if needed
-    if name in _pipe_reader_threads:
-        _pipe_reader_threads.pop(name, None)
-    print(f"Pipe reader stopped for worker '{name}'")
-
-
-def _forward_pipe_message(name: str, message: str):
-    """Forward a message from the pipe to the worker's session.
-
-    Uses backend routing for tmux or non-interactive workers.
-    """
-    if not worker_manager.send(name, message):
-        print(f"Warning: Cannot forward pipe message to '{name}' - worker not found")
-
-
-def start_pipe_reader(name: str):
-    """Start a background thread to read from the worker's input pipe."""
-    if name in _pipe_reader_threads:
-        thread, _stop = _pipe_reader_threads[name]
-        if thread.is_alive():
-            # Already running
-            return
-        # Thread crashed or exited — clean up stale entry and restart
-        print(f"Pipe reader thread for '{name}' is dead, restarting")
-        _pipe_reader_threads.pop(name, None)
-
-    pipe_path = get_worker_pipe_path(name)
-    if not pipe_path.exists():
-        print(f"Cannot start pipe reader: pipe does not exist for '{name}'")
-        return
-
-    stop_event = threading.Event()
-    thread = threading.Thread(
-        target=pipe_reader_loop,
-        args=(name, stop_event),
-        daemon=True,
-        name=f"pipe-reader-{name}"
-    )
-    _pipe_reader_threads[name] = (thread, stop_event)
-    thread.start()
-    print(f"Started pipe reader thread for '{name}'")
-
-
-def stop_pipe_reader(name: str):
-    """Stop the pipe reader thread for a worker."""
-    if name not in _pipe_reader_threads:
-        return
-
-    thread, stop_event = _pipe_reader_threads.pop(name)
-    stop_event.set()
-
-    # Write a dummy byte to unblock the reader if it's waiting
-    pipe_path = get_worker_pipe_path(name)
-    if pipe_path.exists():
-        try:
-            # Open in non-blocking write mode to unblock reader
-            fd = os.open(str(pipe_path), os.O_WRONLY | os.O_NONBLOCK)
-            os.write(fd, b"\n")
-            os.close(fd)
-        except OSError:
-            pass  # Pipe may already be closed
-
-    # Wait for thread to finish (with timeout)
-    thread.join(timeout=1.0)
-    if thread.is_alive():
-        print(f"Warning: pipe reader thread for '{name}' did not stop gracefully")
-
-
-def get_workers(caller_from: str = None):
-    """Get all active workers with their communication details.
-
-    If ``caller_from`` is set to a worker name, ``send_example`` for each peer
-    is rendered from that caller's machine perspective.
-    """
-    _sync_worker_manager()
-    return worker_manager.get_workers(caller_from=caller_from)
 
 
 # download_telegram_file removed — use download_telegram_file() instead
@@ -3031,26 +2757,10 @@ def compute_state(
     last_hook_ts: Optional[float],
     last_seen_claude: Optional[float],
     now: float,
-    is_interactive: bool = True,
-    adapter_alive: bool = False,
     poisoned_reason: Optional[str] = None,
 ) -> tuple[str, str]:
     if not tmux_exists:
         return "OFFLINE", "tmux missing"
-
-    if not is_interactive:
-        if adapter_alive:
-            return "BUSY_TOOL", "adapter running"
-        if pending:
-            if pending_age < STALE_PENDING:
-                return "WAITING", f"age={int(pending_age)}s"
-            hook_since_pending = last_hook_ts is not None and pending_ts is not None and last_hook_ts > pending_ts
-            if pending_age >= STALE_PENDING and not hook_since_pending:
-                if poisoned_reason is not None:
-                    return "POISONED", f"{poisoned_reason}"
-                return "STUCK", f"age={int(pending_age)}s"
-            return "WAITING", f"age={int(pending_age)}s"
-        return "READY", "idle"
 
     if not claude_pid and last_seen_claude is not None:
         if (now - last_seen_claude) > START_GRACE:
@@ -3117,21 +2827,6 @@ def _capture_pane_text(tmux_name: str, lines: int = 50) -> str:
     return result.stdout
 
 
-def _check_adapter_log(name: str, tail_lines: int = 20) -> str:
-    """Read the last N lines of adapter.log for a worker, or empty string."""
-    if tail_lines <= 0:
-        return ""
-    log_path = get_session_dir(name) / "adapter.log"
-    if not log_path.exists():
-        return ""
-    try:
-        with log_path.open("r", errors="ignore") as fh:
-            lines = fh.readlines()
-        return "".join(lines[-tail_lines:])
-    except Exception:
-        return ""
-
-
 HOOK_FAILURE_THRESHOLD = 3   # failures in window → POISONED
 HOOK_FAILURE_WINDOW = 120    # seconds
 
@@ -3188,15 +2883,8 @@ def _detect_poisoned(name: str, tmux_name: str) -> Optional[str]:
     if hook_reason:
         return hook_reason
 
-    # Fallback: regex-based pane/log scanning
-    backend_name = get_worker_backend(name)
-    backend = get_backend(backend_name)
-    text_parts = []
-    if backend.is_interactive:
-        text_parts.append(_capture_pane_text(tmux_name))
-    else:
-        text_parts.append(_check_adapter_log(name))
-    combined = "\n".join([part for part in text_parts if part])
+    # Fallback: regex-based pane scanning
+    combined = _capture_pane_text(tmux_name)
     if not combined:
         return None
     for pattern in POISON_PATTERNS:
@@ -3392,12 +3080,7 @@ def watchdog_loop():
 
             claude_pids = {}
             tmux_present = {}
-            backend_info = {}
-
             for name, session in registered.items():
-                backend_name = get_worker_backend(name, session)
-                backend = get_backend(backend_name)
-                backend_info[name] = backend
                 tmux_name = session.get("tmux", f"{TMUX_PREFIX}{name}")
                 pane_pid = pane_pids.get(tmux_name)
                 tmux_exists = bool(pane_pid)
@@ -3406,16 +3089,15 @@ def watchdog_loop():
                 if not tmux_exists:
                     continue
 
-                if backend.is_interactive:
-                    claude_pid = _get_claude_pid(pane_pid)
-                    if claude_pid:
-                        claude_pids[name] = claude_pid
-                        with _watchdog_lock:
+                claude_pid = _get_claude_pid(pane_pid)
+                if claude_pid:
+                    claude_pids[name] = claude_pid
+                    with _watchdog_lock:
+                        _last_seen_claude[name] = now
+                else:
+                    with _watchdog_lock:
+                        if name not in _last_seen_claude:
                             _last_seen_claude[name] = now
-                    else:
-                        with _watchdog_lock:
-                            if name not in _last_seen_claude:
-                                _last_seen_claude[name] = now
 
             stats = _ps_stats(claude_pids.values())
 
@@ -3432,20 +3114,7 @@ def watchdog_loop():
                 if probe_failed and not tmux_exists and _consecutive_probe_failures.get(name, 0) < 3:
                     continue
 
-                backend = backend_info.get(name)
-                if backend is None:
-                    backend_name = get_worker_backend(name, session)
-                    backend = get_backend(backend_name)
-                is_interactive = backend.is_interactive
-
-                adapter_alive = False
-                if not is_interactive:
-                    entry = _adapter_pids.get(name)
-                    if entry:
-                        proc, _stderr = entry
-                        adapter_alive = proc.poll() is None
-
-                claude_pid = claude_pids.get(name) if is_interactive else None
+                claude_pid = claude_pids.get(name)
                 cpu = 0.0
                 if claude_pid and claude_pid in stats:
                     cpu = stats[claude_pid].get("cpu", 0.0)
@@ -3456,7 +3125,7 @@ def watchdog_loop():
                 # Track idle child count so only EXTRA children count as work.
                 pending_ts = _pending_timestamp(name)
                 pending = pending_ts is not None
-                if is_interactive and claude_pid:
+                if claude_pid:
                     with _watchdog_lock:
                         baseline = _idle_child_baseline.get(name)
                         if baseline is None:
@@ -3498,8 +3167,6 @@ def watchdog_loop():
                     last_child_ts = _last_child_ts.get(name, 0.0)
                     last_hook_ts = _last_hook_ts.get(name)
                     last_seen_claude = _last_seen_claude.get(name)
-                if not is_interactive:
-                    last_seen_claude = None
 
                 state_args = dict(
                     tmux_exists=tmux_exists,
@@ -3513,8 +3180,6 @@ def watchdog_loop():
                     last_hook_ts=last_hook_ts,
                     last_seen_claude=last_seen_claude,
                     now=now,
-                    is_interactive=is_interactive,
-                    adapter_alive=adapter_alive,
                 )
                 state, reason = compute_state(**state_args)
 
@@ -3539,7 +3204,7 @@ def watchdog_loop():
 
                 # Detect interactive prompt (WAITING_INPUT): worker is READY
                 # but TUI is at a selection/question prompt needing manager action
-                if state == "READY" and is_interactive:
+                if state == "READY":
                     pane_text = _capture_pane_text(tmux_name, lines=30)
                     if pane_text:
                         pane_lines = pane_text.splitlines()
@@ -4051,10 +3716,6 @@ def _read_tmux_activity(tmux_name: str) -> tuple:
 
 def _wait_for_restart_ready(tmux_name: str, backend_name: str, timeout: float = 45.0) -> bool:
     """Wait until restarted worker is actually back at the prompt."""
-    backend = get_backend(backend_name)
-    if not backend.is_interactive:
-        return True
-
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not tmux_exists(tmux_name):
@@ -4267,7 +3928,7 @@ def format_progress_lines(
     if needs_attention:
         status.append(f"Blocker: {needs_attention}")
 
-    # Session info (non-interactive backends only)
+    # Session info
     if continuity_line:
         status.append(continuity_line)
     elif resume_line:
@@ -4279,16 +3940,8 @@ def format_progress_lines(
 def get_worker_backend(name: str, session: Optional[dict] = None) -> str:
     """Get backend for a worker.
 
-    Priority: backend file (canonical) > session dict (cache) > default.
-    The backend file in SESSIONS_DIR/<name>/backend is the single source of
-    truth, written at hire time. Session dict may drift if registry or RAM
-    state gets stale.
+    Backend comes from the live session/registry cache; Claude is the default.
     """
-    # Backend file is canonical — check it first
-    backend_file = SESSIONS_DIR / name / "backend"
-    if backend_file.exists():
-        return normalize_backend(backend_file.read_text().strip())
-    # Fall back to session dict (cache from registry/tmux)
     if session and session.get("backend"):
         return normalize_backend(session.get("backend"))
     return DEFAULT_BACKEND
@@ -4372,19 +4025,8 @@ class WorkerManager:
         if registered is None:
             registered = self.scan_tmux_sessions()
 
-        # Fallback: pick up non-interactive workers with backend file but orphaned tmux
-        if self.sessions_dir.exists():
-            for session_dir in self.sessions_dir.iterdir():
-                if session_dir.is_dir():
-                    backend_file = session_dir / "backend"
-                    if backend_file.exists():
-                        name = session_dir.name
-                        if name not in registered:
-                            backend = backend_file.read_text().strip()
-                            registered[name] = {"backend": backend}
-
         # Merge persistent registry: workers in registry but not in tmux
-        # appear with no "tmux" key (same pattern as non-interactive fallback above).
+        # appear with no "tmux" key.
         # On first run, bootstrap registry from current tmux sessions.
         _registry_bootstrap(registered)
         registry = _load_registry()
@@ -4431,61 +4073,33 @@ class WorkerManager:
         workers = []
         registered = self.get_registered_sessions()
         for name, info in registered.items():
-            backend_name = get_worker_backend(name, info)
-            backend = get_backend(backend_name)
-
-            # Registry-only workers (tmux gone): non-interactive can still serve via pipe
             if "tmux" not in info:
-                if not backend.is_interactive:
-                    pipe_path = ensure_worker_pipe(name)
-                    pipe_cmd = f"echo 'YOUR_NAME: your message here' > {pipe_path} &"
-                    workers.append({
-                        "name": name,
-                        "machine": "",
-                        "protocol": "pipe",
-                        "address": str(pipe_path),
-                        "send_example": pipe_cmd,
-                        "note": "Non-interactive. IMPORTANT: Always prefix your name (e.g., 'kenji: hello'). Always use & (background) when writing to pipe — it BLOCKS until read. Never use cat/echo without & or your session will freeze."
-                    })
-                else:
-                    workers.append({
-                        "name": name,
-                        "machine": "",
-                        "protocol": "none",
-                        "address": "",
-                        "status": "exited",
-                        "note": "Worker exited. Reopen its 話題 (or /cd <path> inside it) to restart.",
-                    })
+                workers.append({
+                    "name": name,
+                    "machine": "",
+                    "protocol": "none",
+                    "address": "",
+                    "status": "exited",
+                    "note": "Worker exited. Reopen its 話題 (or /cd <path> inside it) to restart.",
+                })
                 continue
 
-            if not backend.is_interactive:
-                pipe_path = ensure_worker_pipe(name)
-                pipe_cmd = f"echo 'YOUR_NAME: your message here' > {pipe_path} &"
-                workers.append({
-                    "name": name,
-                    "machine": "",
-                    "protocol": "pipe",
-                    "address": str(pipe_path),
-                    "send_example": pipe_cmd,
-                    "note": "Non-interactive. IMPORTANT: Always prefix your name (e.g., 'kenji: hello'). Always use & (background) when writing to pipe — it BLOCKS until read. Never use cat/echo without & or your session will freeze."
-                })
-            else:
-                tmux_name = info.get("tmux")
-                tmux_cmd = (
-                    f"echo 'YOUR_NAME: your message here' | "
-                    f"tmux load-buffer - && "
-                    f"tmux paste-buffer -p -r -t {tmux_name} && "
-                    f"sleep 1 && tmux send-keys -t {tmux_name} Enter"
-                )
-                note = "Uses paste-buffer -p (bracketed paste) for reliable delivery. Sleep 1s before Enter — TUI needs time to render. Always prefix your name."
-                workers.append({
-                    "name": name,
-                    "machine": "",
-                    "protocol": "tmux",
-                    "address": tmux_name,
-                    "send_example": tmux_cmd,
-                    "note": note,
-                })
+            tmux_name = info.get("tmux")
+            tmux_cmd = (
+                f"echo 'YOUR_NAME: your message here' | "
+                f"tmux load-buffer - && "
+                f"tmux paste-buffer -p -r -t {tmux_name} && "
+                f"sleep 1 && tmux send-keys -t {tmux_name} Enter"
+            )
+            note = "Uses paste-buffer -p (bracketed paste) for reliable delivery. Sleep 1s before Enter — TUI needs time to render. Always prefix your name."
+            workers.append({
+                "name": name,
+                "machine": "",
+                "protocol": "tmux",
+                "address": tmux_name,
+                "send_example": tmux_cmd,
+                "note": note,
+            })
         return workers
 
     def _build_welcome(self, name: str, backend_obj) -> str:
@@ -4516,13 +4130,7 @@ class WorkerManager:
                 "BRIDGE API: Available endpoints: GET /workers, GET /checkin. Messages from manager arrive as prompts — there is NO polling endpoint. "
                 "WARNING: Do NOT output worker messages normally — they go to Telegram. Use the send commands from /workers instead."
             )
-        if not backend_obj.is_interactive:
-            welcome += (
-                " NON-INTERACTIVE MODE: Your bridge URL is in $BRIDGE_URL env var. "
-                "Each message triggers a blocking CLI call, responses arrive async in Telegram. "
-                "Use nohup/& if calling CLI directly."
-            )
-        if SANDBOX_ENABLED and backend_obj.is_interactive:
+        if SANDBOX_ENABLED:
             welcome += " Running in sandbox mode (Docker container)."
 
         # Append manager note if set (with {name} and {machine} substitution)
@@ -4585,14 +4193,8 @@ class WorkerManager:
         time.sleep(0.3)
 
         ensure_session_dir(name)
-        if not backend_obj.is_interactive:
-            ensure_worker_pipe(name)
 
-        if not backend_obj.is_interactive:
-            backend_file = self.sessions_dir / name / "backend"
-            backend_file.write_text(backend)
-
-        if SANDBOX_ENABLED and backend_obj.is_interactive:
+        if SANDBOX_ENABLED:
             if startup_cwd:
                 self._cd_tmux_to_cwd(tmux_name, startup_cwd)
             docker_cmd = get_docker_run_cmd(name)
@@ -4603,31 +4205,19 @@ class WorkerManager:
             if startup_cwd:
                 start_cmd = f'cd {shlex.quote(startup_cwd)} && {start_cmd}'
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"])
-            if backend_obj.is_interactive:
-                # Answer the backend's "Do you trust the files in this folder?"
-                # dialog — but ONLY if it actually appears. claude launches with
-                # --dangerously-skip-permissions (and already-trusted folders skip
-                # it too), so there is usually NO prompt; sending "2" unconditionally
-                # leaked it to the model as a stray prompt (-> "你傳了2"). Check the
-                # pane once (same 1.5s timing as before) and answer only a real dialog.
-                time.sleep(1.5)
-                pane = _capture_pane_text(tmux_name, lines=20).lower()
-                if any(m in pane for m in ("do you trust", "trust the files", "trust this folder")):
-                    subprocess.run(["tmux", "send-keys", "-t", tmux_name, "2"])
-                    time.sleep(0.3)
-                    subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+            # Answer Claude's "Do you trust the files in this folder?" dialog,
+            # but only if it actually appears.
+            time.sleep(1.5)
+            pane = _capture_pane_text(tmux_name, lines=20).lower()
+            if any(m in pane for m in ("do you trust", "trust the files", "trust this folder")):
+                subprocess.run(["tmux", "send-keys", "-t", tmux_name, "2"])
+                time.sleep(0.3)
+                subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
 
-        if backend_obj.is_interactive:
-            time.sleep(2.0 if not SANDBOX_ENABLED else 5.0)
+        time.sleep(2.0 if not SANDBOX_ENABLED else 5.0)
 
         welcome = self._build_welcome(name, backend_obj)
-        if not backend_obj.is_interactive:
-            if chat_id:
-                set_pending(name, chat_id)
-            # Echo welcome to tmux (visible for debugging) but don't call backend
-            # to avoid triggering a codex API call on hire
-            subprocess.run(["tmux", "send-keys", "-t", tmux_name, f"echo '{welcome[:200]}...'", "Enter"])
-        elif not TOPIC_MODE:
+        if not TOPIC_MODE:
             # In TOPIC_MODE the welcome is delivered folded into the topic's first
             # message by open_topic_session (one turn -> one reply), so skip the
             # standalone greeting here to avoid a duplicate "你好" reply.
@@ -4636,9 +4226,6 @@ class WorkerManager:
         # No focus/active concept: a 話題 IS the addressing — which session you
         # talk to is decided by which topic you type in, never by bridge state.
         _registry_add(name, backend, chat_id)
-
-        if not backend_obj.is_interactive:
-            print(f"Created {backend} worker '{name}' (non-interactive mode)")
 
         return True, None
 
@@ -4650,8 +4237,6 @@ class WorkerManager:
             return False, f"Worker '{name}' not found"
 
         session = registered[name]
-        backend_name = get_worker_backend(name, session)
-        backend = get_backend(backend_name)
         tmux_name = session.get("tmux", f"{self.tmux_prefix}{name}")
 
         # Clear conversation state for ALL backends so re-hiring a name starts fresh.
@@ -4665,17 +4250,7 @@ class WorkerManager:
         except Exception as e:
             return False, f"Failed to clean session state: {e}"
 
-        # Clean non-interactive-only metadata (adapter + backend file).
-        if not backend.is_interactive:
-            kill_adapter(name)
-            backend_file = session_dir / "backend"
-            try:
-                if backend_file.exists():
-                    backend_file.unlink()
-            except Exception as e:
-                return False, f"Failed to clean non-interactive metadata: {e}"
-
-        if SANDBOX_ENABLED and backend.is_interactive:
+        if SANDBOX_ENABLED:
             stop_docker_container(name)
 
         clear_pending(name)
@@ -4683,7 +4258,6 @@ class WorkerManager:
         # Kill tmux session if it exists (may already be gone for registry-only workers)
         subprocess.run(["tmux", "kill-session", "-t", tmux_name], capture_output=True)
         cleanup_inbox(name)
-        cleanup_worker_pipe(name)
         _registry_remove(name)
 
         return True, None
@@ -4734,11 +4308,7 @@ class WorkerManager:
         if mode != "resume":
             _clear_hook_failures(name)
 
-        # Clean non-interactive state on restart
-        if not backend.is_interactive:
-            session_dir.mkdir(parents=True, exist_ok=True)
-            ensure_worker_pipe(name)
-        elif is_claude_running(tmux_name):
+        if is_claude_running(tmux_name):
             # Kill running claude first, then restart (resume keeps session ID, relaunch clears it)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, "C-c", ""])
             time.sleep(0.5)
@@ -4767,7 +4337,7 @@ class WorkerManager:
                         'eval "$(tmux show-environment -s)" && unset CLAUDECODE', "Enter"])
         time.sleep(0.3)
 
-        if SANDBOX_ENABLED and backend.is_interactive:
+        if SANDBOX_ENABLED:
             stop_docker_container(name)
             time.sleep(0.5)
             if startup_cwd:
@@ -4783,11 +4353,8 @@ class WorkerManager:
 
         # Re-send welcome/instructions so worker gets fresh context after restart
         welcome = self._build_welcome(name, backend)
-        if backend.is_interactive:
-            time.sleep(2.0 if not SANDBOX_ENABLED else 5.0)
-            self.send(name, welcome)
-        else:
-            subprocess.run(["tmux", "send-keys", "-t", tmux_name, f"echo '{welcome[:200]}...'", "Enter"])
+        time.sleep(2.0 if not SANDBOX_ENABLED else 5.0)
+        self.send(name, welcome)
 
         return True, None
 
@@ -4818,8 +4385,6 @@ class WorkerManager:
         time.sleep(0.3)
 
         ensure_session_dir(name)
-        if not backend.is_interactive:
-            ensure_worker_pipe(name)
 
         resume_id = ""
         resume_cwd = ""
@@ -4835,7 +4400,7 @@ class WorkerManager:
         if startup_cwd:
             save_claude_session_cwd(name, startup_cwd)
 
-        if SANDBOX_ENABLED and backend.is_interactive:
+        if SANDBOX_ENABLED:
             if startup_cwd:
                 self._cd_tmux_to_cwd(tmux_name, startup_cwd)
             docker_cmd = get_docker_run_cmd(name, resume_id=resume_id)
@@ -4846,18 +4411,14 @@ class WorkerManager:
             if startup_cwd:
                 start_cmd = f'cd {shlex.quote(startup_cwd)} && {start_cmd}'
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"])
-            if backend.is_interactive:
-                time.sleep(1.5)
-                subprocess.run(["tmux", "send-keys", "-t", tmux_name, "2"])
-                time.sleep(0.3)
-                subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+            time.sleep(1.5)
+            subprocess.run(["tmux", "send-keys", "-t", tmux_name, "2"])
+            time.sleep(0.3)
+            subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
 
         welcome = self._build_welcome(name, backend)
-        if backend.is_interactive:
-            time.sleep(2.0 if not SANDBOX_ENABLED else 5.0)
-            self.send(name, welcome)
-        else:
-            subprocess.run(["tmux", "send-keys", "-t", tmux_name, f"echo '{welcome[:200]}...'", "Enter"])
+        time.sleep(2.0 if not SANDBOX_ENABLED else 5.0)
+        self.send(name, welcome)
 
         print(f"Dead worker '{name}' recovered from registry (mode={mode})")
         return True, None
@@ -6347,18 +5908,10 @@ class CommandRouter:
                        "或 /close 後重開話題。")
             return
 
-        backend_name = get_worker_backend(session_name, session)
-        backend = get_backend(backend_name)
-
-        # Non-interactive backpressure: reject if already processing
-        if not backend.is_interactive and is_pending(session_name):
-            self.reply(chat_id, f"{session_name.capitalize()} is still working on the previous request. Wait for a response or use /pause.")
-            return
-
         # Interactive prompt shortcut: if worker is at a selection prompt and
         # manager sends a single digit or "skip", translate to keystrokes
         shortcut = text.strip().lower()
-        if backend.is_interactive and shortcut in (
+        if shortcut in (
             "1", "2", "3", "4", "5", "6", "7", "8", "9", "skip", "cancel"
         ):
             tmux_name = session.get("tmux", f"{self.workers.tmux_prefix}{session_name}")
@@ -6396,7 +5949,7 @@ class CommandRouter:
             return
 
         if msg_id and send_ok:
-            if not backend.is_interactive or tmux_prompt_empty(session.get("tmux", "")):
+            if tmux_prompt_empty(session.get("tmux", "")):
                 self.transport.set_reaction(chat_id, msg_id, [{"type": "emoji", "emoji": "👀"}])
                 if TOPIC_MODE:
                     _topic_reaction_set[session_name] = TOPIC_REACTION_RECEIVED
@@ -8202,7 +7755,7 @@ class Handler(BaseHTTPRequestHandler):
             caller_from = None
             if parsed is not None:
                 caller_from = parse_qs(parsed.query).get("from", [None])[0]
-            workers = get_workers(caller_from=caller_from)
+            workers = worker_manager.get_workers(caller_from=caller_from)
             response = {"workers": workers}
 
             self.send_response(200)
@@ -9016,9 +8569,6 @@ def main():
                 print(f"  SKIP {name}: tmux '{tmux_name}' doesn't match prefix '{TMUX_PREFIX}'")
                 continue
             backend_name = get_worker_backend(name, info)
-            backend_obj = get_backend(backend_name)
-            if not backend_obj.is_interactive:
-                ensure_worker_pipe(name)
             # Re-export hook env so workers get the current BRIDGE_URL
             if tmux_exists(tmux_name):
                 export_hook_env(tmux_name, backend_name)
