@@ -444,6 +444,30 @@ print('OK')
     fi
 }
 
+test_pane_start_cmd_shell_agnostic() {
+    info "Testing pane start command works in any pane shell (fish has no unset)..."
+    if python3 -c "
+import bridge, shlex
+cmd = bridge.make_pane_start_cmd('claude --dangerously-skip-permissions', '/tmp/some dir')
+assert cmd.startswith('sh -c '), cmd
+assert '&& unset' not in cmd, cmd
+parts = shlex.split(cmd)
+assert parts[0:2] == ['sh', '-c'] and len(parts) == 3, parts
+script = parts[2]
+assert 'unset CLAUDECODE' in script, script
+assert 'exec claude --dangerously-skip-permissions' in script, script
+assert \"cd '/tmp/some dir'\" in script, script
+assert 'tmux show-environment -s' in script, script
+cmd2 = bridge.make_pane_start_cmd('claude', None)
+assert 'cd ' not in shlex.split(cmd2)[2], cmd2
+print('OK')
+" 2>/dev/null | grep -q OK; then
+        success "pane start command is shell-agnostic (sh -c wrapped)"
+    else
+        fail "pane start command is not shell-agnostic"
+    fi
+}
+
 test_topic_session_identity() {
     info "Testing topic-session identity helpers..."
     if python3 -c "
@@ -10619,6 +10643,7 @@ run_unit_tests() {
     log "── Unit Tests ──────────────────────────────────────────────────────────"
     run_test test_formatting
     run_test test_send_text_includes_thread_id
+    run_test test_pane_start_cmd_shell_agnostic
     run_test test_topic_session_identity
     run_test test_folder_navigator_keyboard
     run_test test_handle_callback_navigates

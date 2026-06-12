@@ -3991,10 +3991,6 @@ class SessionManager:
         export_hook_env(tmux_name, backend)
         time.sleep(0.3)
 
-        # Inject tmux env vars then unset CLAUDECODE (prevents nested-session error)
-        subprocess.run(["tmux", "send-keys", "-t", tmux_name,
-                        'eval "$(tmux show-environment -s)" && unset CLAUDECODE', "Enter"])
-        time.sleep(0.3)
 
         ensure_session_dir(name)
 
@@ -4005,9 +4001,7 @@ class SessionManager:
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, docker_cmd, "Enter"])
             print(f"Started worker '{name}' in sandbox mode")
         else:
-            start_cmd = f'unset CLAUDECODE && {backend_obj.start_cmd()}'
-            if startup_cwd:
-                start_cmd = f'cd {shlex.quote(startup_cwd)} && {start_cmd}'
+            start_cmd = make_pane_start_cmd(backend_obj.start_cmd(), startup_cwd)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"])
             # Answer Claude's "Do you trust the files in this folder?" dialog,
             # but only if it actually appears.
@@ -4131,10 +4125,6 @@ class SessionManager:
         export_hook_env(tmux_name, backend_name)
         time.sleep(0.3)
 
-        # Inject tmux env vars then unset CLAUDECODE (prevents nested-session error)
-        subprocess.run(["tmux", "send-keys", "-t", tmux_name,
-                        'eval "$(tmux show-environment -s)" && unset CLAUDECODE', "Enter"])
-        time.sleep(0.3)
 
         if SANDBOX_ENABLED:
             stop_docker_container(name)
@@ -4144,10 +4134,7 @@ class SessionManager:
             docker_cmd = get_docker_run_cmd(name, resume_id=resume_id)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, docker_cmd, "Enter"])
         else:
-            start_cmd = backend.start_cmd(resume_id)
-            start_cmd = f'unset CLAUDECODE && {start_cmd}'
-            if startup_cwd:
-                start_cmd = f'cd {shlex.quote(startup_cwd)} && {start_cmd}'
+            start_cmd = make_pane_start_cmd(backend.start_cmd(resume_id), startup_cwd)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"])
 
         # Re-send welcome/instructions so worker gets fresh context after restart
@@ -4179,10 +4166,6 @@ class SessionManager:
         export_hook_env(tmux_name, backend_name)
         time.sleep(0.3)
 
-        subprocess.run(["tmux", "send-keys", "-t", tmux_name,
-                        'eval "$(tmux show-environment -s)" && unset CLAUDECODE', "Enter"])
-        time.sleep(0.3)
-
         ensure_session_dir(name)
 
         resume_id = ""
@@ -4205,10 +4188,7 @@ class SessionManager:
             docker_cmd = get_docker_run_cmd(name, resume_id=resume_id)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, docker_cmd, "Enter"])
         else:
-            start_cmd = backend.start_cmd(resume_id)
-            start_cmd = f'unset CLAUDECODE && {start_cmd}'
-            if startup_cwd:
-                start_cmd = f'cd {shlex.quote(startup_cwd)} && {start_cmd}'
+            start_cmd = make_pane_start_cmd(backend.start_cmd(resume_id), startup_cwd)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"])
             time.sleep(1.5)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, "2"])
@@ -4314,6 +4294,21 @@ def tmux_prompt_empty(tmux_name, timeout=0.5):
                 return True
         time.sleep(0.1)
     return False
+
+
+def make_pane_start_cmd(start_cmd: str, cwd: str | None = None) -> str:
+    """One send-keys line that launches the backend from ANY pane shell.
+
+    The user's interactive shell may be fish, which has no `unset` and cannot
+    eval the sh-syntax output of `tmux show-environment -s` (the 2026-06-12
+    t2-offline lesson). Wrap every sh-ism inside `sh -c` and exec the backend
+    from there, so it still inherits the injected tmux env.
+    """
+    script = 'eval "$(tmux show-environment -s)"; unset CLAUDECODE; '
+    if cwd:
+        script += f'cd {shlex.quote(cwd)} && '
+    script += f'exec {start_cmd}'
+    return f'sh -c {shlex.quote(script)}'
 
 
 def export_hook_env(tmux_name, backend: str = DEFAULT_WORKER_BACKEND):
