@@ -804,8 +804,7 @@ bridge._topic_request_msg.clear(); bridge._topic_reaction_set.clear()
 bridge.is_pending = lambda name: False          # typing thread exits at once
 bridge.worker_set_pending = lambda name, chat_id: None
 bridge.get_worker_backend = lambda name, session: 'claude'
-bridge.tmux_prompt_empty = lambda tmux, host=None: True
-bridge.get_worker_host = lambda name: None
+bridge.tmux_prompt_empty = lambda tmux, timeout=0.5: True
 cr = bridge.command_router
 cr.workers.get_registered_sessions = lambda registered=None: {'t7': {'tmux': 'claude-test-t7'}}
 cr.workers.is_online = lambda name, session=None: True
@@ -967,7 +966,7 @@ def fake_run(cmd, *a, **k):
 subprocess.run = fake_run
 
 # Case A: no trust dialog on screen -> the stray '2' must NOT be sent.
-bridge._capture_pane_text = lambda t, lines=50, host=None: 'Claude Code v2\n> '
+bridge._capture_pane_text = lambda t, lines=50: 'Claude Code v2\n> '
 try:
     wm.hire('tA', chat_id=11)
 except Exception:
@@ -976,7 +975,7 @@ assert '2' not in sk, ('must not send a bare 2 when no trust dialog:', sk)
 
 # Case B: a real trust dialog -> '2' IS sent to answer it.
 sk.clear()
-bridge._capture_pane_text = lambda t, lines=50, host=None: 'Do you trust the files in this folder?\n1. Yes\n2. No'
+bridge._capture_pane_text = lambda t, lines=50: 'Do you trust the files in this folder?\n1. Yes\n2. No'
 try:
     wm.hire('tB', chat_id=11)
 except Exception:
@@ -1148,7 +1147,6 @@ import bridge
 img = tempfile.mktemp(suffix='.png')
 open(img, 'wb').write(b'fake')
 bridge.load_topic_meta = lambda name: (555, 88)
-bridge.get_worker_host = lambda name: None
 sent = []
 bridge.send_photo = (lambda chat_id, photo_path, caption=None, message_thread_id=None:
     sent.append(('photo', message_thread_id)) or True)
@@ -1170,7 +1168,6 @@ test_tmain_thread_zero_omitted() {
     if python3 -c "
 import bridge
 bridge.load_topic_meta = lambda name: (555, 0)
-bridge.get_worker_host = lambda name: None
 sent = []
 bridge.transport.send_text = (lambda chat_id, text, parse_mode=None, reply_to=None,
     message_thread_id=None: sent.append(message_thread_id) or {'ok': True, 'result': {'message_id': 1}})
@@ -1332,7 +1329,6 @@ import bridge
 ended = []
 bridge.worker_manager.end = lambda name: ended.append(name)
 bridge.load_topic_meta = lambda name: (555, 72)
-bridge.get_worker_host = lambda name: None
 bridge._topic_titles[(555, 72)] = 'x'
 calls = []
 bridge.transport.send_text = (lambda chat_id, text, parse_mode=None, reply_to=None,
@@ -1879,67 +1875,6 @@ print('OK')
     fi
 }
 
-test_set_pending_syncs_chat_id_to_remote() {
-    info "Testing set_pending syncs chat_id to remote host..."
-    # Verifies that _sync_chat_id_to_remote is called when worker has a remote host.
-    # We mock get_worker_host to return a host and verify _remote_copy is called.
-    if python3 -c "
-import sys, os, shutil, importlib
-sys.path.insert(0, '.')
-os.environ.setdefault('TELEGRAM_BOT_TOKEN', 'fake')
-os.environ['SESSIONS_DIR'] = '$SESSIONS_DIR'
-os.environ.setdefault('TMUX_PREFIX', 'claude-test-')
-import bridge
-
-# Track calls
-copy_calls = []
-original_remote_copy = bridge._remote_copy
-def mock_remote_copy(src, dst, host=None, direction='push'):
-    copy_calls.append({'src': src, 'dst': dst, 'host': host, 'direction': direction})
-bridge._remote_copy = mock_remote_copy
-
-# Mock _remote_run to no-op for mkdir
-original_remote_run = bridge._remote_run
-def mock_remote_run(cmd, host=None, **kwargs):
-    if cmd[0] == 'mkdir':
-        import subprocess
-        return subprocess.CompletedProcess(cmd, 0)
-    if cmd == ['bash', '-c', 'echo \$HOME']:
-        import subprocess
-        return subprocess.CompletedProcess(cmd, 0, stdout='/Users/testuser\n')
-    return original_remote_run(cmd, host=host, **kwargs)
-bridge._remote_run = mock_remote_run
-
-# Mock get_worker_host to return a remote host
-original_get_host = bridge.get_worker_host
-bridge.get_worker_host = lambda name: 'test-mac-mini' if name == 'remote_worker' else None
-
-# Test 1: remote worker should trigger sync
-bridge.set_pending('remote_worker', 99999)
-assert len(copy_calls) == 1, f'Expected 1 copy call, got {len(copy_calls)}'
-assert copy_calls[0]['host'] == 'test-mac-mini', f'Wrong host: {copy_calls[0]}'
-assert copy_calls[0]['direction'] == 'push'
-assert 'chat_id' in copy_calls[0]['dst']
-
-# Test 2: local worker should NOT trigger sync
-copy_calls.clear()
-bridge.set_pending('local_worker', 88888)
-assert len(copy_calls) == 0, f'Expected 0 copy calls for local worker, got {len(copy_calls)}'
-
-# Cleanup
-bridge._remote_copy = original_remote_copy
-bridge._remote_run = original_remote_run
-bridge.get_worker_host = original_get_host
-shutil.rmtree(bridge.get_session_dir('remote_worker'), ignore_errors=True)
-shutil.rmtree(bridge.get_session_dir('local_worker'), ignore_errors=True)
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "set_pending syncs chat_id to remote host for teleported workers"
-    else
-        fail "set_pending remote sync test failed"
-    fi
-}
 
 test_cli_flags_and_commands() {
     info "Testing CLI flags and commands..."
@@ -2575,8 +2510,7 @@ response_text = 'Here is my answer to your question.'
 
 with patch.object(bridge, 'send_voice', side_effect=mock_send_voice), \
      patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api), \
-     patch.object(bridge, 'synthesize_speech', return_value='/tmp/voice.ogg') as mock_tts, \
-     patch.object(bridge, 'get_worker_host', return_value=None):
+     patch.object(bridge, 'synthesize_speech', return_value='/tmp/voice.ogg') as mock_tts:
     bridge.send_response_to_telegram('testworker', response_text, 12345)
     time.sleep(0.3)  # TTS runs in background thread
 
@@ -2618,8 +2552,7 @@ response_text = 'Complex technical explanation with code.\n\n[[speak:Here is the
 
 with patch.object(bridge, 'synthesize_speech', side_effect=mock_tts), \
      patch.object(bridge, 'send_voice', return_value=True), \
-     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api), \
-     patch.object(bridge, 'get_worker_host', return_value=None):
+     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api):
     bridge.send_response_to_telegram('testworker', response_text, 12345)
     time.sleep(0.3)
 
@@ -2659,8 +2592,7 @@ tts_calls.clear()
 multi_para = 'First paragraph here.\n\nSecond paragraph here.\n\nThird paragraph.'
 with patch.object(bridge, 'synthesize_speech', side_effect=mock_tts), \
      patch.object(bridge, 'send_voice', return_value=True), \
-     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api), \
-     patch.object(bridge, 'get_worker_host', return_value=None):
+     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api):
     bridge.send_response_to_telegram('testworker', multi_para, 12345)
     time.sleep(0.5)
 
@@ -2674,8 +2606,7 @@ tts_calls.clear()
 long_text = 'A' * 1001
 with patch.object(bridge, 'synthesize_speech', side_effect=mock_tts), \
      patch.object(bridge, 'send_voice', return_value=True), \
-     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api), \
-     patch.object(bridge, 'get_worker_host', return_value=None):
+     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api):
     bridge.send_response_to_telegram('testworker', long_text, 12345)
     time.sleep(0.3)
 
@@ -2710,8 +2641,7 @@ def mock_telegram_api(method, data):
 response_text = 'Important information.'
 
 with patch.object(bridge, 'synthesize_speech', return_value=None), \
-     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api), \
-     patch.object(bridge, 'get_worker_host', return_value=None):
+     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api):
     bridge.send_response_to_telegram('testworker', response_text, 12345)
     time.sleep(0.3)
 
@@ -2752,8 +2682,7 @@ bridge.state['tts_enabled'] = False
 
 with patch.object(bridge, 'synthesize_speech', side_effect=mock_tts), \
      patch.object(bridge, 'send_voice', return_value=True), \
-     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api), \
-     patch.object(bridge, 'get_worker_host', return_value=None):
+     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api):
     bridge.send_response_to_telegram('testworker', 'Hello text only', 12345)
     time.sleep(0.3)
 
@@ -2764,8 +2693,7 @@ bridge.state['tts_enabled'] = True
 
 with patch.object(bridge, 'synthesize_speech', side_effect=mock_tts), \
      patch.object(bridge, 'send_voice', return_value=True), \
-     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api), \
-     patch.object(bridge, 'get_worker_host', return_value=None):
+     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api):
     bridge.send_response_to_telegram('testworker', 'Hello with voice', 12345)
     time.sleep(0.3)
 
@@ -2794,7 +2722,7 @@ entries = [
 ]
 
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd')
+    slug = '/tmp/testcwd'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'test-sid.jsonl'
@@ -2822,6 +2750,79 @@ with tempfile.TemporaryDirectory() as tmpdir:
         success "Transcript renderer produces valid HTML"
     else
         fail "Transcript renderer test failed"
+    fi
+}
+
+test_render_transcript_html_with_query_result() {
+    info "Testing transcript renderer handles transcript-index query results..."
+    if python3 - <<'EOF' 2>/dev/null | grep -q "OK"; then
+import json
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, ".")
+import bridge
+
+entries = [
+    {'type': 'user', 'message': {'role': 'user', 'content': 'Hello query path'}, 'timestamp': '2026-04-05T10:00:00Z', 'sessionId': 'query-sid', 'version': '2.1.85'},
+    {'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': 'Indexed response'}], 'model': 'claude-opus-4-6'}, 'timestamp': '2026-04-05T10:00:01Z'},
+]
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    home = Path(tmpdir)
+    cwd = '/tmp/query-result-cwd'
+    sid = 'query-sid'
+    project_dir = home / '.claude' / 'projects' / cwd.replace('/', '-')
+    project_dir.mkdir(parents=True)
+    transcript = project_dir / f'{sid}.jsonl'
+    with open(transcript, 'w') as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + '\n')
+
+    def fake_query(jsonl_path, got_sid, query, **kwargs):
+        assert str(jsonl_path) == str(transcript), jsonl_path
+        assert got_sid == sid, got_sid
+        assert query == 'entries+stats', query
+        return {
+            'entries': [{'raw_json': json.dumps(entry), 'idx': idx} for idx, entry in enumerate(entries)],
+            'total': len(entries),
+            'total_pages': 1,
+            'page': 1,
+            'stats': {
+                'n_user': 1,
+                'n_tool': 0,
+                'n_edit': 0,
+                'lines_add': 0,
+                'lines_del': 0,
+                'lines_mod': 0,
+                'n_files': 0,
+                'model': 'claude-opus-4-6',
+                'version': '2.1.85',
+                'git_branch': 'main',
+                'first_ts': '2026-04-05T10:00:00Z',
+                'last_ts': '2026-04-05T10:00:01Z',
+                'input_tokens': 0,
+                'output_tokens': 0,
+                'duration': '',
+            },
+        }
+
+    with patch.object(bridge, 'get_claude_session_cwd', return_value=cwd), \
+         patch.object(bridge, 'get_claude_session_id', return_value=sid), \
+         patch.object(bridge, '_run_transcript_query', side_effect=fake_query), \
+         patch('pathlib.Path.home', return_value=home):
+        html = bridge._render_transcript_html('testworker', page=1)
+
+    assert '<!DOCTYPE html>' in html, 'Missing DOCTYPE'
+    assert 'Hello query path' in html, 'Missing indexed user message'
+    assert 'File size' in html and ' B' in html, 'Missing local transcript file size'
+    print('OK')
+EOF
+        success "Transcript renderer handles transcript-index query results"
+    else
+        fail "Transcript query-result renderer test failed"
     fi
 }
 
@@ -2863,7 +2864,7 @@ entries = [
 ]
 
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd2')
+    slug = '/tmp/testcwd2'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'tool-sid.jsonl'
@@ -2910,7 +2911,7 @@ for i in range(120):
     entries.append({'type': 'user', 'message': {'role': 'user', 'content': f'Message {i}'}, 'timestamp': '2026-04-05T10:00:00Z', 'sessionId': 'page-sid', 'version': '2.1.85'})
 
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd')
+    slug = '/tmp/testcwd'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'page-sid.jsonl'
@@ -2947,12 +2948,12 @@ import bridge
 
 entries = [
     {'type': 'user', 'message': {'role': 'user', 'content': 'general conversation about weather'}, 'timestamp': '2026-04-05T10:00:00Z', 'sessionId': 'bm25-sid', 'version': '2.1.85'},
-    {'type': 'user', 'message': {'role': 'user', 'content': 'teleport teleport teleport worker to mac'}, 'timestamp': '2026-04-05T10:00:01Z', 'sessionId': 'bm25-sid'},
-    {'type': 'user', 'message': {'role': 'user', 'content': 'one mention of teleport here'}, 'timestamp': '2026-04-05T10:00:02Z', 'sessionId': 'bm25-sid'},
+    {'type': 'user', 'message': {'role': 'user', 'content': 'deploy deploy deploy worker to mac'}, 'timestamp': '2026-04-05T10:00:01Z', 'sessionId': 'bm25-sid'},
+    {'type': 'user', 'message': {'role': 'user', 'content': 'one mention of deploy here'}, 'timestamp': '2026-04-05T10:00:02Z', 'sessionId': 'bm25-sid'},
 ]
 
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd')
+    slug = '/tmp/testcwd'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'bm25-sid.jsonl'
@@ -2963,13 +2964,13 @@ with tempfile.TemporaryDirectory() as tmpdir:
     with patch.object(bridge, 'get_claude_session_cwd', return_value='/tmp/testcwd'), \
          patch.object(bridge, 'get_claude_session_id', return_value='bm25-sid'), \
          patch('pathlib.Path.home', return_value=Path(tmpdir)):
-        html = bridge._render_transcript_html('testworker', page=1, search_query='teleport')
+        html = bridge._render_transcript_html('testworker', page=1, search_query='deploy')
 
     assert 'sorted by relevance' in html, 'Missing relevance info'
     assert 'Found 2 matching' in html, f'Expected 2 results'
-    # The entry with 3x teleport should rank higher (appear first)
-    pos_3x = html.find('teleport teleport teleport')
-    pos_1x = html.find('one mention of teleport')
+    # The entry with 3x deploy should rank higher (appear first)
+    pos_3x = html.find('deploy deploy deploy')
+    pos_1x = html.find('one mention of deploy')
     assert pos_3x < pos_1x, f'Higher TF entry should rank first: {pos_3x} vs {pos_1x}'
     print('OK')
 " 2>/dev/null | grep -q "OK"; then
@@ -2996,7 +2997,7 @@ entries = [
 ]
 
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd')
+    slug = '/tmp/testcwd'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'ctx-sid.jsonl'
@@ -3041,7 +3042,7 @@ entries = [
 ]
 
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd')
+    slug = '/tmp/testcwd'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'sort-sid.jsonl'
@@ -3093,7 +3094,7 @@ entries = [
 ]
 
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd')
+    slug = '/tmp/testcwd'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'utf8-sid.jsonl'
@@ -3140,7 +3141,7 @@ entries = [
 ]
 
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd')
+    slug = '/tmp/testcwd'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'diff-sid.jsonl'
@@ -3185,7 +3186,7 @@ entries = [
 ]
 
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd')
+    slug = '/tmp/testcwd'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'grp-sid.jsonl'
@@ -3237,7 +3238,7 @@ entries = [
 ]
 
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd')
+    slug = '/tmp/testcwd'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'sys-sid.jsonl'
@@ -3345,7 +3346,7 @@ handler.send_response.assert_called_with(403)
 handler.reset_mock()
 bridge.REWIND_TOKENS['goodtoken'] = {'name': 'alice', 'expires_at': time.time() + 300}
 with tempfile.TemporaryDirectory() as tmpdir:
-    slug = bridge._project_slug('/tmp/testcwd')
+    slug = '/tmp/testcwd'.replace('/', '-')
     project_dir = Path(tmpdir) / '.claude' / 'projects' / slug
     project_dir.mkdir(parents=True)
     transcript = project_dir / 'test-sid.jsonl'
@@ -3809,21 +3810,21 @@ test_tindex_fts5_search() {
 import json
 entries = [
     {'type': 'user', 'message': {'role': 'user', 'content': 'general conversation about weather'}, 'timestamp': '2026-04-05T10:00:00Z'},
-    {'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': 'teleport teleport teleport worker to mac'}]}, 'timestamp': '2026-04-05T10:00:01Z'},
-    {'type': 'user', 'message': {'role': 'user', 'content': 'one mention of teleport here'}, 'timestamp': '2026-04-05T10:00:02Z'},
+    {'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': 'deploy deploy deploy worker to mac'}]}, 'timestamp': '2026-04-05T10:00:01Z'},
+    {'type': 'user', 'message': {'role': 'user', 'content': 'one mention of deploy here'}, 'timestamp': '2026-04-05T10:00:02Z'},
 ]
 with open('$tmp', 'w') as f:
     for e in entries:
         f.write(json.dumps(e) + '\n')
 "
-    if result=$(python3 transcript-index.py --jsonl "$tmp" --db "$db" --query search --search teleport 2>/dev/null); then
+    if result=$(python3 transcript-index.py --jsonl "$tmp" --db "$db" --query search --search deploy 2>/dev/null); then
         echo "$result" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 assert d['total_results'] == 2, f'Expected 2 results, got {d[\"total_results\"]}'
-# 3x teleport should rank higher (first)
+# 3x deploy should rank higher (first)
 first_text = json.loads(d['entries'][0]['raw_json'])
-assert 'teleport teleport teleport' in str(first_text), f'3x teleport should be first'
+assert 'deploy deploy deploy' in str(first_text), f'3x deploy should be first'
 print('OK')
 " && success "FTS5 search ranks correctly" || fail "FTS5 search ranking failed"
     else
@@ -6846,7 +6847,6 @@ bridge.worker_manager.tmux_prefix = 'claude-test-'
 bridge.worker_manager.get_registered_sessions = lambda registered=None: {
     'alice': {'tmux': 'claude-test-alice', 'backend': 'claude'}
 }
-bridge.get_worker_host = lambda name: None
 # Force the dead-worker path and stub it, so restart() returns right after the
 # (hoisted) clear_pending without doing real tmux work.
 bridge.tmux_exists = lambda *a, **k: False
@@ -7696,114 +7696,6 @@ print('OK')
     fi
 }
 
-test_handle_watchdog_transition() {
-    info "Testing _handle_watchdog_transition state machine..."
-
-    if python3 -c "
-import time
-import bridge
-
-alerts = []
-resolved = []
-
-def fake_alert(name, state, reason):
-    alerts.append((name, state, reason))
-
-def fake_resolved(name, new_state):
-    resolved.append((name, new_state))
-
-orig_alert = bridge._send_watchdog_alert
-orig_resolved = bridge._send_resolved_alert
-orig_get_host = bridge.get_worker_host
-bridge._send_watchdog_alert = fake_alert
-bridge._send_resolved_alert = fake_resolved
-bridge.get_worker_host = lambda name: None  # local workers
-
-# Clear state
-with bridge._watchdog_lock:
-    bridge._prev_worker_states.clear()
-    bridge._consecutive_good_probes.clear()
-    bridge._consecutive_bad_probes.clear()
-
-now = time.time()
-
-# Local worker: STUCK triggers alert immediately
-bridge._handle_watchdog_transition('worker1', 'STUCK', 'age=600s', now, now=now)
-assert len(alerts) == 1, f'Expected 1 alert, got {len(alerts)}'
-assert alerts[0] == ('worker1', 'STUCK', 'age=600s')
-
-# Transition from STUCK to READY requires 3 consecutive good probes
-alerts.clear()
-bridge._handle_watchdog_transition('worker1', 'READY', 'idle', now, now=now)
-assert len(resolved) == 0, f'Expected 0 resolved after 1 good probe, got {len(resolved)}'
-bridge._handle_watchdog_transition('worker1', 'READY', 'idle', now, now=now)
-assert len(resolved) == 0, f'Expected 0 resolved after 2 good probes, got {len(resolved)}'
-bridge._handle_watchdog_transition('worker1', 'READY', 'idle', now, now=now)
-assert len(resolved) == 1, f'Expected 1 resolved after 3 good probes, got {len(resolved)}'
-assert resolved[0] == ('worker1', 'READY')
-assert len(alerts) == 0, 'No alert for good state'
-
-# Transition READY -> BUSY_THINKING should not trigger alert or resolved
-alerts.clear()
-resolved.clear()
-bridge._handle_watchdog_transition('worker1', 'BUSY_THINKING', 'cpu=20', now, now=now)
-assert len(alerts) == 0 and len(resolved) == 0, 'READY->BUSY_THINKING should fire nothing'
-
-# --- Remote worker: OFFLINE/DEAD requires 3 consecutive bad probes ---
-alerts.clear()
-resolved.clear()
-bridge.get_worker_host = lambda name: 'remote-host'  # remote workers
-with bridge._watchdog_lock:
-    bridge._prev_worker_states.clear()
-    bridge._consecutive_good_probes.clear()
-    bridge._consecutive_bad_probes.clear()
-
-since_past = now - 60  # past START_GRACE so eligible_for_alert is True
-
-# First bad probe: suppressed
-bridge._handle_watchdog_transition('remote1', 'DEAD', 'claude missing 30s', since_past, now=now)
-assert len(alerts) == 0, f'Remote: expected 0 alerts after 1 bad probe, got {len(alerts)}'
-
-# Second bad probe: still suppressed
-bridge._handle_watchdog_transition('remote1', 'DEAD', 'claude missing 30s', since_past, now=now)
-assert len(alerts) == 0, f'Remote: expected 0 alerts after 2 bad probes, got {len(alerts)}'
-
-# Third bad probe: alert fires
-bridge._handle_watchdog_transition('remote1', 'DEAD', 'claude missing 30s', since_past, now=now)
-assert len(alerts) == 1, f'Remote: expected 1 alert after 3 bad probes, got {len(alerts)}'
-
-# Good probe resets bad counter — but needs 3 good probes to resolve
-alerts.clear()
-bridge._handle_watchdog_transition('remote1', 'READY', 'idle', now, now=now)
-assert len(resolved) == 0, f'Remote: expected 0 resolved after 1 good probe, got {len(resolved)}'
-bridge._handle_watchdog_transition('remote1', 'READY', 'idle', now, now=now)
-bridge._handle_watchdog_transition('remote1', 'READY', 'idle', now, now=now)
-assert len(resolved) == 1, f'Remote: expected 1 resolved after 3 good probes, got {len(resolved)}'
-
-# After resolve, single bad probe should not alert (absorbed)
-alerts.clear()
-resolved.clear()
-bridge._handle_watchdog_transition('remote1', 'DEAD', 'claude missing 10s', since_past, now=now)
-assert len(alerts) == 0, f'Remote: single bad probe after resolve should be absorbed, got {len(alerts)}'
-# Good probe resets — no resolved since prev_state is still READY
-bridge._handle_watchdog_transition('remote1', 'READY', 'idle', now, now=now)
-assert len(alerts) == 0 and len(resolved) == 0, 'Remote: transient blip absorbed cleanly'
-
-bridge._send_watchdog_alert = orig_alert
-bridge._send_resolved_alert = orig_resolved
-bridge.get_worker_host = orig_get_host
-with bridge._watchdog_lock:
-    bridge._prev_worker_states.clear()
-    bridge._consecutive_good_probes.clear()
-    bridge._consecutive_bad_probes.clear()
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_handle_watchdog_transition state machine works correctly"
-    else
-        fail "_handle_watchdog_transition test failed"
-    fi
-}
 
 test_reserved_names_rejection() {
     info "Testing reserved names rejection..."
@@ -9165,226 +9057,16 @@ print('OK')
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Teleport SSH Foundation Tests
+# Bridge Public URL Tests
 # ─────────────────────────────────────────────────────────────────────────────
 
-test_remote_run_local() {
-    info "Testing _remote_run with host=None runs locally..."
 
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
 
-# _remote_run with host=None should call subprocess.run without ssh prefix
-with patch('subprocess.run') as mock_run:
-    mock_run.return_value = MagicMock(returncode=0, stdout='ok', stderr='')
-    bridge._remote_run(['tmux', 'has-session', '-t', 'test'], host=None, capture_output=True)
-    args = mock_run.call_args[0][0]
-    assert args == ['tmux', 'has-session', '-t', 'test'], f'Local: expected raw cmd, got {args}'
 
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_remote_run local passes commands through"
-    else
-        fail "_remote_run local test failed"
-    fi
-}
 
-test_remote_run_ssh() {
-    info "Testing _remote_run with host prefixes ssh..."
 
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
 
-# _remote_run with host='mac' should prefix with ssh and shell-quote args
-with patch('subprocess.run') as mock_run:
-    mock_run.return_value = MagicMock(returncode=0, stdout='ok', stderr='')
-    bridge._remote_run(['tmux', 'has-session', '-t', 'test'], host='mac', capture_output=True)
-    args = mock_run.call_args[0][0]
-    # New format: ['ssh', host, 'shell-quoted-command']
-    assert args[0] == 'ssh', f'Expected ssh, got {args[0]}'
-    assert args[1] == 'mac', f'Expected mac, got {args[1]}'
-    assert len(args) == 3, f'Expected 3 args (ssh host cmd), got {len(args)}: {args}'
-    assert 'has-session' in args[2], f'Expected has-session in cmd string, got {args[2]}'
 
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_remote_run remote prefixes ssh"
-    else
-        fail "_remote_run remote test failed"
-    fi
-}
-
-test_remote_run_stdin() {
-    info "Testing _remote_run passes input/kwargs through..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-# Verify kwargs (input, capture_output, etc.) are forwarded
-with patch('subprocess.run') as mock_run:
-    mock_run.return_value = MagicMock(returncode=0)
-    bridge._remote_run(['tmux', 'load-buffer', '-b', 'buf1', '-'], host='mac', input=b'hello', capture_output=True)
-    kwargs = mock_run.call_args[1]
-    assert kwargs.get('input') == b'hello', f'input not forwarded: {kwargs}'
-    assert kwargs.get('capture_output') == True, f'capture_output not forwarded: {kwargs}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_remote_run forwards kwargs"
-    else
-        fail "_remote_run kwargs test failed"
-    fi
-}
-
-test_remote_copy() {
-    info "Testing _remote_copy builds scp commands..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import shutil
-import bridge
-
-# Local copy (no host) — should use shutil.copy2
-with patch('shutil.copy2') as mock_copy:
-    bridge._remote_copy('/tmp/a.txt', '/tmp/b.txt', host=None)
-    mock_copy.assert_called_once_with('/tmp/a.txt', '/tmp/b.txt')
-
-# Push to remote — scp local remote:path
-with patch('subprocess.run') as mock_run:
-    mock_run.return_value = MagicMock(returncode=0)
-    bridge._remote_copy('/tmp/a.txt', '/remote/b.txt', host='mac', direction='push')
-    args = mock_run.call_args[0][0]
-    assert args == ['scp', '-q', '/tmp/a.txt', 'mac:/remote/b.txt'], f'Push: got {args}'
-
-# Pull from remote — scp remote:path local
-with patch('subprocess.run') as mock_run:
-    mock_run.return_value = MagicMock(returncode=0)
-    bridge._remote_copy('/remote/a.txt', '/tmp/b.txt', host='mac', direction='pull')
-    args = mock_run.call_args[0][0]
-    assert args == ['scp', '-q', 'mac:/remote/a.txt', '/tmp/b.txt'], f'Pull: got {args}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_remote_copy handles local/push/pull"
-    else
-        fail "_remote_copy test failed"
-    fi
-}
-
-test_tmux_send_message_remote() {
-    info "Testing tmux_send_message uses SSH for remote workers..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock, call
-import bridge
-
-calls = []
-def mock_run(cmd, **kwargs):
-    calls.append((list(cmd), kwargs))
-    return MagicMock(returncode=0)
-
-with patch('subprocess.run', side_effect=mock_run):
-    with patch('bridge._acquire_flock', return_value=99):
-        with patch('bridge._release_flock'):
-            bridge.tmux_send_message('test-session', 'hello', host='mac')
-
-# Verify all tmux commands went through ssh (format: ['ssh', 'mac', 'cmd string'])
-tmux_calls = [c for c in calls if 'tmux' in ' '.join(c[0])]
-for cmd, kwargs in tmux_calls:
-    assert cmd[0] == 'ssh' and cmd[1] == 'mac', f'Expected ssh mac prefix, got {cmd[:2]}'
-
-# Verify load-buffer uses stdin (- flag) not tmpfile
-load_calls = [c for c in calls if 'load-buffer' in ' '.join(c[0])]
-assert len(load_calls) == 1, f'Expected 1 load-buffer, got {len(load_calls)}'
-load_cmd_str = ' '.join(load_calls[0][0])
-assert 'load-buffer' in load_cmd_str, f'Expected load-buffer in cmd, got {load_cmd_str}'
-assert load_calls[0][1].get('input') == b'hello', f'Should pipe text via input kwarg'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "tmux_send_message uses SSH for remote workers"
-    else
-        fail "tmux_send_message remote test failed"
-    fi
-}
-
-test_tmux_exists_remote() {
-    info "Testing tmux_exists uses SSH for remote host..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-with patch('subprocess.run') as mock_run:
-    mock_run.return_value = MagicMock(returncode=0)
-    result = bridge.tmux_exists('test-session', host='mac')
-    assert result == True
-    args = mock_run.call_args[0][0]
-    assert args[:2] == ['ssh', 'mac'], f'Expected ssh prefix, got {args}'
-    cmd_str = ' '.join(args)
-    assert 'has-session' in cmd_str, f'Expected has-session in cmd: {cmd_str}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "tmux_exists uses SSH for remote host"
-    else
-        fail "tmux_exists remote test failed"
-    fi
-}
-
-test_process_inspection_remote() {
-    info "Testing pgrep/kill use SSH for remote workers..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-# _get_claude_pid with host should prefix ssh
-with patch('subprocess.run') as mock_run:
-    mock_run.return_value = MagicMock(returncode=0, stdout='12345\n')
-    result = bridge._get_claude_pid('999', host='mac')
-    args = mock_run.call_args[0][0]
-    assert args[:2] == ['ssh', 'mac'], f'Expected ssh prefix for pgrep, got {args}'
-    cmd_str = ' '.join(args)
-    assert 'pgrep' in cmd_str, f'Expected pgrep in cmd: {cmd_str}'
-    assert result == '12345'
-
-# _child_count with host should prefix ssh
-with patch('subprocess.run') as mock_run:
-    mock_run.return_value = MagicMock(returncode=0, stdout='111\n222\n')
-    result = bridge._child_count('999', host='mac')
-    args = mock_run.call_args[0][0]
-    assert args[:2] == ['ssh', 'mac'], f'Expected ssh prefix for child_count, got {args}'
-    assert result == 2
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Process inspection uses SSH for remote workers"
-    else
-        fail "Process inspection remote test failed"
-    fi
-}
-
-test_project_slug() {
-    info "Testing _project_slug converts paths to Claude session slugs..."
-
-    if python3 -c "
-import bridge
-
-assert bridge._project_slug('/home/claude/proj') == '-home-claude-proj'
-assert bridge._project_slug('/Users/joan/my-project') == '-Users-joan-my-project'
-assert bridge._project_slug('/') == '-'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_project_slug converts paths correctly"
-    else
-        fail "_project_slug test failed"
-    fi
-}
 
 test_bridge_public_url_auto_detect() {
     info "Testing BRIDGE_PUBLIC_URL auto-detects from Tailscale when unset..."
@@ -9505,200 +9187,6 @@ print(result.stdout.strip())
     fi
 }
 
-test_bridge_url_honors_remote() {
-    info "Testing BRIDGE_URL honors remote (non-localhost) env..."
-
-    if python3 -c "
-import subprocess, sys, os
-env = {k: v for k, v in os.environ.items() if k not in ('BRIDGE_URL',)}
-env['TELEGRAM_BOT_TOKEN'] = 'test'
-env['PORT'] = '9999'
-env['BRIDGE_URL'] = 'https://remote-bridge.example.com'
-result = subprocess.run([sys.executable, '-c', '''
-import bridge
-assert bridge.BRIDGE_URL == \"https://remote-bridge.example.com\", f\"Expected remote URL, got {bridge.BRIDGE_URL!r}\"
-print(\"OK\")
-'''], capture_output=True, text=True, env=env)
-assert result.returncode == 0, result.stderr or result.stdout
-print(result.stdout.strip())
-" 2>/dev/null | grep -q "OK"; then
-        success "BRIDGE_URL honors remote env"
-    else
-        fail "BRIDGE_URL remote test failed"
-    fi
-}
-
-# ── Git-Based Teleport Sync Tests ──────────────────────────────────────
-
-test_ensure_bare_repo_creates_new() {
-    info "Testing _ensure_bare_repo creates a new bare repo..."
-
-    if python3 -c "
-import tempfile, shutil, os
-import bridge
-
-tmpdir = tempfile.mkdtemp()
-orig = bridge.GIT_SERVER_DIR
-bridge.GIT_SERVER_DIR = tmpdir
-
-path = bridge._ensure_bare_repo('test-project')
-assert path == os.path.join(tmpdir, 'test-project.git'), f'unexpected path: {path}'
-assert os.path.isdir(path), 'bare repo dir should exist'
-assert os.path.isfile(os.path.join(path, 'HEAD')), 'bare repo should have HEAD'
-
-bridge.GIT_SERVER_DIR = orig
-shutil.rmtree(tmpdir)
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_ensure_bare_repo creates new bare repo"
-    else
-        fail "_ensure_bare_repo create test failed"
-    fi
-}
-
-test_ensure_bare_repo_idempotent() {
-    info "Testing _ensure_bare_repo is idempotent..."
-
-    if python3 -c "
-import tempfile, shutil, os
-import bridge
-
-tmpdir = tempfile.mkdtemp()
-orig = bridge.GIT_SERVER_DIR
-bridge.GIT_SERVER_DIR = tmpdir
-
-path1 = bridge._ensure_bare_repo('myrepo')
-path2 = bridge._ensure_bare_repo('myrepo')
-assert path1 == path2, f'paths differ: {path1} vs {path2}'
-assert os.path.isdir(path1), 'bare repo should still exist'
-
-bridge.GIT_SERVER_DIR = orig
-shutil.rmtree(tmpdir)
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_ensure_bare_repo is idempotent"
-    else
-        fail "_ensure_bare_repo idempotent test failed"
-    fi
-}
-
-test_bare_repo_url_for_remote() {
-    info "Testing bare repo URL generation for remote targets..."
-
-    if python3 -c "
-import bridge
-
-# Local target should use direct path
-url = bridge._bare_repo_url('/home/claude/git-server/test.git', target_host=None)
-assert url == '/home/claude/git-server/test.git', f'local: {url}'
-
-# Remote target should use SSH URL
-url = bridge._bare_repo_url('/home/claude/git-server/test.git',
-                             target_host='beastoin-agents-f1-mac-mini')
-assert 'claude@100.125.36.102:' in url, f'remote should SSH to VPS: {url}'
-assert '/home/claude/git-server/test.git' in url, f'should include path: {url}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Bare repo URL correct for remote targets"
-    else
-        fail "Bare repo URL test failed"
-    fi
-}
-
-test_export_hook_env_remaps_remote_sessions_dir() {
-    info "Testing export_hook_env remaps SESSIONS_DIR for teleported workers..."
-
-    if python3 -c "
-from pathlib import Path
-from unittest.mock import patch, MagicMock
-import bridge
-
-orig_sessions = bridge.SESSIONS_DIR
-bridge.SESSIONS_DIR = Path(str(Path.home() / '.claude' / 'telegram' / 'sessions'))
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append((cmd, host))
-    # Match the echo HOME call (literal dollar-HOME in the cmd list)
-    if len(cmd) == 3 and cmd[0] == 'bash' and 'HOME' in cmd[2]:
-        return MagicMock(returncode=0, stdout='/Users/beastoinagents\n', stderr='')
-    return MagicMock(returncode=0, stdout='', stderr='')
-
-with patch('bridge._remote_run', side_effect=mock_remote):
-    bridge.export_hook_env('claude-test-ren', backend='claude', host='mac-mini')
-
-session_exports = [cmd for cmd, host in calls if host == 'mac-mini' and len(cmd) >= 6 and cmd[4] == 'SESSIONS_DIR']
-assert len(session_exports) == 1, f'expected one SESSIONS_DIR export, got {calls}'
-assert session_exports[0][5] == '/Users/beastoinagents/.claude/telegram/sessions', f'wrong path: {session_exports[0]}'
-
-calls.clear()
-with patch('bridge._remote_run', side_effect=mock_remote):
-    bridge.export_hook_env('claude-test-lee', backend='claude')
-
-local_exports = [cmd for cmd, host in calls if host is None and len(cmd) >= 6 and cmd[4] == 'SESSIONS_DIR']
-assert len(local_exports) == 1, f'expected local SESSIONS_DIR export, got {calls}'
-assert local_exports[0][5] == str(bridge.SESSIONS_DIR), f'wrong local path: {local_exports[0]}'
-
-bridge.SESSIONS_DIR = orig_sessions
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "export_hook_env remaps remote SESSIONS_DIR"
-    else
-        fail "export_hook_env should remap remote SESSIONS_DIR"
-    fi
-}
-
-test_export_hook_env_uses_public_url_for_remote() {
-    info "Testing export_hook_env uses BRIDGE_PUBLIC_URL for remote workers..."
-
-    if python3 -c "
-from pathlib import Path
-from unittest.mock import patch, MagicMock
-import bridge
-
-# Save originals
-orig_bridge_url = bridge.BRIDGE_URL
-orig_public_url = bridge.BRIDGE_PUBLIC_URL
-
-# Simulate: BRIDGE_URL is localhost, BRIDGE_PUBLIC_URL is the Tailscale IP
-bridge.BRIDGE_URL = 'http://localhost:8271'
-bridge.BRIDGE_PUBLIC_URL = 'http://100.125.36.102:8271'
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append((cmd, host))
-    if len(cmd) == 3 and cmd[0] == 'bash' and 'HOME' in cmd[2]:
-        return MagicMock(returncode=0, stdout='/Users/beastoinagents\n', stderr='')
-    return MagicMock(returncode=0, stdout='', stderr='')
-
-# Remote worker: must use BRIDGE_PUBLIC_URL, not localhost
-with patch('bridge._remote_run', side_effect=mock_remote):
-    bridge.export_hook_env('claude-test-ren', backend='claude', host='mac-mini')
-
-bridge_exports = [cmd for cmd, host in calls if host == 'mac-mini' and len(cmd) >= 6 and cmd[4] == 'BRIDGE_URL']
-assert len(bridge_exports) == 1, f'expected one BRIDGE_URL export, got {bridge_exports}'
-assert bridge_exports[0][5] == 'http://100.125.36.102:8271', f'remote should use BRIDGE_PUBLIC_URL, got: {bridge_exports[0][5]}'
-
-# Local worker: can use BRIDGE_URL as-is
-calls.clear()
-with patch('bridge._remote_run', side_effect=mock_remote):
-    bridge.export_hook_env('claude-test-lee', backend='claude')
-
-local_exports = [cmd for cmd, host in calls if host is None and len(cmd) >= 6 and cmd[4] == 'BRIDGE_URL']
-assert len(local_exports) == 1, f'expected one BRIDGE_URL export, got {local_exports}'
-assert local_exports[0][5] == 'http://localhost:8271', f'local should use BRIDGE_URL, got: {local_exports[0][5]}'
-
-# Restore
-bridge.BRIDGE_URL = orig_bridge_url
-bridge.BRIDGE_PUBLIC_URL = orig_public_url
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "export_hook_env uses BRIDGE_PUBLIC_URL for remote workers"
-    else
-        fail "export_hook_env should use BRIDGE_PUBLIC_URL for remote workers"
-    fi
-}
 
 test_resolved_alert_cooldown() {
     info "Testing resolved alert has cooldown to prevent spam..."
@@ -9742,558 +9230,6 @@ print('OK')
         fail "resolved alert should have cooldown to prevent spam"
     fi
 }
-
-test_is_online_teleported_checks_claude_process() {
-    info "Testing teleported interactive workers require tmux and Claude to be alive..."
-
-    if python3 -c "
-from unittest.mock import patch
-import bridge
-
-wm = bridge.WorkerManager(bridge.SESSIONS_DIR, 'claude-test-')
-session = {'tmux': 'claude-test-ren', 'backend': 'claude'}
-
-with patch('bridge.get_worker_host', return_value='mac-mini'), \
-     patch('bridge.tmux_exists', return_value=True), \
-     patch('bridge.is_claude_running', return_value=False):
-    assert wm.is_online('ren', session) is False, 'remote worker with dead claude should be offline'
-
-with patch('bridge.get_worker_host', return_value='mac-mini'), \
-     patch('bridge.tmux_exists', return_value=True), \
-     patch('bridge.is_claude_running', return_value=True):
-    assert wm.is_online('ren', session) is True, 'remote worker with live claude should be online'
-
-local_calls = []
-class FakeBackend:
-    is_interactive = True
-    def is_online(self, tmux_name):
-        local_calls.append(tmux_name)
-        return True
-
-with patch('bridge.get_worker_host', return_value=None), \
-     patch('bridge.get_backend', return_value=FakeBackend()):
-    assert wm.is_online('lee', {'tmux': 'claude-test-lee', 'backend': 'claude'}) is True
-
-assert local_calls == ['claude-test-lee'], f'local path should delegate to backend.is_online: {local_calls}'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "teleported is_online checks both tmux and Claude"
-    else
-        fail "teleported is_online should check both tmux and Claude"
-    fi
-}
-
-test_scan_latest_session_id_local() {
-    info "Testing _scan_latest_session_id returns latest JSONL by mtime (local)..."
-
-    if python3 -c "
-import os, tempfile, shutil, time
-from pathlib import Path
-import bridge
-
-projects_dir = Path(tempfile.mkdtemp())
-cwd = '/tmp/scan-test-abc'
-slug = bridge._project_slug(cwd)
-slug_dir = projects_dir / slug
-slug_dir.mkdir(parents=True)
-
-old_path = slug_dir / 'aaaaaaaa-1111-2222-3333-444444444444.jsonl'
-new_path = slug_dir / 'bbbbbbbb-5555-6666-7777-888888888888.jsonl'
-old_path.write_text('')
-new_path.write_text('')
-now = time.time()
-os.utime(old_path, (now - 100, now - 100))
-os.utime(new_path, (now, now))
-
-orig = bridge.CLAUDE_PROJECTS_DIR
-bridge.CLAUDE_PROJECTS_DIR = projects_dir
-try:
-    sid = bridge._scan_latest_session_id(cwd)
-    assert sid == 'bbbbbbbb-5555-6666-7777-888888888888', f'got {sid!r}'
-    # Empty slug dir returns empty
-    empty_cwd = '/tmp/scan-test-empty'
-    (projects_dir / bridge._project_slug(empty_cwd)).mkdir()
-    assert bridge._scan_latest_session_id(empty_cwd) == ''
-    # Missing slug dir returns empty
-    assert bridge._scan_latest_session_id('/tmp/scan-test-missing') == ''
-finally:
-    bridge.CLAUDE_PROJECTS_DIR = orig
-    shutil.rmtree(projects_dir, ignore_errors=True)
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_scan_latest_session_id returns latest JSONL stem"
-    else
-        fail "_scan_latest_session_id local scan test failed"
-    fi
-}
-
-test_get_claude_session_id_authoritative_overrides_stale() {
-    info "Testing get_claude_session_id(authoritative=True) overrides stale cache..."
-
-    if python3 -c "
-import os, tempfile, shutil
-from pathlib import Path
-import bridge
-
-tmpdir = Path(tempfile.mkdtemp())
-projects_dir = Path(tempfile.mkdtemp())
-
-orig_sessions = bridge.SESSIONS_DIR
-orig_projects = bridge.CLAUDE_PROJECTS_DIR
-orig_node = bridge.NODE_DIR
-orig_reg = bridge.WORKER_REGISTRY_FILE
-
-bridge.SESSIONS_DIR = tmpdir / 'sessions'
-bridge.SESSIONS_DIR.mkdir()
-bridge.CLAUDE_PROJECTS_DIR = projects_dir
-bridge.NODE_DIR = tmpdir
-bridge.WORKER_REGISTRY_FILE = tmpdir / 'workers.json'
-
-session_dir = bridge.SESSIONS_DIR / 'worker1'
-session_dir.mkdir()
-(session_dir / 'claude_session_id').write_text('stale-uuid-does-not-exist')
-(session_dir / 'claude_session_cwd').write_text('/tmp/scan-test-def')
-
-cwd = '/tmp/scan-test-def'
-slug = bridge._project_slug(cwd)
-slug_dir = projects_dir / slug
-slug_dir.mkdir(parents=True)
-real_uuid = 'real-uuid-abc123-def456-7890-111213141516'
-(slug_dir / f'{real_uuid}.jsonl').write_text('')
-
-bridge._registry_add('worker1', 'claude', 123)
-
-# Non-authoritative: returns stale cache (fast path)
-sid_stale = bridge.get_claude_session_id('worker1')
-assert sid_stale == 'stale-uuid-does-not-exist', f'non-auth should trust cache, got {sid_stale!r}'
-
-# Authoritative: scans, overrides cache
-sid = bridge.get_claude_session_id('worker1', authoritative=True)
-assert sid == real_uuid, f'expected {real_uuid!r}, got {sid!r}'
-
-cached = (session_dir / 'claude_session_id').read_text().strip()
-assert cached == real_uuid, f'cache not refreshed: got {cached!r}'
-
-# Next non-authoritative read picks up refreshed cache
-assert bridge.get_claude_session_id('worker1') == real_uuid
-
-bridge.SESSIONS_DIR = orig_sessions
-bridge.CLAUDE_PROJECTS_DIR = orig_projects
-bridge.NODE_DIR = orig_node
-bridge.WORKER_REGISTRY_FILE = orig_reg
-shutil.rmtree(tmpdir, ignore_errors=True)
-shutil.rmtree(projects_dir, ignore_errors=True)
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "get_claude_session_id authoritative overrides stale cache"
-    else
-        fail "authoritative scan override test failed"
-    fi
-}
-
-test_localize_media_teleported_fetches_remote_even_when_local_exists() {
-    info "Testing teleported media localization always fetches from remote..."
-
-    if python3 -c "
-from unittest.mock import patch
-import bridge
-
-fetch_calls = []
-def mock_fetch(host, file_path):
-    fetch_calls.append((host, file_path))
-    return '/tmp/fetched.png'
-
-with patch('bridge.get_worker_host', return_value='mac-mini'), \
-     patch('bridge._fetch_remote_file', side_effect=mock_fetch), \
-     patch('os.path.exists', return_value=True):
-    result = bridge._localize_media('ren', [('/tmp/raw.png', 'caption')])
-
-assert result == [('/tmp/fetched.png', 'caption')], f'expected fetched remote path, got {result}'
-assert fetch_calls == [('mac-mini', '/tmp/raw.png')], f'should fetch remote file regardless of local collision: {fetch_calls}'
-
-fetch_calls.clear()
-with patch('bridge.get_worker_host', return_value=None), \
-     patch('bridge._fetch_remote_file', side_effect=mock_fetch):
-    result = bridge._localize_media('lee', [('/tmp/raw.png', 'caption')])
-
-assert result == [('/tmp/raw.png', 'caption')], f'local worker should keep local path: {result}'
-assert not fetch_calls, f'local worker should not fetch remote media: {fetch_calls}'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "teleported media localization always fetches remote files"
-    else
-        fail "teleported media localization should always fetch remote files"
-    fi
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 1: host=None parameter tests (teleport remote dispatch)
-# ─────────────────────────────────────────────────────────────────────────────
-
-test_remote_dispatch_get_pane_command() {
-    info "Testing get_pane_command routes through _remote_run when host is set..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import subprocess
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    r = MagicMock()
-    r.returncode = 0
-    r.stdout = 'claude'
-    return r
-
-with patch('bridge._remote_run', side_effect=mock_remote):
-    result = bridge.get_pane_command('claude-prod-ren', host='mac-mini')
-
-assert len(calls) == 1, f'Expected 1 _remote_run call, got {len(calls)}'
-assert calls[0]['host'] == 'mac-mini', f'Expected host=mac-mini, got {calls[0][\"host\"]}'
-assert 'tmux' in calls[0]['cmd'][0], f'Expected tmux command, got {calls[0][\"cmd\"]}'
-assert result == 'claude', f'Expected claude, got {result}'
-
-# host=None should also work (backward compat)
-calls.clear()
-with patch('bridge._remote_run', side_effect=mock_remote):
-    bridge.get_pane_command('claude-prod-ren')
-assert calls[0]['host'] is None, f'Default host should be None'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "get_pane_command dispatches to _remote_run with host"
-    else
-        fail "get_pane_command should dispatch to _remote_run with host"
-    fi
-}
-
-test_remote_dispatch_is_process_running() {
-    info "Testing is_process_running passes host through call chain..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    r = MagicMock()
-    r.returncode = 0
-    r.stdout = 'claude'
-    return r
-
-with patch('bridge._remote_run', side_effect=mock_remote):
-    result = bridge.is_process_running('claude-prod-ren', 'claude', host='mac-mini')
-
-# Should have called _remote_run for tmux display-message (via get_pane_command)
-assert any(c['host'] == 'mac-mini' for c in calls), f'All calls should have host=mac-mini: {calls}'
-assert result == True, f'Process name in pane command should match'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "is_process_running passes host to _remote_run"
-    else
-        fail "is_process_running should pass host to _remote_run"
-    fi
-}
-
-test_remote_dispatch_is_claude_running() {
-    info "Testing is_claude_running passes host through..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    r = MagicMock()
-    r.returncode = 0
-    r.stdout = 'claude'
-    return r
-
-with patch('bridge._remote_run', side_effect=mock_remote):
-    result = bridge.is_claude_running('claude-prod-ren', host='mac-mini')
-
-assert any(c['host'] == 'mac-mini' for c in calls), f'Should route through _remote_run with host'
-assert result == True
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "is_claude_running passes host to is_process_running"
-    else
-        fail "is_claude_running should pass host to is_process_running"
-    fi
-}
-
-test_remote_dispatch_tmux_send_escape() {
-    info "Testing tmux_send_escape routes through _remote_run when host is set..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    return MagicMock(returncode=0)
-
-with patch('bridge._remote_run', side_effect=mock_remote):
-    bridge.tmux_send_escape('claude-prod-ren', host='mac-mini')
-
-assert len(calls) == 1, f'Expected 1 call, got {len(calls)}'
-assert calls[0]['host'] == 'mac-mini'
-assert 'Escape' in calls[0]['cmd'], f'Should send Escape key: {calls[0][\"cmd\"]}'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "tmux_send_escape dispatches to _remote_run with host"
-    else
-        fail "tmux_send_escape should dispatch to _remote_run with host"
-    fi
-}
-
-test_remote_dispatch_tmux_pane_pids() {
-    info "Testing _tmux_pane_pids routes through _remote_run when host is set..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    r = MagicMock()
-    r.returncode = 0
-    r.stdout = 'claude-prod-ren 12345\nclaude-prod-lee 67890'
-    return r
-
-with patch('bridge._remote_run', side_effect=mock_remote):
-    result = bridge._tmux_pane_pids(host='mac-mini')
-
-assert len(calls) == 1, f'Expected 1 call, got {len(calls)}'
-assert calls[0]['host'] == 'mac-mini'
-assert result == {'claude-prod-ren': '12345', 'claude-prod-lee': '67890'}, f'Got {result}'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_tmux_pane_pids dispatches to _remote_run with host"
-    else
-        fail "_tmux_pane_pids should dispatch to _remote_run with host"
-    fi
-}
-
-test_remote_dispatch_ps_stats() {
-    info "Testing _ps_stats routes through _remote_run when host is set..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    r = MagicMock()
-    r.returncode = 0
-    r.stdout = '12345  2.5 S'
-    return r
-
-with patch('bridge._remote_run', side_effect=mock_remote):
-    result = bridge._ps_stats(['12345'], host='mac-mini')
-
-assert len(calls) == 1, f'Expected 1 call, got {len(calls)}'
-assert calls[0]['host'] == 'mac-mini'
-assert '12345' in result, f'Got {result}'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_ps_stats dispatches to _remote_run with host"
-    else
-        fail "_ps_stats should dispatch to _remote_run with host"
-    fi
-}
-
-test_remote_dispatch_capture_pane_text() {
-    info "Testing _capture_pane_text routes through _remote_run when host is set..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    r = MagicMock()
-    r.returncode = 0
-    r.stdout = 'some pane text'
-    return r
-
-with patch('bridge._remote_run', side_effect=mock_remote):
-    result = bridge._capture_pane_text('claude-prod-ren', host='mac-mini')
-
-assert len(calls) == 1, f'Expected 1 call, got {len(calls)}'
-assert calls[0]['host'] == 'mac-mini'
-assert result == 'some pane text', f'Got {result}'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_capture_pane_text dispatches to _remote_run with host"
-    else
-        fail "_capture_pane_text should dispatch to _remote_run with host"
-    fi
-}
-
-test_remote_dispatch_export_hook_env() {
-    info "Testing export_hook_env routes through _remote_run when host is set..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    # Handle echo HOME call for SESSIONS_DIR remapping
-    if len(cmd) == 3 and cmd[0] == 'bash' and 'HOME' in cmd[2]:
-        return MagicMock(returncode=0, stdout='/Users/beastoinagents\n', stderr='')
-    # Guard reads current BRIDGE_URL via show-environment (return empty = no prior owner)
-    if 'show-environment' in cmd and 'BRIDGE_URL' in cmd:
-        return MagicMock(returncode=1, stdout='', stderr='')
-    return MagicMock(returncode=0, stdout='', stderr='')
-
-with patch('bridge._remote_run', side_effect=mock_remote):
-    bridge.export_hook_env('claude-prod-ren', host='mac-mini')
-
-# 7 calls: 1 show-environment guard + 5 set-environment + 1 echo HOME
-assert len(calls) == 7, f'Expected 7 calls (1 guard + 5 set-env + 1 echo HOME), got {len(calls)}'
-assert all(c['host'] == 'mac-mini' for c in calls), f'All calls should target mac-mini'
-set_env_calls = [c for c in calls if 'set-environment' in ' '.join(c['cmd']) and 'show' not in ' '.join(c['cmd'])]
-assert len(set_env_calls) == 5, f'Expected 5 set-environment calls, got {len(set_env_calls)}'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "export_hook_env dispatches to _remote_run with host"
-    else
-        fail "export_hook_env should dispatch to _remote_run with host"
-    fi
-}
-
-test_remote_dispatch_tmux_prompt_empty() {
-    info "Testing tmux_prompt_empty routes through _remote_run when host is set..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    r = MagicMock()
-    r.returncode = 0
-    r.stdout = 'some output\n❯ \n'
-    return r
-
-with patch('bridge._remote_run', side_effect=mock_remote):
-    result = bridge.tmux_prompt_empty('claude-prod-ren', host='mac-mini')
-
-assert len(calls) >= 1, f'Expected at least 1 call, got {len(calls)}'
-assert calls[0]['host'] == 'mac-mini'
-assert result == True, f'Should detect empty prompt'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "tmux_prompt_empty dispatches to _remote_run with host"
-    else
-        fail "tmux_prompt_empty should dispatch to _remote_run with host"
-    fi
-}
-
-test_remote_dispatch_send_interactive_reply() {
-    info "Testing _send_interactive_reply routes through _remote_run when host is set..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    return MagicMock(returncode=0)
-
-details = {'options': [{'num': 1, 'selected': True}, {'num': 2, 'selected': False}]}
-with patch('bridge._remote_run', side_effect=mock_remote):
-    result = bridge._send_interactive_reply('claude-prod-ren', 'cancel', details, host='mac-mini')
-
-assert result == True, f'cancel should be handled'
-assert len(calls) >= 1, f'Expected at least 1 call, got {len(calls)}'
-assert calls[0]['host'] == 'mac-mini'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_send_interactive_reply dispatches to _remote_run with host"
-    else
-        fail "_send_interactive_reply should dispatch to _remote_run with host"
-    fi
-}
-
-test_remote_dispatch_wait_for_restart_ready() {
-    info "Testing _wait_for_restart_ready passes host to sub-calls..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-tmux_exists_calls = []
-activity_calls = []
-
-def mock_tmux_exists(name, host=None):
-    tmux_exists_calls.append({'name': name, 'host': host})
-    return True
-
-def mock_activity(name, host=None):
-    activity_calls.append({'name': name, 'host': host})
-    return ('Idle at prompt', None, None)
-
-with patch('bridge.tmux_exists', side_effect=mock_tmux_exists), \
-     patch('bridge._read_tmux_activity', side_effect=mock_activity):
-    result = bridge._wait_for_restart_ready('claude-prod-ren', 'claude', host='mac-mini')
-
-assert result == True, f'Should detect idle prompt'
-assert any(c['host'] == 'mac-mini' for c in tmux_exists_calls), f'tmux_exists should get host: {tmux_exists_calls}'
-assert any(c['host'] == 'mac-mini' for c in activity_calls), f'_read_tmux_activity should get host: {activity_calls}'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_wait_for_restart_ready passes host to tmux_exists and _read_tmux_activity"
-    else
-        fail "_wait_for_restart_ready should pass host to sub-calls"
-    fi
-}
-
-test_remote_dispatch_get_tmux_pane_cwd() {
-    info "Testing _get_tmux_pane_cwd routes through _remote_run when host is set..."
-
-    if python3 -c "
-from unittest.mock import patch, MagicMock
-import bridge
-
-calls = []
-def mock_remote(cmd, host=None, **kwargs):
-    calls.append({'cmd': cmd, 'host': host})
-    r = MagicMock()
-    r.returncode = 0
-    r.stdout = '/Users/beastoinagents/omi'
-    return r
-
-wm = bridge.WorkerManager.__new__(bridge.WorkerManager)
-with patch('bridge._remote_run', side_effect=mock_remote):
-    result = wm._get_tmux_pane_cwd('claude-prod-ren', host='mac-mini')
-
-assert len(calls) == 1, f'Expected 1 call, got {len(calls)}'
-assert calls[0]['host'] == 'mac-mini'
-assert result == '/Users/beastoinagents/omi', f'Got {result}'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_get_tmux_pane_cwd dispatches to _remote_run with host"
-    else
-        fail "_get_tmux_pane_cwd should dispatch to _remote_run with host"
-    fi
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 2: Call site host= propagation tests (teleport)
-# ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Node-derived config tests
@@ -10784,10 +9720,10 @@ new_dir.mkdir()
 bridge.worker_manager.get_registered_sessions = lambda registered=None: {
     'alice': {'tmux': f'{bridge.TMUX_PREFIX}alice', 'backend': 'claude'}
 }
-bridge.tmux_exists = lambda _name, host=None: True
-bridge.is_claude_running = lambda _name, host=None: False  # Allow checkin restart
+bridge.tmux_exists = lambda _name: True
+bridge.is_claude_running = lambda _name: False  # Allow checkin restart
 bridge.export_hook_env = lambda *_args, **_kwargs: None
-bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux, host=None: str(old_dir)
+bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
 bridge.worker_manager.restart = lambda name, mode='relaunch': (True, None)
 bridge._wait_for_restart_ready = lambda *_args, **_kwargs: True
 bridge._recent_restarts.pop('alice', None)  # Clear cooldown
@@ -10867,10 +9803,10 @@ new_dir.mkdir()
 bridge.worker_manager.get_registered_sessions = lambda registered=None: {
     'alice': {'tmux': f'{bridge.TMUX_PREFIX}alice', 'backend': 'claude'}
 }
-bridge.tmux_exists = lambda _name, host=None: True
-bridge.is_claude_running = lambda _name, host=None: False  # Allow checkin restart
+bridge.tmux_exists = lambda _name: True
+bridge.is_claude_running = lambda _name: False  # Allow checkin restart
 bridge.export_hook_env = lambda *_args, **_kwargs: None
-bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux, host=None: str(old_dir)
+bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
 bridge.worker_manager.restart = lambda name, mode='relaunch': (True, None)
 bridge._wait_for_restart_ready = lambda *_args, **_kwargs: True
 bridge._recent_restarts.pop('alice', None)  # Clear cooldown
@@ -10944,10 +9880,10 @@ new_dir.mkdir()
 bridge.worker_manager.get_registered_sessions = lambda registered=None: {
     'alice': {'tmux': f'{bridge.TMUX_PREFIX}alice', 'backend': 'claude'}
 }
-bridge.tmux_exists = lambda _name, host=None: True
-bridge.is_claude_running = lambda _name, host=None: False  # Allow checkin restart
+bridge.tmux_exists = lambda _name: True
+bridge.is_claude_running = lambda _name: False  # Allow checkin restart
 bridge.export_hook_env = lambda *_args, **_kwargs: None
-bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux, host=None: str(old_dir)
+bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
 bridge.worker_manager.restart = lambda name, mode='relaunch': (False, 'boom')
 bridge._recent_restarts.pop('alice', None)  # Clear cooldown
 
@@ -11019,10 +9955,10 @@ new_dir.mkdir()
 bridge.worker_manager.get_registered_sessions = lambda registered=None: {
     'bob': {'tmux': f'{bridge.TMUX_PREFIX}bob', 'backend': 'claude'}
 }
-bridge.tmux_exists = lambda _name, host=None: True
-bridge.is_claude_running = lambda _name, host=None: False
+bridge.tmux_exists = lambda _name: True
+bridge.is_claude_running = lambda _name: False
 bridge.export_hook_env = lambda *_args, **_kwargs: None
-bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux, host=None: str(old_dir)
+bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
 
 restart_calls = []
 bridge.worker_manager.restart = lambda name, mode='relaunch': (restart_calls.append(1), (True, None))[1]
@@ -11091,10 +10027,10 @@ new_dir.mkdir()
 bridge.worker_manager.get_registered_sessions = lambda registered=None: {
     'bob': {'tmux': f'{bridge.TMUX_PREFIX}bob', 'backend': 'claude'}
 }
-bridge.tmux_exists = lambda _name, host=None: True
-bridge.is_claude_running = lambda _name, host=None: True  # Claude IS running
+bridge.tmux_exists = lambda _name: True
+bridge.is_claude_running = lambda _name: True  # Claude IS running
 bridge.export_hook_env = lambda *_args, **_kwargs: None
-bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux, host=None: str(old_dir)
+bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
 bridge._recent_restarts.pop('bob', None)  # No cooldown
 
 restart_calls = []
@@ -11621,103 +10557,7 @@ print('OK')
     fi
 }
 
-test_is_online_teleported_ssh_failure_assumes_online() {
-    info "Testing is_online treats SSH failures as online for remote workers..."
 
-    if python3 -c "
-from unittest.mock import patch
-import bridge
-
-wm = bridge.WorkerManager(bridge.SESSIONS_DIR, 'claude-test-')
-session = {'tmux': 'claude-test-ren', 'backend': 'claude'}
-
-# SSH failure (exception) should return True (assume online)
-def mock_tmux_exists(name, host=None):
-    if host:
-        raise Exception('SSH connection refused')
-    return True
-
-with patch('bridge.get_worker_host', return_value='mac-mini'), \
-     patch('bridge.tmux_exists', side_effect=mock_tmux_exists):
-    result = wm.is_online('ren', session)
-    assert result is True, f'SSH failure should assume online, got {result}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "is_online treats SSH failure as online for teleported workers"
-    else
-        fail "is_online should treat SSH failure as online for teleported workers"
-    fi
-}
-
-test_watchdog_skips_dead_alert_during_teleport() {
-    info "Testing watchdog suppresses DEAD/OFFLINE alerts when teleport_state exists..."
-
-    if python3 -c "
-import bridge, tempfile, json, time
-from pathlib import Path
-from unittest.mock import patch
-
-tmpdir = tempfile.mkdtemp()
-sessions_dir = Path(tmpdir) / 'sessions'
-sessions_dir.mkdir()
-orig_sessions_dir = bridge.SESSIONS_DIR
-bridge.SESSIONS_DIR = sessions_dir
-
-worker_name = 'bob'
-worker_dir = sessions_dir / worker_name
-worker_dir.mkdir()
-
-# Write teleport_state file
-(worker_dir / 'teleport_state').write_text(json.dumps({
-    'phase': 1, 'source_host': 'host1',
-    'target_host': 'host2', 'target_cwd': '/tmp',
-    'started_at': 1000,
-}))
-
-bridge.admin_chat_id = 123
-bridge._last_alert_ts = {}
-bridge._prev_worker_states = {'bob': 'READY'}
-
-sent = []
-def fake_api(method, data):
-    sent.append(data)
-    return {'ok': True}
-
-now = time.time()
-with patch('bridge.telegram_api', fake_api):
-    # DEAD during teleport: should NOT send alert
-    bridge._handle_watchdog_transition('bob', 'DEAD', 'process gone', since=100, now=now)
-assert len(sent) == 0, f'Should suppress DEAD alert during teleport, but sent {len(sent)} messages'
-
-# Verify state was still recorded
-with bridge._watchdog_lock:
-    assert bridge._prev_worker_states.get('bob') == 'DEAD', 'State should still be tracked'
-
-# OFFLINE during teleport: should also NOT send alert
-sent.clear()
-bridge._prev_worker_states = {'bob': 'READY'}
-with patch('bridge.telegram_api', fake_api):
-    bridge._handle_watchdog_transition('bob', 'OFFLINE', 'not running', since=100, now=now)
-assert len(sent) == 0, f'Should suppress OFFLINE alert during teleport, but sent {len(sent)} messages'
-
-# Remove teleport_state — now DEAD alert should fire
-(worker_dir / 'teleport_state').unlink()
-sent.clear()
-bridge._prev_worker_states = {'bob': 'READY'}
-with patch('bridge.telegram_api', fake_api):
-    bridge._handle_watchdog_transition('bob', 'DEAD', 'process gone', since=100, now=now)
-assert len(sent) == 1, f'Should send DEAD alert without teleport_state, but sent {len(sent)} messages'
-
-bridge.SESSIONS_DIR = orig_sessions_dir
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Watchdog suppresses DEAD/OFFLINE alerts during teleport"
-    else
-        fail "Watchdog teleport suppression test failed"
-    fi
-}
 
 test_team_attention_needs_reply() {
     info "Testing _team_attention_summary uses needs reply..."
@@ -13774,8 +12614,7 @@ try:
     note = bridge.read_checkin_note()
     assert '{machine}' in note, f'note missing placeholder: {note}'
 
-    # Teleport was removed: get_worker_host is always None -> local machine.
-    assert bridge.get_worker_host('anyname') is None, 'all sessions must be local'
+    # Sessions are local by design.
     rendered = note.replace('{name}', 'localtest').replace('{machine}', 'VPS (100.125.36.102)')
     assert 'VPS' in rendered and '{machine}' not in rendered, rendered
     print('LOCAL=' + rendered)
@@ -14336,7 +13175,6 @@ run_unit_tests() {
     run_test test_idle_child_baseline
     run_test test_idle_streak_prevents_false_stuck
     run_test test_watchdog_resolved_alert
-    run_test test_handle_watchdog_transition
     run_test test_parse_at_mentions
     run_test test_format_watchdog_status
     run_test test_send_response_html_formatting
@@ -14349,54 +13187,18 @@ run_unit_tests() {
     run_test test_watchdog_waiting_input_state
     run_test test_progress_shows_activity
     run_test test_pipe_forwarding_to_codex
-    # Unit tests - Teleport SSH Foundation
+    # Unit tests - Bridge public URL
     log ""
-    log "── Teleport SSH Foundation Tests (Unit) ────────────────────────────────"
-    run_test test_remote_run_local
-    run_test test_remote_run_ssh
-    run_test test_remote_run_stdin
-    run_test test_remote_copy
-    run_test test_tmux_send_message_remote
-    run_test test_tmux_exists_remote
-    run_test test_process_inspection_remote
-    run_test test_project_slug
+    log "── Bridge Public URL Tests (Unit) ──────────────────────────────────────"
     run_test test_bridge_public_url_auto_detect
     run_test test_bridge_public_url_auto_bind
     run_test test_bridge_public_url_no_auto_bind_when_explicit
     run_test test_bridge_url_ignores_stale_localhost
     run_test test_bridge_url_ignores_stale_127
-    run_test test_bridge_url_honors_remote
-    # Unit tests - Git-Based Teleport Sync
+    # Unit tests - Watchdog resolved alerts
     log ""
-    log "── Git Sync Tests (Unit) ───────────────────────────────────────────────"
-    run_test test_ensure_bare_repo_creates_new
-    run_test test_ensure_bare_repo_idempotent
-    run_test test_bare_repo_url_for_remote
-    run_test test_export_hook_env_remaps_remote_sessions_dir
-    run_test test_export_hook_env_uses_public_url_for_remote
+    log "── Watchdog Resolved Alert Tests (Unit) ────────────────────────────────"
     run_test test_resolved_alert_cooldown
-    run_test test_is_online_teleported_checks_claude_process
-    run_test test_scan_latest_session_id_local
-    run_test test_get_claude_session_id_authoritative_overrides_stale
-    run_test test_localize_media_teleported_fetches_remote_even_when_local_exists
-    # Phase 1: Remote dispatch (host=None parameter)
-    log ""
-    log "── Remote Dispatch Tests (Phase 1) ─────────────────────────────────────"
-    run_test test_remote_dispatch_get_pane_command
-    run_test test_remote_dispatch_is_process_running
-    run_test test_remote_dispatch_is_claude_running
-    run_test test_remote_dispatch_tmux_send_escape
-    run_test test_remote_dispatch_tmux_pane_pids
-    run_test test_remote_dispatch_ps_stats
-    run_test test_remote_dispatch_capture_pane_text
-    run_test test_remote_dispatch_export_hook_env
-    run_test test_remote_dispatch_tmux_prompt_empty
-    run_test test_remote_dispatch_send_interactive_reply
-    run_test test_remote_dispatch_wait_for_restart_ready
-    run_test test_remote_dispatch_get_tmux_pane_cwd
-    # Phase 2: Call site host= propagation
-    log ""
-    log "── Call Site Host Propagation Tests (Phase 2) ──────────────────────────"
     # Unit tests - Node-derived config
     log ""
     log "── Node-Derived Config Tests (Unit) ────────────────────────────────────"
@@ -14418,7 +13220,6 @@ run_unit_tests() {
     run_test test_stale_pending_survives_for_watchdog
     run_test test_backend_file_is_canonical
     run_test test_pending_files
-    run_test test_set_pending_syncs_chat_id_to_remote
     # Unit tests - Worker Registry (persistent)
     log ""
     log "── Worker Registry Tests (Unit) ────────────────────────────────────────"
@@ -14450,8 +13251,6 @@ run_unit_tests() {
     run_test test_watchdog_alert_dead_copy
     run_test test_watchdog_alert_waiting_input_copy
     run_test test_watchdog_resolved_copy
-    run_test test_is_online_teleported_ssh_failure_assumes_online
-    run_test test_watchdog_skips_dead_alert_during_teleport
     run_test test_team_attention_needs_reply
     # Unit tests - Concurrency
     log ""
@@ -14512,6 +13311,7 @@ run_unit_tests() {
     log "── Transcript Viewer Tests (Unit) ──────────────────────────────────────"
     rm -f /tmp/transcript-cache/*.db /tmp/transcript-cache/*.db-wal /tmp/transcript-cache/*.db-shm 2>/dev/null
     run_test test_transcript_renders_html
+    run_test test_render_transcript_html_with_query_result
     run_test test_transcript_missing_session
     run_test test_transcript_with_tool_calls
     run_test test_transcript_default_last_page
