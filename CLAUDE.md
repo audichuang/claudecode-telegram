@@ -40,7 +40,13 @@ When making changes that result in a new version:
      - Architecture changes
    - Update design philosophy sections if core principles changed
 
-3. **Run acceptance tests** before committing:
+3. **Run the release gate** before committing a bump — exits non-zero on any
+   version mismatch across the three files:
+   ```bash
+   .claude/skills/bridge-ops/scripts/check-versions.sh
+   ```
+
+4. **Run acceptance tests** before committing:
    ```bash
    TELEGRAM_BOT_TOKEN='...' ./test.sh
    ```
@@ -79,6 +85,8 @@ The project is **uv-managed**. `pyproject.toml` declares deps (`markdown-it-py` 
 | `team_memory/` | `/memory` stack + search (graceful, empty until an index is built) |
 | `pyproject.toml` / `uv.lock` | uv dependency + interpreter management, ruff config |
 | `test.sh` | Automated acceptance tests |
+| `.claude/skills/bridge-ops/` | Node operations skill: `restart-node.sh` (PID-kill + setsid relaunch), `poll-forwarder.sh` (getUpdates delivery), `verify-node.sh` (health check), `check-versions.sh` (release gate). **Use these instead of hand-typed ops commands.** |
+| `.claude/skills/test-triage/` | test.sh failure triage skill: filtered repro → known-environmental list → worktree control experiment → instrumentation. **Use it before blaming any change for a red test.** |
 | `CLAUDE.md` | Project instructions + operational learnings (AGENTS.md symlink) |
 | `DOC.md` | Design philosophy, changelog |
 | `TEST.md` | Testing documentation |
@@ -236,31 +244,22 @@ SESSIONS_DIR="$HOME/.claude/telegram/sessions"
 
 ### Bridge processes MUST be setsid-detached (the 07:47 silent-death lesson)
 
-**Problem:** The dev bridge died silently twice (2026-06-10 20:21, 2026-06-11 07:47):
-last log line was a successful `POST /response`, then nothing — no shutdown banner,
-no traceback. Forensics ruled out OOM/kernel kills (journal readable & empty),
-graceful signals (SIGTERM/SIGINT print a banner since v0.4.0), the test suite
-(it only ever kills :8295/:8096), and manual kills (shell history + transcripts clean).
+**Problem:** The dev bridge died silently twice (2026-06-10/11): last log line a
+successful `POST /response`, then nothing — no banner, no traceback. Root cause:
+it was launched under an interactive host (foreground `./claudecode-telegram.sh
+run`); when that terminal/session went away, the process group got SIGHUP/SIGKILL,
+which Python dies from silently. A foreground `run` whose webhook setup fails can
+also exit after killing the old bridge, leaving the whole node dead (2026-06-12).
 
-**Root cause:** the bridge was launched under an interactive host — a foreground
-`./claudecode-telegram.sh run` whose parent was a terminal/Claude-session shell.
-When that host went away (terminal closed / session shell reclaimed), the whole
-process group got SIGHUP/SIGKILL, which Python dies from **silently** (no handler
-can run for SIGKILL; SIGHUP's default action prints nothing).
-
-**Rule:** ALWAYS launch the bridge fully detached so no host teardown can reach it:
+**Rule:** Restart nodes ONLY via the bridge-ops skill — it codifies all of this
+(PID-file kill, setsid + `</dev/null` detach so PPID=1, ss-based verification):
 ```bash
-setsid bash -c '... exec ./.venv/bin/python -u bridge.py >> "$NODE/bridge.log" 2>&1' \
-  </dev/null >/dev/null 2>&1 &
+.claude/skills/bridge-ops/scripts/restart-node.sh dev
+.claude/skills/bridge-ops/scripts/verify-node.sh dev   # read-only health check
 ```
-Verify afterwards: the bridge's PPID must be 1. Every setsid-launched restart since
-leaves a clean `Received SIGTERM` banner on shutdown — the silent-death mode is
-extinct unless someone launches it attached again.
-
-**Verifying a restart:** don't trust `curl` — the OLD bridge's graceful shutdown
-sends notifications over the network and holds the port for tens of seconds, so
-curl returns `000` while everything is fine. Poll `ss -ltnp | grep :<port>` for
-the NEW pid, then `tail bridge.log` for the startup banner.
+Verifying by hand: don't trust `curl` — the OLD bridge holds the port for tens of
+seconds during graceful shutdown (curl `000` is a false alarm). Poll
+`ss -ltnp | grep :<port>` for the NEW pid, then `tail bridge.log` for the banner.
 
 ### NEVER use pkill on multi-node setups
 
@@ -270,20 +269,17 @@ the NEW pid, then `tail bridge.log` for the startup banner.
 
 ```bash
 # WRONG - kills ALL nodes
-pkill -f cloudflared
 pkill -f bridge.py
-
 # WRONG - kills without knowing which node owns the port
 lsof -ti :8271 | xargs kill
 
-# RIGHT - use specific PID from file
+# RIGHT - PID from file, the stop command, or the bridge-ops scripts
 kill $(cat ~/.claude/telegram/nodes/prod/pid)
-
-# RIGHT - use the script's stop command
 ./claudecode-telegram.sh --node prod stop
+.claude/skills/bridge-ops/scripts/restart-node.sh dev
 ```
 
-**Why this matters:** Production runs multiple nodes (prod, dev, test) simultaneously. Pattern-based killing causes collateral damage to other running nodes.
+**Why this matters:** Multiple nodes (prod, dev, test) run simultaneously. Pattern-based killing causes collateral damage. The dev poll forwarder is an independent PPID-1 process — never kill it as a side effect; it auto-resumes delivery after bridge restarts.
 
 ### Verify port ownership before killing
 
@@ -297,40 +293,31 @@ kill $(cat ~/.claude/telegram/nodes/prod/pid)
 | 8272 | dev | `--no-sandbox` |
 | 8295 | test (test.sh) | `--no-sandbox` |
 
-Ports are dynamic — **the defaults lie in practice** (e.g. this Linux box runs
-the dev node on **8270**). Always check the live owner first:
+Ports are dynamic — **the defaults lie in practice** (this Linux box runs the dev
+node on **8270**, test on 8295). Always check the live owner before anything
+destructive:
 ```bash
-ss -ltnp | grep ':82'           # who actually listens, with PID
-cat ~/.claude/telegram/nodes/*/port 2>/dev/null   # if port files exist
+ss -ltnp | grep ':82'                             # who actually listens, with PID
+cat ~/.claude/telegram/nodes/*/port 2>/dev/null   # recorded assignments
 ```
 
 **Why `--no-sandbox` for prod/dev/test?** Docker overhead is too slow. Sandbox node is for untrusted/experimental code.
-
-**Rule:** Before killing any port, verify which node owns it:
-```bash
-# Check what's running on a port BEFORE killing
-cat ~/.claude/telegram/nodes/*/port  # See actual port assignments
-
-# Or check specific node
-cat ~/.claude/telegram/nodes/prod/port
-```
-
-**Why:** Ports can be overridden, so never assume a port belongs to a specific node. Always verify before destructive operations.
 
 ### Node credentials live in ~/.config/claudecode-telegram/
 
 **Problem:** During a prod restart, wasted time extracting the bot token from `/proc/<pid>/environ` when it was already stored in a config file.
 
-**Rule:** Token env files are at `~/.config/claudecode-telegram/<node>.env`. Use them for restarts:
-```bash
-# Load token and restart prod
-source ~/.config/claudecode-telegram/prod.env
-TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" ./claudecode-telegram.sh --node prod --no-sandbox run
-```
+**Rule:** Token env files are at `~/.config/claudecode-telegram/<node>.env` —
+one file per node on that machine (this Linux box has `dev.env` and `test.env`;
+a machine hosting prod has `prod.env`). The bridge-ops scripts load them
+automatically; `test.sh` credentials come from `test.env`
+(`TELEGRAM_BOT_TOKEN` + `TEST_CHAT_ID`).
 
-The pattern is `~/.config/claudecode-telegram/<node>.env` — one file per node
-that runs on that machine (this Linux box currently has only `dev.env`; a
-machine hosting prod has `prod.env`, etc.).
+**The `set -a` trap:** these files are plain `VAR=value` with **no `export`** —
+a bare `source` sets shell-local vars that die at the next `exec` boundary (the
+bridge exits instantly with "TELEGRAM_BOT_TOKEN not set"). Anything sourcing
+them across an exec must wrap: `set -a; source "$ENV_FILE"; set +a`.
+Regression-tested by `test_restart_node_env_propagation`.
 
 **Why:** Faster, more reliable than extracting from running process memory. Works even if the bridge is already dead.
 
@@ -353,6 +340,76 @@ machine hosting prod has `prod.env`, etc.).
 **Fix:** Per-session locks in `tmux_send_message()` serialize sends to same session.
 
 **Why:** Two subprocess calls (`send-keys -l text`, `send-keys Enter`) are not atomic. Without locking, concurrent sends to the same session corrupt each other.
+
+### A pane shell's rc can eat or bury the launch line — never blind-sleep before send-keys
+
+**Problem:** Three sibling incidents (2026-06-12, v1.1.1–v1.1.2): fish couldn't
+parse the bash-syntax launch line (`unset: command not found` — claude dead at
+birth); a slow zsh rc was still consuming stdin when the keystrokes arrived and
+ate the whole line; an rc that prints, goes quiet, *then* `read`s stdin fools
+any "is the prompt up yet" heuristic.
+
+**Rule — the launch path has three layers, keep all of them:**
+1. `make_pane_start_cmd()` wraps every sh-ism in `sh -c '...'` so ANY pane shell
+   (bash/zsh/fish) can run the line.
+2. `wait_for_pane_shell_ready()` gates the first keystroke on pane-content
+   stability (10s cap, fail-open) — used by create AND revive. Never replace it
+   with a blind `time.sleep()`.
+3. `send_pane_start_cmd()` confirms via a sentinel touched right before `exec`,
+   resending (max 2) only if the line was genuinely eaten. The confirmation
+   window (`PANE_LAUNCH_CONFIRM_SECS`, default 20s) must outlast slow rc tails:
+   while an rc runs, an *eaten* send and a *buffered* send are indistinguishable
+   from outside, so TIME is the only safe discriminator — resending too early
+   injects a junk copy into the freshly-started backend.
+
+Regression tests: `test_pane_start_cmd_runs_in_real_shell_panes` (real bash/zsh/
+fish panes), `..._survives_stdin_eating_rc`, `..._no_resend_into_running_backend`
+(rerun with `PANE_LAUNCH_CONFIRM_SECS=8` to reproduce the old red).
+
+### test.sh landmines (all stepped on for real)
+
+**`set -e` kills the suite silently.** A bare `((x++))` returns 1 when x was 0;
+a function whose last line is `cond && action` returns 1 when cond is false —
+either aborts the whole run mid-suite. Write `((x++)) || true` and end branches
+explicitly. `run_test` wraps each test, but helpers called OUTSIDE it are exposed.
+
+**Never shadow the global counters.** `success()`/`fail()` increment globals
+named `passed`/`failed`/`tests_run`. A `local failed=0` in a test silently
+swallows the suite-level failure count (bash dynamic scoping). Pick other names.
+
+**Fake `subprocess.run` makes `tmux_exists` lie.** A python mock that returns
+rc=0 for everything makes `create_session` bail early with "Worker already
+exists" — monkeypatch `bridge.tmux_exists = lambda *a: False` alongside. And per
+the monkeypatch iron rule: patch bridge module attributes (`bridge.X = ...`),
+never rebind imported copies.
+
+**Opaque failures: instrument, don't guess.** Tests suppress stderr
+(`2>/dev/null`) and `cleanup()` deletes `$BRIDGE_LOG` on exit, so a failing
+integration test leaves no evidence. Temporarily patch the test's redirect to
+`2>/tmp/dbg.err | tee /tmp/dbg.out`, and side-copy the bridge log while the run
+is live (`for i in $(seq 1 120); do cp $BRIDGE_LOG /tmp/snap.log; sleep 0.5; done`
+in parallel). Revert the patch after (`git checkout -- test.sh`).
+
+**Time-window tests must prove they reach the branch under test.** A no-resend
+test whose rc slept 6s against an 8s confirmation window never reached the
+resend decision — green and worthless. Make the timings force the branch, and
+keep a knob (`PANE_LAUNCH_CONFIRM_SECS=8`) that reproduces the old red.
+
+### Known environmental flaky tests on this Linux box
+
+**Problem:** Two tests fail on this box regardless of code version — re-triaging
+them on every suite run wastes hours.
+
+**Known list (verified against baseline/HEAD~1 worktree controls, 2026-06-12):**
+- `Concurrent sends` (flock interleaving test): 0/25 delivered, fails even on
+  known-good commits.
+- `test_send_to_session_integration`: `/cd` fails to create tmain in the test
+  bridge; fails identically on v1.1.1 and v1.1.2.
+
+**Rule:** Before blaming a change for a suite failure, run the SAME filtered test
+on the previous commit via a scratch worktree (`git worktree add /tmp/wt HEAD~1`,
+symlink `.venv`, run, remove). Identical failure ⇒ environmental, proceed;
+update this list when entries are fixed or new ones are proven.
 
 ### macOS vs Linux shell compatibility
 
@@ -402,41 +459,22 @@ BRIDGE_PORT="__NODE_PORT__"
 
 *(Examples below are from the deleted multi-worker era — the principle is unchanged.)*
 
-**Problem:** Tests verified structure (functions exist, HTTP returns OK) but not actual behavior. A non-interactive worker subprocess was dying immediately, but tests passed because they only checked:
-- `test_bridge_starts` → bridge starts
-- `test_hire_command` → HTTP returns "OK"
-- `test_send_to_worker_function_exists` → functions exist
+**Problem:** Tests verified structure (functions exist, HTTP returns OK) while a
+worker subprocess was dying immediately — every check passed, the feature was
+broken. Repeated in v1.1.1: a string-shape assertion on the launch line passed
+while zsh panes killed claude at birth; only a real-pane behavior test caught it.
 
-None of these verified that the worker actually stayed running or could receive messages.
-
-**Rule:** Tests must verify the actual behavior users care about, not just that code structure exists.
+**Rule:** Tests must verify the behavior users care about, not that code exists.
 
 ```bash
-# BAD - tests scaffolding
-test_bridge_starts() {
-    curl -s /health >/dev/null  # 200 OK, but doesn't prove workers run
-}
+# BAD - scaffolding: returns OK but the worker may already be dead
+test_hire_command() { [[ $(curl -s /hire) == "OK" ]]; }
 
-test_hire_command() {
-    [[ $(curl -s /hire) == "OK" ]]  # Returns OK but worker may have died!
-}
-
-test_send_to_worker_function_exists() {
-    python3 -c "from bridge import send_to_worker; assert callable(send_to_worker)"
-}
-
-# GOOD - tests behavior
-test_tmux_mode_session_stays_alive() {
-    curl -s /hire  # Create worker
-    sleep 3        # Wait a bit
-    # Verify worker/session is STILL running, not just that it started
+# GOOD - behavior: the session is STILL alive after creation
+test_session_stays_alive() {
+    curl -s /hire; sleep 3
     tmux has-session -t claude-test-worker
-}
-
-test_worker_to_worker_pipe() {
-    # Verify inter-worker pipe messages are delivered end-to-end
-    assert_no_log "Cannot forward pipe message"
 }
 ```
 
-**Why this matters:** When tests pass but features are broken, you waste time debugging and lose trust in the test suite. Behavior tests catch real bugs; scaffolding tests give false confidence.
+**Why this matters:** When tests pass but features are broken, you lose trust in the suite. Behavior tests catch real bugs; scaffolding tests give false confidence. Also give new tests a sensitivity proof: show the exact command that makes them red (a config knob, a reverted fix) — a test that can't go red proves nothing.

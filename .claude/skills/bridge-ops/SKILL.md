@@ -51,6 +51,12 @@ idempotent, and logs to `<node_dir>/poll-fallback.log`. Prefer it over the
 launcher's tunnel+webhook mode for dev — trycloudflare DNS propagation has
 failed a launch and left the whole node dead (2026-06-12).
 
+Swapping forwarders (kill old PID → start new) prints `HTTP Error 409: Conflict`
+for up to ~30s: Telegram still holds the dead process's getUpdates long-poll and
+allows only one consumer. This is transient — wait it out; do NOT start more
+forwarders or delete the webhook again. Updates queue server-side meanwhile
+(nothing is lost). Quiet log for 30s+ = the new forwarder holds the slot.
+
 ## Verify health (read-only, safe anytime)
 
 ```bash
