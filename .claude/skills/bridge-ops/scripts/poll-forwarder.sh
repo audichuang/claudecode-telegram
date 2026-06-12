@@ -27,26 +27,35 @@ if pgrep -af "getUpdates.*localhost:$PORT" >/dev/null 2>&1; then
   exit 0
 fi
 
+# Telegram API base is overridable so tests can point at a fake server.
+API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
+
 # getUpdates conflicts with an active webhook — clear it first.
 set -a; source "$ENV_FILE"; set +a
-curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/deleteWebhook" >/dev/null || true
+curl -s "$API_BASE/bot$TELEGRAM_BOT_TOKEN/deleteWebhook" >/dev/null || true
 
 setsid bash -c "
   set -a; source '$ENV_FILE'; set +a
+  export TELEGRAM_API_BASE='$API_BASE'
   exec '$PY' -u -c '
 import os, time, json, urllib.request
 token = os.environ[\"TELEGRAM_BOT_TOKEN\"]
+api_base = os.environ.get(\"TELEGRAM_API_BASE\", \"https://api.telegram.org\")
 bridge = \"http://localhost:$PORT\"  # getUpdates -> localhost:$PORT forwarder
 offset = 0
 print(\"Poll forwarder started (bridge=\" + bridge + \")\", flush=True)
 while True:
     try:
-        url = f\"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=30\"
+        url = f\"{api_base}/bot{token}/getUpdates?offset={offset}&timeout=30\"
         with urllib.request.urlopen(urllib.request.Request(url), timeout=35) as resp:
             data = json.loads(resp.read())
         if not data.get(\"ok\"):
             time.sleep(1)
             continue
+        # Forward each update IN ORDER. Only advance the offset past an update
+        # AFTER the bridge has accepted it — a failed POST must NOT lose the
+        # update. On failure we sleep and re-poll the SAME offset (natural
+        # redelivery), so the update is retried until it lands.
         for update in data.get(\"result\", []):
             uid = update[\"update_id\"]
             try:
@@ -55,8 +64,15 @@ while True:
                     headers={\"Content-Type\": \"application/json\"}, method=\"POST\")
                 urllib.request.urlopen(req, timeout=5)
             except Exception as e:
-                print(f\"Forward failed {uid}: {e}\", flush=True)
-            offset = uid + 1
+                print(f\"Forward failed {uid}: {e} — will retry same offset\", flush=True)
+                break  # do NOT advance offset; re-poll this update next loop
+            offset = uid + 1  # only reached on a successful POST
+        else:
+            # for-else: ran to completion with no break (all delivered, or
+            # empty batch). Nothing to do; loop polls the advanced offset.
+            continue
+        # We broke out on a failed POST — back off briefly, then re-poll.
+        time.sleep(1)
     except Exception as e:
         print(f\"Poll error: {e}\", flush=True)
         time.sleep(2)

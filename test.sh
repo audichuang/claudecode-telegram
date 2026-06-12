@@ -529,6 +529,180 @@ test_pane_start_cmd_runs_in_real_shell_panes() {
     fi
 }
 
+test_pane_start_cmd_survives_stdin_eating_rc() {
+    info "Testing launch line survives an rc that goes quiet then reads stdin..."
+
+    # The readiness heuristic's fatal blind spot: an rc that prints, falls
+    # silent >0.6s, THEN reads stdin (echo boot; sleep 1; read x) makes
+    # wait_for_pane_shell_ready declare "ready" too early — the first send is
+    # eaten by the rc's `read`. No amount of waiting can "see" a future read;
+    # only a post-send confirmation + bounded resend recovers. This test
+    # drives the REAL launch path (send_pane_start_cmd) and asserts the marker
+    # exists — i.e. the backend launched DESPITE the rc eating a send. The
+    # swallow file is a sensitivity guard: it MUST capture the eaten send, or
+    # the rc never actually fooled the heuristic and the test proves nothing.
+    local sh
+    sh=$(command -v bash 2>/dev/null || true)
+    if [[ -z "$sh" ]]; then
+        success "stdin-eating-rc test skipped (bash not installed)"
+        return
+    fi
+
+    local sess rcfile swallow marker
+    sess="${TMUX_PREFIX}stdineat-$$"
+    rcfile="/tmp/claudecode-telegram-test-rc-$$"
+    swallow="/tmp/claudecode-telegram-test-swallow-$$"
+    marker="/tmp/claudecode-telegram-test-stdineat-marker-$$"
+    rm -f "$rcfile" "$swallow" "$marker"
+
+    # rc that prints, goes quiet long enough to trip the "stable" heuristic,
+    # then eats one line of stdin into the swallow file.
+    cat > "$rcfile" <<RCEOF
+echo boot
+sleep 1
+read -t 2 SWALLOWED
+printf '%s' "\$SWALLOWED" > $swallow
+RCEOF
+
+    tmux kill-session -t "$sess" 2>/dev/null || true
+    tmux new-session -d -s "$sess" "$sh --rcfile $rcfile -i" 2>/dev/null || true
+
+    # Real launch semantics: wait via the heuristic, then send the start cmd
+    # through bridge's launch path (same shape as the real-panes test).
+    # Compress the confirmation window: this rc is DONE by ~3s (read times
+    # out), so a 3s window reaches the eaten-line resend fast without
+    # reopening the buffered race (nothing stays buffered once the rc exited).
+    python3 -c "
+import bridge
+bridge.PANE_LAUNCH_CONFIRM_SECS = 3
+bridge.wait_for_pane_shell_ready('$sess')
+bridge.send_pane_start_cmd('$sess', 'touch $marker', '/tmp')
+" 2>&1
+
+    local ok i
+    ok=false
+    for i in $(seq 1 200); do
+        if [[ -e "$marker" ]]; then
+            ok=true
+            break
+        fi
+        sleep 0.05
+    done
+
+    # Sensitivity guard: the rc's `read` must have actually eaten a send,
+    # otherwise the heuristic was never fooled and the test is a no-op.
+    local fooled=""
+    if [[ -e "$swallow" && -s "$swallow" ]] && grep -q "touch $marker" "$swallow" 2>/dev/null; then
+        fooled="yes"
+    fi
+
+    tmux kill-session -t "$sess" 2>/dev/null || true
+    rm -f "$rcfile" "$swallow" "$marker"
+
+    if [[ "$ok" == "true" && -n "$fooled" ]]; then
+        success "launch line survived stdin-eating rc (eaten once, resent, marker ran)"
+    elif [[ "$ok" != "true" ]]; then
+        fail "launch line never ran against stdin-eating rc (marker missing — no resend recovery)"
+    else
+        fail "rc never ate a send — heuristic not exercised, test proves nothing"
+    fi
+}
+
+test_pane_start_cmd_no_resend_into_running_backend() {
+    info "Testing resend is suppressed once the backend is already running..."
+
+    # The buffered-input race: a bash-family rc that prints, goes quiet
+    # (tripping wait_for_pane_shell_ready), but does NOT read stdin until well
+    # past the confirmation window. send #1 sits BUFFERED in the pty (not
+    # eaten); a too-short window expires; old code blindly resent. When the rc
+    # finally ends, line 1 execs the backend and the buffered line 2 + Enter is
+    # delivered into the freshly started backend's stdin as a junk prompt line.
+    #
+    # The defense is TIME: PANE_LAUNCH_CONFIRM_SECS (default 20s) outlasts the
+    # rc tail, so the sentinel appears before any resend decision. This test
+    # uses an rc that sleeps 12s — longer than the OLD 8s window (red on old
+    # code: junk gets the resent line), shorter than the 20s default (green
+    # now: no resend at all). The launched "backend" execs `cat >> $junk`
+    # (long-lived, reads stdin) and the junk file must never receive a line.
+    # the marker proves the backend launched at all; if junk got the line the
+    # OLD code's bug is reproduced and the test fails.
+    local sh
+    sh=$(command -v bash 2>/dev/null || true)
+    if [[ -z "$sh" ]]; then
+        success "no-resend-into-running-backend test skipped (bash not installed)"
+        return
+    fi
+
+    local sess rcfile marker junk backend
+    sess="${TMUX_PREFIX}noresend-$$"
+    rcfile="/tmp/claudecode-telegram-test-nr-rc-$$"
+    marker="/tmp/claudecode-telegram-test-nr-marker-$$"
+    junk="/tmp/claudecode-telegram-test-nr-junk-$$"
+    backend="/tmp/claudecode-telegram-test-nr-backend-$$.sh"
+    rm -f "$rcfile" "$marker" "$junk" "$backend"
+
+    # Long-lived "backend": records that it launched, then reads stdin forever.
+    # Any buffered resend line lands here.
+    cat > "$backend" <<BKEOF
+#!/usr/bin/env bash
+echo launched >> $marker
+exec cat >> $junk
+BKEOF
+    chmod +x "$backend"
+
+    # rc that prints, goes quiet long enough to trip "stable", then sleeps 12s
+    # WITHOUT reading stdin — past the OLD 8s window (send #1 buffers, window
+    # expires, old code resends → junk), within the 20s default (sentinel
+    # appears at ~12s, no resend ever fires).
+    cat > "$rcfile" <<RCEOF
+echo boot
+sleep 12
+RCEOF
+
+    tmux kill-session -t "$sess" 2>/dev/null || true
+    tmux new-session -d -s "$sess" "$sh --rcfile $rcfile -i" 2>/dev/null || true
+
+    # Default confirmation window (20s) on purpose — the property under test
+    # is that it outlasts this rc's 12s tail so no resend ever fires. To see
+    # the old bug, rerun with PANE_LAUNCH_CONFIRM_SECS=8 (red: junk polluted).
+    python3 -c "
+import bridge
+bridge.wait_for_pane_shell_ready('$sess')
+bridge.send_pane_start_cmd('$sess', '$backend', '/tmp')
+" 2>&1
+
+    # Wait for the backend to actually launch (rc sleeps 12s; the python call
+    # above blocks until the sentinel lands, so this resolves fast after it).
+    local ok i
+    ok=false
+    for i in $(seq 1 300); do
+        if [[ -e "$marker" ]]; then
+            ok=true
+            break
+        fi
+        sleep 0.1
+    done
+
+    # Give any stray buffered resend a moment to land in the backend's stdin.
+    for i in $(seq 1 20); do sleep 0.1; done
+
+    local leaked=""
+    if [[ -e "$junk" && -s "$junk" ]]; then
+        leaked="yes"
+    fi
+
+    tmux kill-session -t "$sess" 2>/dev/null || true
+    rm -f "$rcfile" "$marker" "$junk" "$backend"
+
+    if [[ "$ok" != "true" ]]; then
+        fail "backend never launched (marker missing) — test setup broken"
+    elif [[ -n "$leaked" ]]; then
+        fail "resend leaked a junk line into the running backend's stdin (buffered-input race not guarded)"
+    else
+        success "no resend into an already-running backend (buffered-input race guarded)"
+    fi
+}
+
 test_topic_session_identity() {
     info "Testing topic-session identity helpers..."
     if python3 -c "
@@ -9469,6 +9643,166 @@ print('OK')
     fi
 }
 
+test_revive_waits_for_pane_shell_ready() {
+    info "Testing dead-worker revive gates the launch line on pane shell readiness..."
+    # Increment A: _restart_dead_worker's fresh pane must wait_for_pane_shell_ready
+    # BEFORE sending the launch line, exactly like create_session — else a slow
+    # zsh/fish rc swallows the launch line and claude never starts.
+    if python3 -c "
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+import bridge
+
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp
+bridge.session_manager.sessions_dir = tmp
+bridge.SANDBOX_ENABLED = False
+
+events = []
+
+class FakeProc:
+    def __init__(self):
+        self.returncode = 0
+        self.stdout = ''
+
+def fake_run(args, *a, **k):
+    if isinstance(args, (list, tuple)) and 'send-keys' in args:
+        events.append(('send', list(args)))
+    elif isinstance(args, (list, tuple)) and 'new-session' in args:
+        events.append(('new-session', list(args)))
+    return FakeProc()
+
+bridge.subprocess.run = fake_run
+bridge.wait_for_pane_shell_ready = lambda *a, **k: events.append(('wait',) + a) or True
+bridge.time.sleep = lambda *a, **k: None
+bridge.export_hook_env = lambda *a, **k: None
+bridge.ensure_session_dir = lambda *a, **k: None
+bridge.save_claude_session_cwd = lambda *a, **k: None
+bridge._which_binary = lambda b: '/usr/bin/' + b
+bridge.session_manager._get_startup_cwd = lambda name, fallback_cwd='': ''
+bridge.session_manager.send = lambda *a, **k: None
+bridge.session_manager._build_welcome = lambda *a, **k: 'hi'
+
+backend = SimpleNamespace(binary='claude', start_cmd=lambda resume_id='': 'claude')
+ok, err = bridge.session_manager._restart_dead_worker('rev1', 'claude', backend, 'claude-test-rev1', 'relaunch')
+assert ok, ('revive should succeed', err)
+
+kinds = [e[0] for e in events]
+assert 'wait' in kinds, ('revive never called wait_for_pane_shell_ready', kinds)
+# Find the launch-line send (the sh -c ... wrapper) and assert wait precedes it.
+launch_idx = None
+for i, e in enumerate(events):
+    if e[0] == 'send' and any('sh -c' in str(p) for p in e[1]):
+        launch_idx = i
+        break
+assert launch_idx is not None, ('no launch-line send found', events)
+wait_idx = kinds.index('wait')
+assert wait_idx < launch_idx, ('wait must precede launch line', kinds)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "revive gates launch line on pane shell readiness"
+    else
+        fail "revive does not wait for pane shell readiness before launching"
+    fi
+}
+
+test_wait_for_pane_shell_ready_paths() {
+    info "Testing wait_for_pane_shell_ready True/False paths against real panes..."
+    # Increment B part 1: a nonexistent pane returns False after ~timeout
+    # (never hangs); a real ready bash pane returns True.
+    if python3 -c "
+import time
+import bridge
+
+# False path: pane does not exist -> capture-pane keeps failing -> times out.
+t0 = time.time()
+got = bridge.wait_for_pane_shell_ready('claude-test-nonexistent-pane-xyz', timeout=0.6)
+elapsed = time.time() - t0
+assert got is False, ('nonexistent pane must return False', got)
+assert 0.5 <= elapsed < 3.0, ('should consume ~timeout, not hang or return instantly', elapsed)
+print('FALSE-OK')
+" 2>/dev/null | grep -q "FALSE-OK"; then
+        local false_ok=1
+    else
+        local false_ok=0
+    fi
+
+    # True path: spin up a real bash pane and wait for it to settle.
+    local sess="${TMUX_PREFIX}waitready-$$"
+    tmux kill-session -t "$sess" 2>/dev/null || true
+    tmux new-session -d -s "$sess" "$(command -v bash)" 2>/dev/null || true
+    local true_ok=0
+    if python3 -c "
+import bridge
+assert bridge.wait_for_pane_shell_ready('$sess', timeout=10.0) is True
+print('TRUE-OK')
+" 2>/dev/null | grep -q "TRUE-OK"; then
+        true_ok=1
+    fi
+    tmux kill-session -t "$sess" 2>/dev/null || true
+
+    if [[ "$false_ok" == "1" && "$true_ok" == "1" ]]; then
+        success "wait_for_pane_shell_ready: False on missing pane (~timeout), True on ready pane"
+    else
+        fail "wait_for_pane_shell_ready paths failed (false_ok=$false_ok true_ok=$true_ok)"
+    fi
+}
+
+test_create_fail_open_when_wait_returns_false() {
+    info "Testing create_session still launches when readiness wait fails open..."
+    # Increment B part 2: a pathological rc can only DELAY the launch (wait
+    # returns False) — it must never BLOCK it. The launch line must still send.
+    if python3 -c "
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+import bridge
+
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp
+bridge.session_manager.sessions_dir = tmp
+bridge.SANDBOX_ENABLED = False
+
+sends = []
+
+class FakeProc:
+    def __init__(self):
+        self.returncode = 0
+        self.stdout = ''
+
+def fake_run(args, *a, **k):
+    if isinstance(args, (list, tuple)) and 'send-keys' in args:
+        sends.append(list(args))
+    return FakeProc()
+
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a, **k: False
+# Readiness gate fails open (False) — must not stop the launch line.
+bridge.wait_for_pane_shell_ready = lambda *a, **k: False
+bridge.time.sleep = lambda *a, **k: None
+bridge.export_hook_env = lambda *a, **k: None
+bridge.ensure_session_dir = lambda *a, **k: None
+bridge.save_claude_session_cwd = lambda *a, **k: None
+bridge._which_binary = lambda b: '/usr/bin/' + b
+bridge._capture_pane_text = lambda *a, **k: ''
+bridge.session_manager._get_startup_cwd = lambda name, **k: ''
+bridge.session_manager.register_worker = lambda *a, **k: None
+bridge.session_manager.send = lambda *a, **k: None
+bridge.session_manager._build_welcome = lambda *a, **k: 'hi'
+
+ok, err = bridge.create_session('foff1')
+assert ok, ('create should succeed even when wait fails open', err)
+launch = [s for s in sends if any('sh -c' in str(p) for p in s)]
+assert launch, ('launch line must still be sent when wait returns False', sends)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "create_session fails open: launch line sent even when readiness wait is False"
+    else
+        fail "create_session blocked launch when readiness wait returned False"
+    fi
+}
+
 test_end_removes_from_registry() {
     info "Testing /end removes worker from registry..."
 
@@ -10692,6 +11026,306 @@ print('OK')
 }
 
 # ============================================================
+# bridge-ops scripts: poll-forwarder.sh + restart-node.sh
+# ============================================================
+
+# Pick a free high port (Linux+macOS portable — uses python, not /dev/tcp).
+_pick_free_port() {
+    python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
+}
+
+# Increment A: poll-forwarder must NOT advance offset on a failed POST.
+# A failed forward that still bumps offset silently drops the update forever.
+test_poll_forwarder_retries_failed_post() {
+    info "Testing poll-forwarder offset survives bridge POST failures..."
+
+    local repo="$SCRIPT_DIR"
+    local fwd="$repo/.claude/skills/bridge-ops/scripts/poll-forwarder.sh"
+    [[ -x "$fwd" ]] || { fail "poll-forwarder.sh not found at $fwd"; return 1; }
+
+    local tmphome; tmphome="$(mktemp -d)"
+    local node="pfa"
+    local api_port bridge_port
+    api_port="$(_pick_free_port)"
+    bridge_port="$(_pick_free_port)"
+
+    # Fake Telegram API (records offsets seen, returns ONE update until acked)
+    # + fake bridge (rejects the first 2 POSTs, then accepts and records).
+    local statedir="$tmphome/state"
+    mkdir -p "$statedir"
+    local fake_py="$tmphome/fake.py"
+    cat > "$fake_py" <<PYEOF
+import json, os, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATE = "$statedir"
+TARGET_UID = 4242
+
+def _rec(name, val):
+    with open(os.path.join(STATE, name), "a") as f:
+        f.write(str(val) + "\n")
+
+class Api(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _json(self, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(200); self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers()
+        self.wfile.write(b)
+    def do_GET(self):
+        if "deleteWebhook" in self.path:
+            return self._json({"ok": True, "result": True})
+        if "getUpdates" in self.path:
+            # parse offset
+            offset = 0
+            if "offset=" in self.path:
+                try: offset = int(self.path.split("offset=")[1].split("&")[0])
+                except Exception: offset = 0
+            _rec("offsets_seen", offset)
+            # update considered acked once offset moves past TARGET_UID
+            acked = os.path.exists(os.path.join(STATE, "acked"))
+            if not acked and offset <= TARGET_UID:
+                return self._json({"ok": True, "result": [
+                    {"update_id": TARGET_UID,
+                     "message": {"message_id": 1, "date": 0,
+                                 "chat": {"id": 1, "type": "private"},
+                                 "from": {"id": 1, "first_name": "x"},
+                                 "text": "hi"}}]})
+            if offset > TARGET_UID:
+                open(os.path.join(STATE, "acked"), "w").close()
+            return self._json({"ok": True, "result": []})
+        self._json({"ok": True, "result": []})
+
+class Bridge(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        # count attempts; fail first 2
+        ap = os.path.join(STATE, "bridge_attempts")
+        cnt = 0
+        if os.path.exists(ap):
+            cnt = int(open(ap).read() or "0")
+        cnt += 1
+        open(ap, "w").write(str(cnt))
+        if cnt <= 2:
+            self.send_response(500); self.end_headers()
+            return
+        try:
+            upd = json.loads(n)
+            _rec("bridge_received", upd.get("update_id"))
+        except Exception:
+            _rec("bridge_received", "parse-error")
+        self.send_response(200); self.end_headers()
+
+a = ThreadingHTTPServer(("127.0.0.1", $api_port), Api)
+b = ThreadingHTTPServer(("127.0.0.1", $bridge_port), Bridge)
+threading.Thread(target=a.serve_forever, daemon=True).start()
+b.serve_forever()
+PYEOF
+
+    python3 -u "$fake_py" >"$tmphome/fake.log" 2>&1 &
+    local fake_pid=$!
+    wait_for_port "$api_port" >/dev/null 2>&1 || true
+    wait_for_port "$bridge_port" >/dev/null 2>&1 || true
+
+    # Node env + dirs under the isolated HOME.
+    mkdir -p "$tmphome/.config/claudecode-telegram"
+    printf 'TELEGRAM_BOT_TOKEN=fake-token-123\n' > "$tmphome/.config/claudecode-telegram/$node.env"
+    mkdir -p "$tmphome/.claude/telegram/nodes/$node"
+
+    # Run the forwarder pointed at the fakes. PORT controls the bridge URL,
+    # TELEGRAM_API_BASE controls the Telegram side.
+    HOME="$tmphome" PORT="$bridge_port" TELEGRAM_API_BASE="http://127.0.0.1:$api_port" \
+        "$fwd" "$node" >"$tmphome/fwd.log" 2>&1 || true
+
+    # Capture the forwarder PID it recorded so we can kill ONLY it.
+    local fwd_pid=""
+    [[ -f "$tmphome/.claude/telegram/nodes/$node/poller.pid" ]] && \
+        fwd_pid="$(cat "$tmphome/.claude/telegram/nodes/$node/poller.pid")"
+
+    # Give it time to: fail twice, retry, succeed.
+    local attempts=0 got=""
+    while [[ $attempts -lt 80 ]]; do
+        if [[ -f "$statedir/bridge_received" ]] && grep -q "4242" "$statedir/bridge_received" 2>/dev/null; then
+            got="yes"; break
+        fi
+        sleep 0.1
+        ((attempts++)) || true
+    done
+
+    # Kill ONLY the forwarder + its python child, then the fake server.
+    if [[ -n "$fwd_pid" ]]; then
+        pkill -P "$fwd_pid" 2>/dev/null || true
+        kill "$fwd_pid" 2>/dev/null || true
+    fi
+    kill "$fake_pid" 2>/dev/null || true
+
+    if [[ "$got" == "yes" ]]; then
+        success "Failed POST retried — bridge eventually received update 4242"
+    else
+        fail "Update 4242 never reached the bridge (offset advanced past a failed POST)"
+    fi
+
+    # The offset must NOT have advanced to 4243 until AFTER a successful POST.
+    # If it did while POSTs were still failing, the update would be lost.
+    # We assert the bridge got it AND that offset 4243 was eventually seen
+    # (proving advance happened only post-success).
+    if [[ -f "$statedir/offsets_seen" ]] && grep -q "^4243$" "$statedir/offsets_seen" 2>/dev/null; then
+        success "Offset advanced to 4243 only after successful delivery"
+    elif [[ "$got" == "yes" ]]; then
+        # Delivered but the next poll wasn't observed yet — acceptable.
+        success "Offset advance is gated on delivery (4243 not yet polled)"
+    else
+        fail "Offset behaviour wrong — update lost"
+    fi
+
+    rm -rf "$tmphome"
+}
+
+# Increment B: a second forwarder for the same bot must refuse to start.
+test_poll_forwarder_idempotent() {
+    info "Testing poll-forwarder idempotency (no double-run)..."
+
+    local repo="$SCRIPT_DIR"
+    local fwd="$repo/.claude/skills/bridge-ops/scripts/poll-forwarder.sh"
+    [[ -x "$fwd" ]] || { fail "poll-forwarder.sh not found"; return 1; }
+
+    local tmphome; tmphome="$(mktemp -d)"
+    local node="pfb"
+    local guard_port; guard_port="$(_pick_free_port)"
+
+    mkdir -p "$tmphome/.config/claudecode-telegram"
+    printf 'TELEGRAM_BOT_TOKEN=fake-token-123\n' > "$tmphome/.config/claudecode-telegram/$node.env"
+    mkdir -p "$tmphome/.claude/telegram/nodes/$node"
+
+    # Dummy process whose argv matches the pgrep guard:
+    #   "getUpdates.*localhost:$PORT"
+    python3 -c "import sys,time
+sys.argv[0] = 'getUpdates localhost:$guard_port (fake forwarder)'
+time.sleep(60)" "getUpdates localhost:$guard_port" &
+    local dummy_pid=$!
+    # The guard greps the full cmdline; ensure the arg is in argv regardless.
+    local before
+    before="$(pgrep -af "getUpdates.*localhost:$guard_port" | grep -vc "^$$" || true)"
+
+    local out
+    out="$(HOME="$tmphome" PORT="$guard_port" TELEGRAM_API_BASE="http://127.0.0.1:1" \
+        "$fwd" "$node" 2>&1)"
+    local rc=$?
+
+    # No second forwarder should have appeared.
+    local after
+    after="$(pgrep -af "getUpdates.*localhost:$guard_port" | wc -l | tr -d ' ')"
+
+    kill "$dummy_pid" 2>/dev/null || true
+
+    if echo "$out" | grep -qi "already running"; then
+        success "Forwarder refused to start a second instance"
+    else
+        fail "Forwarder did not detect the running instance: $out"
+    fi
+    if [[ "$rc" == "0" ]]; then
+        success "Forwarder exited 0 on idempotent no-op"
+    else
+        fail "Forwarder exited $rc (expected 0)"
+    fi
+
+    rm -rf "$tmphome"
+}
+
+# Increment C: restart-node.sh must propagate the (export-less) env token
+# through the setsid/exec boundary, or the bridge dies for lack of a token.
+test_restart_node_env_propagation() {
+    info "Testing restart-node.sh env propagation to the bridge..."
+
+    require_token
+
+    # restart-node.sh / verify-node.sh are ss-based (ss -ltnp, grep -oP) and so
+    # is this test's own pid poll — all Linux-only. On macOS (the primary target
+    # platform) ss is absent, so the script under test cannot even verify itself
+    # and our poll would never find new_pid → guaranteed false failure + an
+    # orphaned bridge (restart-node only writes bridge.pid after its own ss loop,
+    # which never succeeds without ss). Skip cleanly rather than false-fail.
+    if ! command -v ss >/dev/null 2>&1; then
+        success "restart-node env test skipped (ss unavailable — restart-node.sh is ss-based/Linux-only)"
+        return 0
+    fi
+
+    local repo="$SCRIPT_DIR"
+    local script="$repo/.claude/skills/bridge-ops/scripts/restart-node.sh"
+    [[ -x "$script" ]] || { fail "restart-node.sh not found at $script"; return 1; }
+    [[ -x "$repo/.venv/bin/python" ]] || { fail ".venv/bin/python missing — run uv sync"; return 1; }
+
+    local tmphome; tmphome="$(mktemp -d)"
+    local node="tn"
+    local rport; rport="$(_pick_free_port)"
+
+    mkdir -p "$tmphome/.config/claudecode-telegram"
+    # plain VAR=value, NO 'export' — exactly the shape that breaks without set -a.
+    printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TEST_BOT_TOKEN" \
+        > "$tmphome/.config/claudecode-telegram/$node.env"
+    local ndir="$tmphome/.claude/telegram/nodes/$node"
+    mkdir -p "$ndir/sessions"
+
+    # restart-node.sh ends by exec-ing verify-node.sh; run it in background so
+    # the verify tail doesn't block us, then poll ss ourselves.
+    HOME="$tmphome" PORT="$rport" \
+        "$script" "$node" >"$tmphome/restart.log" 2>&1 &
+    local runner_pid=$!
+
+    # Poll for the bridge to bind the port.
+    local attempts=0 new_pid=""
+    while [[ $attempts -lt 100 ]]; do
+        new_pid="$(ss -ltnp 2>/dev/null | grep ":$rport " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)"
+        [[ -n "$new_pid" ]] && break
+        sleep 0.1
+        ((attempts++)) || true
+    done
+
+    local alive="no"
+    if [[ -n "$new_pid" ]]; then
+        # Must stay alive >= 3s (a token-starved bridge dies in <1s).
+        local i=0
+        alive="yes"
+        while [[ $i -lt 30 ]]; do
+            kill -0 "$new_pid" 2>/dev/null || { alive="no"; break; }
+            sleep 0.1
+            ((i++)) || true
+        done
+    fi
+
+    # Read the bridge log under the isolated HOME.
+    local blog="$ndir/bridge.log"
+    local token_err="no"
+    if [[ -f "$blog" ]] && grep -qi "TELEGRAM_BOT_TOKEN not set" "$blog"; then
+        token_err="yes"
+    fi
+
+    # Cleanup: kill ONLY the bridge we spawned + the runner, then temp HOME.
+    [[ -n "$new_pid" ]] && kill "$new_pid" 2>/dev/null || true
+    kill "$runner_pid" 2>/dev/null || true
+    [[ -f "$ndir/bridge.pid" ]] && kill "$(cat "$ndir/bridge.pid")" 2>/dev/null || true
+
+    if [[ -n "$new_pid" ]]; then
+        success "restart-node.sh launched a bridge on :$rport (pid=$new_pid)"
+    else
+        fail "No bridge bound :$rport — restart-node.sh failed to launch (see $tmphome/restart.log)"
+    fi
+    if [[ "$token_err" == "yes" ]]; then
+        fail "bridge.log shows 'TELEGRAM_BOT_TOKEN not set' — env did NOT propagate"
+    else
+        success "No token-missing error — env propagated through setsid/exec"
+    fi
+    if [[ "$alive" == "yes" ]]; then
+        success "Bridge stayed alive >= 3s (token was present)"
+    else
+        fail "Bridge died within 3s — token likely missing at exec"
+    fi
+
+    rm -rf "$tmphome"
+}
+
+# ============================================================
 # TEST RUNNERS
 # ============================================================
 
@@ -10706,6 +11340,8 @@ run_unit_tests() {
     run_test test_send_text_includes_thread_id
     run_test test_pane_start_cmd_shell_agnostic
     run_test test_pane_start_cmd_runs_in_real_shell_panes
+    run_test test_pane_start_cmd_survives_stdin_eating_rc
+    run_test test_pane_start_cmd_no_resend_into_running_backend
     run_test test_topic_session_identity
     run_test test_folder_navigator_keyboard
     run_test test_handle_callback_navigates
@@ -10841,6 +11477,9 @@ run_unit_tests() {
     run_test test_checkin_cwd_restart_blocked_by_cooldown
     run_test test_checkin_cwd_restart_blocked_by_running_claude
     run_test test_restart_dead_worker
+    run_test test_revive_waits_for_pane_shell_ready
+    run_test test_wait_for_pane_shell_ready_paths
+    run_test test_create_fail_open_when_wait_returns_false
     run_test test_end_removes_from_registry
     run_test test_watchdog_exited_state
     # Unit tests - Copy improvements (human-friendly /team + watchdog)
@@ -10979,6 +11618,11 @@ run_unit_tests() {
     run_test test_local_transport_media_methods
     run_test test_local_transport_log_file
     run_test test_transport_init_selects_correctly
+    # Unit tests - bridge-ops poll-forwarder
+    log ""
+    log "── bridge-ops poll-forwarder Tests (Unit) ──────────────────────────────"
+    run_test test_poll_forwarder_retries_failed_post
+    run_test test_poll_forwarder_idempotent
 }
 
 run_cli_tests() {
@@ -11087,6 +11731,10 @@ run_integration_tests() {
     log "── export_hook_env Guard Tests (Integration) ───────────────────────────"
     run_test test_export_hook_env_skips_live_bridge
     run_test test_export_hook_env_overwrites_dead_bridge
+    # bridge-ops restart-node env propagation
+    log ""
+    log "── bridge-ops restart-node Tests (Integration) ─────────────────────────"
+    run_test test_restart_node_env_propagation
     # Cleanup test sessions
     send_message "/end testbot1" >/dev/null 2>&1 || true
 }

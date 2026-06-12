@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 1.1.1
+> Version: 1.1.2
 
 ## Current Philosophy (Summary)
 
@@ -292,6 +292,46 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.1.2 - Confirmed launch (resend) + lossless poll forwarding + revive gate
+
+**What:** Three reliability fixes around session launch and update delivery.
+(1) `wait_for_pane_shell_ready()` is a heuristic — an rc that prints, goes
+quiet, *then* reads stdin trips "ready" early and the rc's `read` eats the
+launch line, so claude never starts. New `send_pane_start_cmd()` makes the
+launch line touch a per-launch sentinel right before `exec`, sends the line,
+polls for the sentinel for `PANE_LAUNCH_CONFIRM_SECS` (default 20s, env-
+overridable), and resends (up to 2 retries) only if it never appears. While
+an rc is still running, an eaten send and a buffered send look identical from
+outside — the defense against resending into a backend that a buffered line
+is about to launch is TIME: the window outlasts the 10s readiness cap plus a
+generous rc tail. Residual accepted risk: an rc busy past the window that
+never reads stdin gets one junk prompt line in the backend (bounded by the
+2-resend cap). All three launch paths (create / register / restart) now go
+through it. (2) `restart_claude()`'s revive path now calls
+`wait_for_pane_shell_ready()` instead of a blind `sleep(0.5)`, closing the same
+race on the restart sibling. (3) The poll forwarder no longer drops a Telegram
+update when the POST to the bridge fails: it advances the `getUpdates` offset
+only *after* the bridge accepts an update, and on failure breaks, backs off,
+and re-polls the same offset (natural Telegram redelivery) so the update is
+retried until it lands. The Telegram API base is now overridable via
+`TELEGRAM_API_BASE` so tests can point the forwarder at a fake server.
+
+**Tests:** `test_pane_start_cmd_survives_stdin_eating_rc` (rc that `read`s stdin
+eats send #1; resend lands and the backend launches),
+`test_pane_start_cmd_no_resend_into_running_backend` (buffered-input race: an
+rc sleeping 12s — past the old 8s window — gets no junk second copy; rerun
+with `PANE_LAUNCH_CONFIRM_SECS=8` reproduces the old red),
+`test_revive_waits_for_pane_shell_ready` and
+`test_wait_for_pane_shell_ready_paths` (revive gate + readiness heuristic
+sensitivity, incl. a non-existent pane asserting False),
+`test_create_fail_open_when_wait_returns_false` (a never-ready pane delays but
+never blocks the launch), `test_poll_forwarder_retries_failed_post` (failed
+POST does not advance offset; update is redelivered),
+`test_poll_forwarder_idempotent` (a second forwarder for the same port refuses
+to start), and `test_restart_node_env_propagation` (restart-node.sh's `set -a`
+carries a plain, un-exported `TELEGRAM_BOT_TOKEN=` env file across the exec
+boundary — the bridge must come up instead of dying with "not set").
 
 ### v1.1.1 - Pane shell readiness gate (zsh launch race)
 

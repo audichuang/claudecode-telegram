@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code <-> Telegram Bridge - Multi-Session Control Panel"""
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 import os
 import json
@@ -4004,8 +4004,7 @@ class SessionManager:
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, docker_cmd, "Enter"])
             print(f"Started worker '{name}' in sandbox mode")
         else:
-            start_cmd = make_pane_start_cmd(backend_obj.start_cmd(), startup_cwd)
-            subprocess.run(["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"])
+            send_pane_start_cmd(tmux_name, backend_obj.start_cmd(), startup_cwd)
             # Answer Claude's "Do you trust the files in this folder?" dialog,
             # but only if it actually appears.
             time.sleep(1.5)
@@ -4137,8 +4136,7 @@ class SessionManager:
             docker_cmd = get_docker_run_cmd(name, resume_id=resume_id)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, docker_cmd, "Enter"])
         else:
-            start_cmd = make_pane_start_cmd(backend.start_cmd(resume_id), startup_cwd)
-            subprocess.run(["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"])
+            send_pane_start_cmd(tmux_name, backend.start_cmd(resume_id), startup_cwd)
 
         # Re-send welcome/instructions so worker gets fresh context after restart
         welcome = self._build_welcome(name, backend)
@@ -4165,7 +4163,11 @@ class SessionManager:
         if result.returncode != 0:
             return False, "Could not create worker workspace"
 
-        time.sleep(0.5)
+        # Wait for the pane shell's rc to finish before any keystroke goes in —
+        # a slow rc (zsh + heavy plugins) swallows input sent too early and the
+        # launch line never runs. Blind sleep(0.5) lost this race on-box.
+        # Same gate as create_session's fresh-pane path (sibling of this bug).
+        wait_for_pane_shell_ready(tmux_name)
         export_hook_env(tmux_name, backend_name)
         time.sleep(0.3)
 
@@ -4191,8 +4193,7 @@ class SessionManager:
             docker_cmd = get_docker_run_cmd(name, resume_id=resume_id)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, docker_cmd, "Enter"])
         else:
-            start_cmd = make_pane_start_cmd(backend.start_cmd(resume_id), startup_cwd)
-            subprocess.run(["tmux", "send-keys", "-t", tmux_name, start_cmd, "Enter"])
+            send_pane_start_cmd(tmux_name, backend.start_cmd(resume_id), startup_cwd)
             time.sleep(1.5)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, "2"])
             time.sleep(0.3)
@@ -4330,19 +4331,128 @@ def wait_for_pane_shell_ready(tmux_name, timeout=10.0):
     return False
 
 
-def make_pane_start_cmd(start_cmd: str, cwd: str | None = None) -> str:
+def make_pane_start_cmd(start_cmd: str, cwd: str | None = None,
+                        sentinel: str | None = None) -> str:
     """One send-keys line that launches the backend from ANY pane shell.
 
     The user's interactive shell may be fish, which has no `unset` and cannot
     eval the sh-syntax output of `tmux show-environment -s` (the 2026-06-12
     t2-offline lesson). Wrap every sh-ism inside `sh -c` and exec the backend
     from there, so it still inherits the injected tmux env.
+
+    When `sentinel` is given, the script touches it on the line immediately
+    before `exec` — so the sentinel existing means the shell reached the
+    launch line (it was NOT eaten by a slow/stdin-reading rc). send_pane_start_cmd
+    polls that sentinel to decide whether a bounded resend is needed. The
+    touch sits AFTER all setup so a half-run line never lies, and BEFORE exec
+    (the last thing sh does) so it can never fire for a line that didn't launch.
     """
     script = 'eval "$(tmux show-environment -s)"; unset CLAUDECODE; '
     if cwd:
         script += f'cd {shlex.quote(cwd)} && '
+    if sentinel:
+        script += f'touch {shlex.quote(sentinel)}; '
     script += f'exec {start_cmd}'
     return f'sh -c {shlex.quote(script)}'
+
+
+# Launch-confirmation window (seconds). Must outlast the 10s readiness cap
+# plus a slow rc's tail: while an rc is still running, a buffered (not eaten)
+# launch line is invisible to the sentinel, and resending early injects a junk
+# copy into the backend once the buffered line execs. Env-overridable so tests
+# can compress (eaten-path) or simulate the old too-short window (regression).
+PANE_LAUNCH_CONFIRM_SECS = float(os.environ.get("PANE_LAUNCH_CONFIRM_SECS", "20"))
+
+
+def send_pane_start_cmd(tmux_name: str, start_cmd: str, cwd: str | None = None) -> bool:
+    """Send the backend launch line into a pane with confirmation + bounded resend.
+
+    wait_for_pane_shell_ready is a heuristic: an rc that prints, goes quiet,
+    THEN reads stdin (e.g. `echo boot; sleep 1; read x`) trips "ready" early
+    and the rc's `read` swallows the launch line — claude never starts. No
+    wait can see a future read; only a post-send confirmation can.
+
+    Mechanism: make_pane_start_cmd embeds a per-launch sentinel touched right
+    before `exec`. We send the line, poll for the sentinel, and resend (up to
+    2 retries) if it never appears.
+
+    The sentinel guarantee ("sh touched it iff it reached the launch line")
+    holds only when the previous send was DISCARDED (eaten by an rc `read`).
+    On bash-family shells, input sent while the rc is still running is
+    BUFFERED, not eaten: a slow rc that goes quiet (tripping the readiness
+    heuristic) but doesn't read stdin until past the confirmation window
+    leaves send #1 queued in the pty. The window expires, and a blind resend
+    queues a SECOND copy — which lands in the freshly-exec'd backend's stdin
+    as a junk prompt line once the rc finally runs line #1. While the rc is
+    still running, "eaten" and "buffered" are indistinguishable from outside
+    (the pane reports a shell either way, and the sentinel precedes exec, so
+    it can't be seen before the line runs) — the only real defense is TIME:
+    the confirmation window (PANE_LAUNCH_CONFIRM_SECS, default 20s)
+    deliberately outlasts the 10s readiness cap plus a generous rc tail.
+    Before every resend we still re-check the sentinel and skip if the pane
+    no longer runs an interactive shell. Residual accepted risk: an rc that
+    stays busy past the window WITHOUT ever reading stdin and then execs the
+    buffered line gets one junk prompt line in the backend's stdin (bounded
+    by the 2-resend cap). Fails loudly (prints a warning) if all attempts
+    are genuinely swallowed, but never blocks.
+    """
+    sentinel_dir = FILE_INBOX_ROOT / "launched"
+    try:
+        sentinel_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except Exception:
+        pass
+    sentinel = str(sentinel_dir / f"{tmux_name}-{uuid.uuid4().hex}")
+    try:
+        if os.path.exists(sentinel):
+            os.unlink(sentinel)
+    except Exception:
+        pass
+
+    # Shells whose presence means the rc hasn't exec'd the backend yet. If the
+    # pane reports anything else (or nothing), the launch line already ran and a
+    # resend would inject a junk prompt into the live backend's stdin.
+    _shells = {"sh", "bash", "zsh", "fish", "dash", "ksh", "-sh", "-bash", "-zsh"}
+
+    line = make_pane_start_cmd(start_cmd, cwd, sentinel=sentinel)
+    max_attempts = 3  # 1 initial + 2 resends
+    for attempt in range(max_attempts):
+        subprocess.run(["tmux", "send-keys", "-t", tmux_name, line, "Enter"])
+        # Poll PANE_LAUNCH_CONFIRM_SECS for the sentinel. A SLOW rc that
+        # BUFFERS the line (doesn't read stdin) will eventually run it and
+        # touch the sentinel — the window must outlast the rc's tail, or we'd
+        # resend a copy that lands in the backend's stdin once the buffered
+        # line finally execs. Only a send genuinely EATEN by an rc `read`
+        # leaves the sentinel forever absent and justifies a resend.
+        for _ in range(max(1, int(PANE_LAUNCH_CONFIRM_SECS * 10))):
+            if os.path.exists(sentinel):
+                try:
+                    os.unlink(sentinel)
+                except Exception:
+                    pass
+                return True
+            time.sleep(0.1)
+        if attempt < max_attempts - 1:
+            # Guard the buffered-input race: only resend if the previous line
+            # was genuinely eaten. If the sentinel just appeared, or the pane
+            # has left its interactive shell (the backend exec'd — our buffered
+            # send #1 ran), DON'T resend: a second copy would land in the
+            # backend's stdin as a junk prompt.
+            if os.path.exists(sentinel):
+                try:
+                    os.unlink(sentinel)
+                except Exception:
+                    pass
+                return True
+            pane_cmd = get_pane_command(tmux_name)
+            if pane_cmd not in _shells:
+                print(f"[send_pane_start_cmd] {tmux_name}: pane left the shell "
+                      f"(now '{pane_cmd}') — backend launched, suppressing resend")
+                return True
+            print(f"[send_pane_start_cmd] {tmux_name}: launch line not confirmed "
+                  f"(attempt {attempt + 1}/{max_attempts}), resending")
+    print(f"[send_pane_start_cmd] {tmux_name}: WARNING launch line never confirmed "
+          f"after {max_attempts} attempts — backend may not have started")
+    return False
 
 
 def export_hook_env(tmux_name, backend: str = DEFAULT_WORKER_BACKEND):

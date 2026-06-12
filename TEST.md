@@ -59,14 +59,14 @@ FAST=1 TEST_BOT_TOKEN='1234567890:TEST-dummy-token-for-unit-suite' ./test.sh
 
 ## Current Test Count
 
-As of v1.1.0:
+As of v1.1.2:
 
 | Scope | Count |
 |-------|-------|
-| Test functions defined in `test.sh` | 263 |
-| FAST invocations (`run_unit_tests` + `run_cli_tests`) | 216 |
-| Default invocations | 263 |
-| FULL invocations | 264, including `test_with_tunnel` |
+| Test functions defined in `test.sh` | 268 |
+| FAST invocations (`run_unit_tests` + `run_cli_tests`) | 225 |
+| Default invocations | 268 |
+| FULL invocations | 269, including `test_with_tunnel` |
 
 `test_workers_endpoint_removed` intentionally runs in both FAST and integration
 mode because it checks both pure routing behavior and the live bridge endpoint.
@@ -146,6 +146,8 @@ source of truth for exact names is the `run_test ...` calls inside `test.sh`.
 | Formatting/media | response formatting, Telegram HTML, message splitting, media tags, file validation, inbound media typing |
 | Voice | STT/TTS success/failure/timeout, auto-TTS, speak tags, `/voice` toggle |
 | Claude/tmux helpers | Claude start command, tmux send locks, bracketed paste, flock isolation, concurrent-send baseline |
+| Launch confirmation | `send_pane_start_cmd` sentinel resend when an rc eats the launch line (`test_pane_start_cmd_survives_stdin_eating_rc`), no junk resend into a backend that already exec'd (`test_pane_start_cmd_no_resend_into_running_backend`), revive uses the readiness gate (`test_revive_waits_for_pane_shell_ready`), readiness heuristic sensitivity incl. missing pane → False (`test_wait_for_pane_shell_ready_paths`), launch fails open when the pane never readies (`test_create_fail_open_when_wait_returns_false`) |
+| Poll forwarder | failed POST does not advance the `getUpdates` offset and the update is redelivered (`test_poll_forwarder_retries_failed_post`); offset advances past delivered updates so no duplicates (`test_poll_forwarder_idempotent`) |
 | Watchdog/hooks | state computation, alerts, poison signal files, tool-failure hook |
 | Registry/checkin | session registry, checkin CWD, dead session restart, registry cleanup |
 | Viewers/indexers | `viewer.py` transcript/team-chat renderers and transcript/team-chat SQLite indexers |
@@ -165,6 +167,7 @@ source of truth for exact names is the `run_test ...` calls inside `test.sh`.
 | Hooks/endpoints | `/response`, `/notify`, `/checkin`, hook env validation |
 | Removed endpoints | `/workers` removal against the live bridge |
 | Process inspection | tmux prompt/process helpers and `export_hook_env` guard behavior |
+| Node restart | restart re-exports the required hook env into the pane (`test_restart_node_env_propagation`) |
 
 ### FULL Tests
 
