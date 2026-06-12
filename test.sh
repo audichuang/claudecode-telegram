@@ -424,7 +424,7 @@ from pathlib import Path
 import bridge
 tmp = Path(tempfile.mkdtemp())
 bridge.SESSIONS_DIR = tmp
-bridge.worker_manager.sessions_dir = tmp
+bridge.session_manager.sessions_dir = tmp
 
 name = bridge.topic_session_name(4321)
 assert name == 't4321', name
@@ -513,7 +513,7 @@ import tempfile
 from pathlib import Path
 import bridge
 tmp = Path(tempfile.mkdtemp()); cwd = tmp / 'proj'; cwd.mkdir()
-bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.SESSIONS_DIR = tmp; bridge.session_manager.sessions_dir = tmp
 created = {}
 bridge.create_session = lambda name, **k: created.update({'name': name, 'kw': k}) or (True, None)
 routed = {}
@@ -543,12 +543,12 @@ import tempfile
 from pathlib import Path
 import bridge
 tmp = Path(tempfile.mkdtemp())
-bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.SESSIONS_DIR = tmp; bridge.session_manager.sessions_dir = tmp
 bridge.TOPIC_MODE = True; bridge.TOPIC_ROOT = str(tmp)
 # known thread t4321 already registered + bound
 (tmp / 't4321').mkdir(parents=True, exist_ok=True)
 bridge.save_topic_meta('t4321', 555, 4321)
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {'t4321': {}}
+bridge.session_manager.get_registered_sessions = lambda registered=None: {'t4321': {}}
 routed = {}; pickers = {'n': 0}
 cr = bridge.command_router
 cr.route_message = lambda name, text, chat_id, msg_id, one_off=False: routed.update({'name': name, 'text': text})
@@ -576,12 +576,12 @@ import tempfile
 from pathlib import Path
 import bridge
 tmp = Path(tempfile.mkdtemp())
-bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.SESSIONS_DIR = tmp; bridge.session_manager.sessions_dir = tmp
 bridge.TOPIC_MODE = True; bridge.TOPIC_ROOT = str(tmp)
 (tmp / 't4321').mkdir(parents=True, exist_ok=True); bridge.save_topic_meta('t4321', 555, 4321)
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {'t4321': {}}
+bridge.session_manager.get_registered_sessions = lambda registered=None: {'t4321': {}}
 ended = {}; pickers = {'n': 0}
-bridge.worker_manager.end = lambda name: ended.update({'name': name}) or (True, None)
+bridge.session_manager.close_session = lambda name: ended.update({'name': name}) or (True, None)
 cr = bridge.command_router
 cr.reply = lambda chat_id, text, **k: None
 cr.transport = bridge.transport
@@ -607,10 +607,10 @@ import tempfile
 from pathlib import Path
 import bridge
 tmp = Path(tempfile.mkdtemp())
-bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.SESSIONS_DIR = tmp; bridge.session_manager.sessions_dir = tmp
 bridge.TOPIC_MODE = True; bridge.TOPIC_ROOT = str(tmp)
 (tmp / 'tmain').mkdir(parents=True, exist_ok=True); bridge.save_topic_meta('tmain', 555, 0)
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {'tmain': {}}
+bridge.session_manager.get_registered_sessions = lambda registered=None: {'tmain': {}}
 routed = {}
 cr = bridge.command_router
 cr.route_message = lambda name, text, chat_id, msg_id, one_off=False: routed.update({'name': name, 'text': text})
@@ -631,7 +631,7 @@ import tempfile
 from pathlib import Path
 import bridge
 tmp = Path(tempfile.mkdtemp())
-bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.SESSIONS_DIR = tmp; bridge.session_manager.sessions_dir = tmp
 bridge.TOPIC_MODE = True
 bridge._topic_titles.clear()
 
@@ -641,7 +641,7 @@ assert bridge._sanitize_topic_name('My Proj 2') == 'my-proj-2', bridge._sanitize
 assert bridge._sanitize_topic_name('我的專案') == '', repr(bridge._sanitize_topic_name('我的專案'))
 
 # a forum_topic_created service message captures the title for that thread
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {}
+bridge.session_manager.get_registered_sessions = lambda registered=None: {}
 cr = bridge.command_router
 cr.handle_message({'message': {'chat': {'id': 555}, 'message_id': 7, 'message_thread_id': 7, 'forum_topic_created': {'name': 'TEST'}}})
 assert bridge._topic_titles.get((555, 7)) == 'TEST', bridge._topic_titles
@@ -753,7 +753,7 @@ bridge.time.sleep = lambda *a, **k: None  # no real waiting in test
 
 # Happy path: pending + a working state → keeps typing (the one-on-one feel).
 # is_pending flips True→False so the loop runs exactly one tick then exits.
-bridge._worker_states['t7'] = ('BUSY_THINKING', '', 0)
+bridge._session_states['t7'] = ('BUSY_THINKING', '', 0)
 seq = [True, False]
 bridge.is_pending = lambda name: seq.pop(0) if seq else False
 typed = []
@@ -763,7 +763,7 @@ assert typed == ['typing'], typed
 
 # Stalled: pending stays True but worker is STUCK → break immediately, 0 typing.
 # is_pending returns True a few times as a safety net (no hang if break broke).
-bridge._worker_states['t7'] = ('STUCK', '', 0)
+bridge._session_states['t7'] = ('STUCK', '', 0)
 calls = {'n': 0}
 def fake_pending(name):
     calls['n'] += 1
@@ -840,12 +840,12 @@ print('OK')
 }
 
 test_topic_hire_starts_pane_in_picked_cwd() {
-    info "Testing hire starts the tmux pane in the picked cwd via -c (no cd-readback race)..."
+    info "Testing open_session starts the tmux pane in the picked cwd via -c (no cd-readback race)..."
     if python3 -c "
 import tempfile, subprocess
 import bridge
 picked = tempfile.mkdtemp()            # a real dir so isdir() passes
-wm = bridge.worker_manager
+wm = bridge.session_manager
 wm._sync_paths = lambda: None
 bridge.is_valid_backend = lambda b: True
 bridge._which_binary = lambda b: '/usr/bin/true'
@@ -865,7 +865,7 @@ bridge.export_hook_env = lambda *a, **k: None
 bridge.ensure_session_dir = lambda n: None
 bridge.time.sleep = lambda *a, **k: None
 try:
-    wm.hire('546', chat_id=11)         # later stages may no-op/raise; new-session runs first
+    wm.open_session('546', chat_id=11)         # later stages may no-op/raise; new-session runs first
 except Exception:
     pass
 ns = cap.get('ns', [])
@@ -873,9 +873,9 @@ assert '-c' in ns and picked in ns, ('new-session missing -c <picked>:', ns)
 assert saved.get('546') == picked, ('persisted cwd != picked:', saved)
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
-        success "hire starts pane in picked cwd via -c and persists it"
+        success "open_session starts pane in picked cwd via -c and persists it"
     else
-        fail "hire -c cwd test failed"
+        fail "open_session -c cwd test failed"
     fi
 }
 
@@ -929,11 +929,11 @@ print('OK')
 }
 
 test_topic_hire_skips_trust_2_without_prompt() {
-    info "Testing hire only answers the trust dialog when it actually appears (no stray '2')..."
+    info "Testing open_session only answers the trust dialog when it actually appears (no stray '2')..."
     if python3 -c "
 import tempfile, subprocess
 import bridge
-wm = bridge.worker_manager
+wm = bridge.session_manager
 wm._sync_paths = lambda: None
 bridge.is_valid_backend = lambda b: True
 bridge._which_binary = lambda b: '/usr/bin/true'
@@ -958,7 +958,7 @@ subprocess.run = fake_run
 # Case A: no trust dialog on screen -> the stray '2' must NOT be sent.
 bridge._capture_pane_text = lambda t, lines=50: 'Claude Code v2\n> '
 try:
-    wm.hire('tA', chat_id=11)
+    wm.open_session('tA', chat_id=11)
 except Exception:
     pass
 assert '2' not in sk, ('must not send a bare 2 when no trust dialog:', sk)
@@ -967,15 +967,15 @@ assert '2' not in sk, ('must not send a bare 2 when no trust dialog:', sk)
 sk.clear()
 bridge._capture_pane_text = lambda t, lines=50: 'Do you trust the files in this folder?\n1. Yes\n2. No'
 try:
-    wm.hire('tB', chat_id=11)
+    wm.open_session('tB', chat_id=11)
 except Exception:
     pass
 assert '2' in sk, ('should answer a real trust dialog with 2:', sk)
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
-        success "hire answers trust dialog only when present (no stray 2)"
+        success "open_session answers trust dialog only when present (no stray 2)"
     else
-        fail "hire trust-2 guard test failed"
+        fail "open_session trust-2 guard test failed"
     fi
 }
 
@@ -1086,7 +1086,7 @@ test_topic_welcome_drops_multiworker_framing() {
 import bridge
 bridge.TOPIC_MODE = True
 bridge.read_checkin_note = lambda: ''
-w = bridge.worker_manager._build_welcome('t9', bridge.get_backend('claude'))
+w = bridge.session_manager._build_welcome('t9', bridge.get_backend('claude'))
 assert '/workers' not in w, 'topic welcome should not mention /workers'
 assert 'NAME PREFIX' not in w, 'topic welcome should not mention NAME PREFIX'
 assert '話題' in w and '/cd' in w, w[:120]
@@ -1228,12 +1228,12 @@ print('OK')
 }
 
 test_hire_does_not_set_focus() {
-    info "Testing hire() no longer sets focus/active (topic mode has no current worker)..."
+    info "Testing open_session() no longer sets focus/active (topic mode has no current worker)..."
     if python3 -c "
 import tempfile, subprocess
 import bridge
 picked = tempfile.mkdtemp()
-wm = bridge.worker_manager
+wm = bridge.session_manager
 wm._sync_paths = lambda: None
 bridge.is_valid_backend = lambda b: True
 bridge._which_binary = lambda b: '/usr/bin/true'
@@ -1250,16 +1250,16 @@ bridge.state['active'] = None
 focused = []
 bridge.set_focus = lambda name: focused.append(name)
 try:
-    wm.hire('tF', chat_id=11)
+    wm.open_session('tF', chat_id=11)
 except Exception:
     pass
-assert focused == [], ('hire must not set focus:', focused)
+assert focused == [], ('open_session must not set focus:', focused)
 assert bridge.state['active'] is None, bridge.state['active']
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
-        success "hire() does not set focus/active"
+        success "open_session() does not set focus/active"
     else
-        fail "hire no-focus test failed"
+        fail "open_session no-focus test failed"
     fi
 }
 
@@ -1299,7 +1299,7 @@ cr = bridge.command_router
 ended = []
 cr.workers.get_registered_sessions = lambda registered=None: {'tX': {}}
 bridge.find_topic_session = lambda c, t, r: 'tX'
-cr.workers.end = lambda name: ended.append(name)
+cr.workers.close_session = lambda name: ended.append(name)
 bridge._topic_titles[(555, 70)] = 'x'
 bridge._awaiting_folder.add((555, 70))
 bridge._picker_sent_at[(555, 70)] = 1.0
@@ -1350,7 +1350,7 @@ test_deleted_topic_reaped_on_send_failure() {
     if python3 -c "
 import bridge
 ended = []
-bridge.worker_manager.end = lambda name: ended.append(name)
+bridge.session_manager.close_session = lambda name: ended.append(name)
 bridge.load_topic_meta = lambda name: (555, 72)
 bridge._topic_titles[(555, 72)] = 'x'
 calls = []
@@ -1612,12 +1612,12 @@ import tempfile
 from pathlib import Path
 import bridge
 tmp = Path(tempfile.mkdtemp())
-bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.SESSIONS_DIR = tmp; bridge.session_manager.sessions_dir = tmp
 bridge.TOPIC_MODE = True
 (tmp / 't7').mkdir(parents=True, exist_ok=True)
 bridge.save_topic_meta('t7', 555, 4321)
 bridge.time.sleep = lambda *a, **k: None
-bridge._worker_states.pop('t7', None)
+bridge._session_states.pop('t7', None)
 seq = [True, False]
 bridge.is_pending = lambda name: seq.pop(0) if seq else False
 rec = []
@@ -1639,7 +1639,7 @@ import tempfile
 from pathlib import Path
 import bridge
 tmp = Path(tempfile.mkdtemp())
-bridge.SESSIONS_DIR = tmp; bridge.worker_manager.sessions_dir = tmp
+bridge.SESSIONS_DIR = tmp; bridge.session_manager.sessions_dir = tmp
 (tmp / 't4321').mkdir(parents=True, exist_ok=True); bridge.save_topic_meta('t4321', 555, 4321)
 sent = {}
 bridge.transport.send_text = lambda chat_id, text, parse_mode=None, reply_to=None, message_thread_id=None: sent.update({'chat': chat_id, 'thread': message_thread_id, 'text': text}) or {'ok': True}
@@ -2235,29 +2235,29 @@ test_cli_webhook_commands() {
     TELEGRAM_BOT_TOKEN="$TEST_BOT_TOKEN" ./claudecode-telegram.sh webhook delete --force 2>/dev/null || true
 }
 
-test_send_to_worker_missing() {
-    info "Testing send_to_worker for non-existent workers..."
+test_send_to_session_missing() {
+    info "Testing send_to_session for non-existent workers..."
     if python3 -c "
 import os
 import importlib
 import bridge
 importlib.reload(bridge)
 
-from bridge import send_to_worker
+from bridge import send_to_session
 
 # Non-existent worker returns False
-result = send_to_worker('nonexistent_worker_12345', 'test message')
+result = send_to_session('nonexistent_worker_12345', 'test message')
 assert result == False, f'Expected False, got {result}'
 
 # Another non-existent tmux worker also returns False
-result2 = send_to_worker('nonexistent_tmux_worker_xyz', 'test message')
+result2 = send_to_session('nonexistent_tmux_worker_xyz', 'test message')
 assert result2 == False, f'Expected False, got {result2}'
 
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
-        success "send_to_worker returns False for non-existent workers"
+        success "send_to_session returns False for non-existent workers"
     else
-        fail "send_to_worker missing worker test failed"
+        fail "send_to_session missing worker test failed"
     fi
 }
 
@@ -4933,7 +4933,7 @@ test_admin_registration() {
     fi
 }
 
-test_hire_command() {
+test_open_session_creates_tmux() {
     info "Testing /hire command..."
 
     send_message "/hire testbot1" >/dev/null
@@ -5620,9 +5620,9 @@ class FakeBackend:
 
 bridge.BACKENDS['fake'] = FakeBackend()
 
-# hire should fail with binary-not-found error
-ok, err = bridge.worker_manager.hire('testbincheck', 'fake')
-assert ok is False, f'expected hire to fail, got ok={ok}'
+# open_session should fail with binary-not-found error
+ok, err = bridge.session_manager.open_session('testbincheck', 'fake')
+assert ok is False, f'expected open_session to fail, got ok={ok}'
 assert 'fakecli' in err, f'expected binary name in error: {err}'
 assert 'not found' in err, f'expected not-found message: {err}'
 
@@ -5688,8 +5688,8 @@ bridge.admin_chat_id = 12345
 
 # Clear state
 with bridge._watchdog_lock:
-    bridge._prev_worker_states.clear()
-    bridge._prev_worker_states['bob'] = 'STUCK'
+    bridge._prev_session_states.clear()
+    bridge._prev_session_states['bob'] = 'STUCK'
 
 # Mark bob as recently restarted
 bridge._recent_restarts['bob'] = time.time()
@@ -6144,7 +6144,7 @@ import sys; sys.path.insert(0, '.')
 import bridge, time
 
 # Test _format_watchdog_status with WAITING_INPUT
-bridge._worker_states['testbot'] = ('WAITING_INPUT', 'question=Pick color', time.time() - 120)
+bridge._session_states['testbot'] = ('WAITING_INPUT', 'question=Pick color', time.time() - 120)
 result = bridge._format_watchdog_status('testbot')
 assert 'Needs reply' in result, f'Expected Needs reply, got: {result}'
 assert '2m' in result, f'Expected 2m duration, got: {result}'
@@ -6159,7 +6159,7 @@ assert icon == '\U0001f7e1', f'Expected yellow icon, got: {icon}'
 assert 'reply' in label, f'Expected reply label, got: {label}'
 
 # Clean up
-bridge._worker_states.pop('testbot', None)
+bridge._session_states.pop('testbot', None)
 " 2>&1; then
         success "Watchdog WAITING_INPUT state detection"
     else
@@ -6320,9 +6320,9 @@ import bridge
 tmp = Path(tempfile.mkdtemp())
 bridge.SESSIONS_DIR = tmp
 bridge.FILE_INBOX_ROOT = tmp / 'inbox'
-bridge.worker_manager.sessions_dir = tmp
-bridge.worker_manager.tmux_prefix = 'claude-test-'
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {
+bridge.session_manager.sessions_dir = tmp
+bridge.session_manager.tmux_prefix = 'claude-test-'
+bridge.session_manager.get_registered_sessions = lambda registered=None: {
     'alice': {'tmux': 'claude-test-alice', 'backend': 'claude'}
 }
 
@@ -6330,7 +6330,7 @@ bridge.set_pending('alice', 12345)
 pending_file = bridge.get_pending_file('alice')
 assert pending_file.exists(), 'pending should exist before end'
 
-ok, err = bridge.worker_manager.end('alice')
+ok, err = bridge.session_manager.close_session('alice')
 assert ok is True, f'end failed: {err}'
 assert not pending_file.exists(), 'pending should be cleared by /end'
 
@@ -6352,7 +6352,7 @@ import bridge
 
 tmp = Path(tempfile.mkdtemp())
 bridge.SESSIONS_DIR = tmp
-bridge.worker_manager.sessions_dir = tmp
+bridge.session_manager.sessions_dir = tmp
 
 def boom(*a, **k):
     raise RuntimeError('telegram down')
@@ -6387,20 +6387,20 @@ import bridge
 
 tmp = Path(tempfile.mkdtemp())
 bridge.SESSIONS_DIR = tmp
-bridge.worker_manager.sessions_dir = tmp
-bridge.worker_manager.tmux_prefix = 'claude-test-'
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {
+bridge.session_manager.sessions_dir = tmp
+bridge.session_manager.tmux_prefix = 'claude-test-'
+bridge.session_manager.get_registered_sessions = lambda registered=None: {
     'alice': {'tmux': 'claude-test-alice', 'backend': 'claude'}
 }
 # Force the dead-worker path and stub it, so restart() returns right after the
 # (hoisted) clear_pending without doing real tmux work.
 bridge.tmux_exists = lambda *a, **k: False
-bridge.worker_manager._restart_dead_worker = lambda *a, **k: (True, None)
+bridge.session_manager._restart_dead_worker = lambda *a, **k: (True, None)
 
 bridge.set_pending('alice', 12345)
 assert bridge.get_pending_file('alice').exists(), 'pending should exist before restart'
 
-ok, err = bridge.worker_manager.restart('alice')
+ok, err = bridge.session_manager.restart('alice')
 assert not bridge.get_pending_file('alice').exists(), 'pending must be cleared by restart'
 
 print('OK')
@@ -6422,9 +6422,9 @@ import bridge
 tmp = Path(tempfile.mkdtemp())
 bridge.SESSIONS_DIR = tmp
 bridge.FILE_INBOX_ROOT = tmp / 'inbox'
-bridge.worker_manager.sessions_dir = tmp
-bridge.worker_manager.tmux_prefix = 'claude-test-'
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {
+bridge.session_manager.sessions_dir = tmp
+bridge.session_manager.tmux_prefix = 'claude-test-'
+bridge.session_manager.get_registered_sessions = lambda registered=None: {
     'alice': {'tmux': 'claude-test-alice', 'backend': 'claude'}
 }
 
@@ -6434,7 +6434,7 @@ session_dir.mkdir()
 (session_dir / 'claude_session_cwd').write_text('/some/old/dir')
 
 bridge.state['active'] = 'alice'
-ok, err = bridge.worker_manager.end('alice')
+ok, err = bridge.session_manager.close_session('alice')
 assert ok is True, f'end failed: {err}'
 assert not (session_dir / 'claude_session_id').exists(), 'session id must be cleared on /end'
 assert not (session_dir / 'claude_session_cwd').exists(), 'session cwd must be cleared on /end'
@@ -6458,14 +6458,14 @@ import bridge
 
 tmp = Path(tempfile.mkdtemp())
 bridge.SESSIONS_DIR = tmp
-bridge.worker_manager.sessions_dir = tmp
-bridge.worker_manager.tmux_prefix = 'claude-test-'
-bridge.worker_manager.scan_tmux_sessions = lambda: {'bob': {'tmux': 'claude-test-bob', 'backend': 'claude'}}
+bridge.session_manager.sessions_dir = tmp
+bridge.session_manager.tmux_prefix = 'claude-test-'
+bridge.session_manager.scan_tmux_sessions = lambda: {'bob': {'tmux': 'claude-test-bob', 'backend': 'claude'}}
 bridge._registry_bootstrap = lambda reg: None
 bridge._load_registry = lambda: {'workers': {}}
 
 bridge.state['active'] = None
-reg = bridge.worker_manager.get_registered_sessions()
+reg = bridge.session_manager.get_registered_sessions()
 assert 'bob' in reg, 'bob should be registered'
 assert bridge.state['active'] is None, 'focus must stay None, not be auto-picked'
 
@@ -6702,7 +6702,7 @@ test_since_preserved_on_reason_change() {
 import time
 import bridge
 
-bridge._worker_states.clear()
+bridge._session_states.clear()
 now = time.time()
 
 first_since = bridge._record_worker_state('alice', 'DEAD', 'claude missing 1s', now)
@@ -6909,11 +6909,11 @@ bridge.admin_chat_id = 12345
 
 # Clear state
 with bridge._watchdog_lock:
-    bridge._prev_worker_states.clear()
+    bridge._prev_session_states.clear()
 
 # Simulate STUCK -> READY transition
 with bridge._watchdog_lock:
-    bridge._prev_worker_states['testworker'] = 'STUCK'
+    bridge._prev_session_states['testworker'] = 'STUCK'
 
 bridge._send_resolved_alert('testworker', 'READY')
 
@@ -6926,7 +6926,7 @@ assert 'back to normal' in data['text'], f'Expected back to normal in text, got 
 # Verify no alert when transition is not from bad to good state
 calls.clear()
 with bridge._watchdog_lock:
-    bridge._prev_worker_states['testworker'] = 'READY'
+    bridge._prev_session_states['testworker'] = 'READY'
 bridge._send_resolved_alert('testworker', 'BUSY_TOOL')
 assert len(calls) == 0, f'Expected no call for READY->BUSY_TOOL, got {len(calls)}'
 
@@ -7011,9 +7011,9 @@ states = {
     'untracked_worker': ('UNTRACKED_BUSY', 'children=1', since),
 }
 
-# Inject into _worker_states
+# Inject into _session_states
 with bridge._watchdog_lock:
-    bridge._worker_states.update(states)
+    bridge._session_states.update(states)
 
 snapshot = dict(states)
 
@@ -7059,7 +7059,7 @@ assert result == 'Ready', f'Unknown+idle: expected Ready, got {result}'
 # Clean up
 with bridge._watchdog_lock:
     for k in list(states.keys()):
-        bridge._worker_states.pop(k, None)
+        bridge._session_states.pop(k, None)
 
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
@@ -8449,8 +8449,8 @@ from unittest.mock import patch
 
 bridge.admin_chat_id = 123
 bridge._last_alert_ts = {}
-bridge._prev_worker_states = {'alice': 'READY'}
-bridge._worker_states = {'alice': ('STUCK', 'age=400s cpu=0.0', 600)}
+bridge._prev_session_states = {'alice': 'READY'}
+bridge._session_states = {'alice': ('STUCK', 'age=400s cpu=0.0', 600)}
 
 sent = {}
 def fake_api(method, data):
@@ -8648,7 +8648,7 @@ import bridge
 
 # Reset state
 bridge._last_resolved_ts.clear()
-bridge._prev_worker_states.clear()
+bridge._prev_session_states.clear()
 
 alerts = []
 def mock_api(method, params):
@@ -8659,7 +8659,7 @@ with patch.object(bridge, 'admin_chat_id', 123), \
      patch.object(bridge, 'telegram_api', mock_api):
     # Set prev state as DEAD
     with bridge._watchdog_lock:
-        bridge._prev_worker_states['test'] = 'DEAD'
+        bridge._prev_session_states['test'] = 'DEAD'
 
     # First resolved alert should send
     bridge._send_resolved_alert('test', 'READY')
@@ -8667,7 +8667,7 @@ with patch.object(bridge, 'admin_chat_id', 123), \
 
     # Reset prev state back to DEAD to simulate another bad->good transition
     with bridge._watchdog_lock:
-        bridge._prev_worker_states['test'] = 'DEAD'
+        bridge._prev_session_states['test'] = 'DEAD'
 
     # Second one within cooldown should be suppressed
     bridge._send_resolved_alert('test', 'READY')
@@ -9022,7 +9022,7 @@ data = {'version': 1, 'workers': {
 bridge.WORKER_REGISTRY_FILE.write_text(json.dumps(data))
 
 # Create worker manager that returns no tmux sessions
-wm = bridge.WorkerManager(bridge.SESSIONS_DIR, 'claude-test-')
+wm = bridge.SessionManager(bridge.SESSIONS_DIR, 'claude-test-')
 
 # Mock scan_tmux_sessions to return empty (no live workers)
 wm.scan_tmux_sessions = lambda: {}
@@ -9167,14 +9167,14 @@ new_dir = tmp_path / 'new-project'
 old_dir.mkdir()
 new_dir.mkdir()
 
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {
+bridge.session_manager.get_registered_sessions = lambda registered=None: {
     'alice': {'tmux': f'{bridge.TMUX_PREFIX}alice', 'backend': 'claude'}
 }
 bridge.tmux_exists = lambda _name: True
 bridge.is_claude_running = lambda _name: False  # Allow checkin restart
 bridge.export_hook_env = lambda *_args, **_kwargs: None
-bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
-bridge.worker_manager.restart = lambda name, mode='relaunch': (True, None)
+bridge.session_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
+bridge.session_manager.restart = lambda name, mode='relaunch': (True, None)
 bridge._wait_for_restart_ready = lambda *_args, **_kwargs: True
 bridge._recent_restarts.pop('alice', None)  # Clear cooldown
 
@@ -9250,14 +9250,14 @@ new_dir = tmp_path / 'new-project'
 old_dir.mkdir()
 new_dir.mkdir()
 
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {
+bridge.session_manager.get_registered_sessions = lambda registered=None: {
     'alice': {'tmux': f'{bridge.TMUX_PREFIX}alice', 'backend': 'claude'}
 }
 bridge.tmux_exists = lambda _name: True
 bridge.is_claude_running = lambda _name: False  # Allow checkin restart
 bridge.export_hook_env = lambda *_args, **_kwargs: None
-bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
-bridge.worker_manager.restart = lambda name, mode='relaunch': (True, None)
+bridge.session_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
+bridge.session_manager.restart = lambda name, mode='relaunch': (True, None)
 bridge._wait_for_restart_ready = lambda *_args, **_kwargs: True
 bridge._recent_restarts.pop('alice', None)  # Clear cooldown
 
@@ -9327,14 +9327,14 @@ new_dir = tmp_path / 'new-project'
 old_dir.mkdir()
 new_dir.mkdir()
 
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {
+bridge.session_manager.get_registered_sessions = lambda registered=None: {
     'alice': {'tmux': f'{bridge.TMUX_PREFIX}alice', 'backend': 'claude'}
 }
 bridge.tmux_exists = lambda _name: True
 bridge.is_claude_running = lambda _name: False  # Allow checkin restart
 bridge.export_hook_env = lambda *_args, **_kwargs: None
-bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
-bridge.worker_manager.restart = lambda name, mode='relaunch': (False, 'boom')
+bridge.session_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
+bridge.session_manager.restart = lambda name, mode='relaunch': (False, 'boom')
 bridge._recent_restarts.pop('alice', None)  # Clear cooldown
 
 sent = []
@@ -9402,16 +9402,16 @@ new_dir = tmp_path / 'new-project'
 old_dir.mkdir()
 new_dir.mkdir()
 
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {
+bridge.session_manager.get_registered_sessions = lambda registered=None: {
     'bob': {'tmux': f'{bridge.TMUX_PREFIX}bob', 'backend': 'claude'}
 }
 bridge.tmux_exists = lambda _name: True
 bridge.is_claude_running = lambda _name: False
 bridge.export_hook_env = lambda *_args, **_kwargs: None
-bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
+bridge.session_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
 
 restart_calls = []
-bridge.worker_manager.restart = lambda name, mode='relaunch': (restart_calls.append(1), (True, None))[1]
+bridge.session_manager.restart = lambda name, mode='relaunch': (restart_calls.append(1), (True, None))[1]
 bridge._wait_for_restart_ready = lambda *_args, **_kwargs: True
 bridge.send_telegram_message = lambda *a, **kw: {'ok': True}
 
@@ -9474,17 +9474,17 @@ new_dir = tmp_path / 'new-project'
 old_dir.mkdir()
 new_dir.mkdir()
 
-bridge.worker_manager.get_registered_sessions = lambda registered=None: {
+bridge.session_manager.get_registered_sessions = lambda registered=None: {
     'bob': {'tmux': f'{bridge.TMUX_PREFIX}bob', 'backend': 'claude'}
 }
 bridge.tmux_exists = lambda _name: True
 bridge.is_claude_running = lambda _name: True  # Claude IS running
 bridge.export_hook_env = lambda *_args, **_kwargs: None
-bridge.worker_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
+bridge.session_manager._get_tmux_pane_cwd = lambda _tmux: str(old_dir)
 bridge._recent_restarts.pop('bob', None)  # No cooldown
 
 restart_calls = []
-bridge.worker_manager.restart = lambda name, mode='relaunch': (restart_calls.append(1), (True, None))[1]
+bridge.session_manager.restart = lambda name, mode='relaunch': (restart_calls.append(1), (True, None))[1]
 
 class FakeHandler:
     def __init__(self):
@@ -9539,7 +9539,7 @@ bridge.WORKER_REGISTRY_FILE.write_text(json.dumps(data))
 
 prefix = 'claude-regtest-'
 bridge.TMUX_PREFIX = prefix
-wm = bridge.WorkerManager(bridge.SESSIONS_DIR, prefix)
+wm = bridge.SessionManager(bridge.SESSIONS_DIR, prefix)
 wm.scan_tmux_sessions = lambda: {}
 
 registered = wm.get_registered_sessions()
@@ -9589,7 +9589,7 @@ bridge.SESSIONS_DIR = Path(tmpdir) / 'sessions'
 bridge.SESSIONS_DIR.mkdir()
 
 prefix = 'claude-regtest-'
-wm = bridge.WorkerManager(bridge.SESSIONS_DIR, prefix)
+wm = bridge.SessionManager(bridge.SESSIONS_DIR, prefix)
 
 # Create a tmux session to simulate a live worker
 tmux_name = f'{prefix}endtest'
@@ -9601,7 +9601,7 @@ data = bridge._load_registry()
 assert 'endtest' in data['workers'], 'worker should be in registry before end'
 
 # End the worker
-ok, err = wm.end('endtest')
+ok, err = wm.close_session('endtest')
 assert ok, f'end should succeed, got err: {err}'
 
 # Verify removed from registry
@@ -9682,7 +9682,7 @@ from unittest.mock import patch
 
 bridge.admin_chat_id = 123
 bridge._last_alert_ts = {}
-bridge._prev_worker_states = {'alice': 'READY'}
+bridge._prev_session_states = {'alice': 'READY'}
 
 sent = {}
 def fake_api(method, data):
@@ -9716,7 +9716,7 @@ from unittest.mock import patch
 
 bridge.admin_chat_id = 123
 bridge._last_alert_ts = {}
-bridge._prev_worker_states = {'bob': 'READY'}
+bridge._prev_session_states = {'bob': 'READY'}
 
 sent = {}
 def fake_api(method, data):
@@ -9748,7 +9748,7 @@ from unittest.mock import patch
 
 bridge.admin_chat_id = 123
 bridge._last_alert_ts = {}
-bridge._prev_worker_states = {'carol': 'READY'}
+bridge._prev_session_states = {'carol': 'READY'}
 
 sent = {}
 def fake_api(method, data):
@@ -9780,7 +9780,7 @@ from unittest.mock import patch
 
 bridge.admin_chat_id = 123
 bridge._last_alert_ts = {}
-bridge._prev_worker_states = {'dave': 'READY'}
+bridge._prev_session_states = {'dave': 'READY'}
 bridge._waiting_input_details = {
     'dave': {
         'header': 'Auth method',
@@ -9821,7 +9821,7 @@ import bridge
 from unittest.mock import patch
 
 bridge.admin_chat_id = 123
-bridge._prev_worker_states = {'eve': 'STUCK'}
+bridge._prev_session_states = {'eve': 'STUCK'}
 bridge._recent_restarts = {}
 
 sent = {}
@@ -9876,8 +9876,8 @@ import bridge
 import time
 
 # Clear watchdog state
-bridge._worker_states.clear()
-bridge._prev_worker_states.clear()
+bridge._session_states.clear()
+bridge._prev_session_states.clear()
 bridge._last_alert_ts.clear()
 
 now = time.time()
@@ -9886,7 +9886,7 @@ now = time.time()
 since = bridge._record_worker_state('deadworker', 'EXITED', 'session gone', now)
 
 # Verify it's tracked
-entry = bridge._worker_states.get('deadworker')
+entry = bridge._session_states.get('deadworker')
 assert entry is not None, 'EXITED state should be recorded'
 assert entry[0] == 'EXITED', f'state should be EXITED, got {entry[0]}'
 
@@ -9905,7 +9905,7 @@ orig_api = bridge.telegram_api
 bridge.telegram_api = fake_api
 
 # Simulate transition: first transition should alert (after grace period)
-bridge._prev_worker_states.clear()
+bridge._prev_session_states.clear()
 bridge._handle_watchdog_transition('deadworker', 'EXITED', 'session gone', since=now - 60, now=now)
 assert len(calls) == 1, f'expected 1 alert call, got {len(calls)}'
 txt = calls[0][1]['text']
@@ -10007,8 +10007,8 @@ test_workers_endpoint_removed() {
 }
 
 
-test_send_to_worker_integration() {
-    info "Testing send_to_worker with real tmux worker..."
+test_send_to_session_integration() {
+    info "Testing send_to_session with real tmux worker..."
 
     # Create a worker first
     send_message "/hire sendworkertest" >/dev/null
@@ -10017,10 +10017,10 @@ test_send_to_worker_integration() {
 
     local tmux_name="${TEST_TMUX_PREFIX}sendworkertest"
 
-    # Use send_to_worker to send a unique message
-    local unique_msg="test_send_to_worker_${RANDOM}"
+    # Use send_to_session to send a unique message
+    local unique_msg="test_send_to_session_${RANDOM}"
 
-    # Note: Must set TMUX_PREFIX to match the test prefix for send_to_worker to find the session
+    # Note: Must set TMUX_PREFIX to match the test prefix for send_to_session to find the session
     if TMUX_PREFIX="$TEST_TMUX_PREFIX" python3 -c "
 import os
 # Force reload of bridge to pick up TMUX_PREFIX from env
@@ -10028,11 +10028,11 @@ import importlib
 import bridge
 importlib.reload(bridge)
 
-from bridge import send_to_worker, TMUX_PREFIX
+from bridge import send_to_session, TMUX_PREFIX
 print('TMUX_PREFIX:', TMUX_PREFIX)
 
 # Send message using the generic function
-result = send_to_worker('sendworkertest', '$unique_msg')
+result = send_to_session('sendworkertest', '$unique_msg')
 print('sent:', result)
 " 2>/dev/null | grep -q "sent: True"; then
         # Verify message appeared in tmux pane
@@ -10041,12 +10041,12 @@ print('sent:', result)
         pane_content=$(tmux capture-pane -t "$tmux_name" -p 2>/dev/null || echo "")
 
         if echo "$pane_content" | grep -q "$unique_msg"; then
-            success "send_to_worker delivered message to tmux worker"
+            success "send_to_session delivered message to tmux worker"
         else
-            fail "send_to_worker message not found in tmux pane"
+            fail "send_to_session message not found in tmux pane"
         fi
     else
-        fail "send_to_worker returned False for existing worker"
+        fail "send_to_session returned False for existing worker"
     fi
 
     # Cleanup
@@ -10055,11 +10055,11 @@ print('sent:', result)
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# send_to_worker Abstraction Tests (TDD)
+# send_to_session Abstraction Tests (TDD)
 # ─────────────────────────────────────────────────────────────────────────────
 
-test_send_to_worker_uses_backend_registry() {
-    info "Testing send_to_worker dispatches through the claude backend..."
+test_send_to_session_uses_backend_registry() {
+    info "Testing send_to_session dispatches through the claude backend..."
     if python3 -c "
 import tempfile
 from pathlib import Path
@@ -10075,12 +10075,12 @@ bridge.BACKENDS['claude'] = bridge.ClaudeBackend()
 
 tmp = Path(tempfile.mkdtemp())
 bridge.SESSIONS_DIR = tmp
-bridge.worker_manager.sessions_dir = tmp
-bridge.worker_manager.scan_tmux_sessions = lambda: {'testclaude': {'tmux': 'claude-test-testclaude'}}
-bridge._sync_worker_manager()
+bridge.session_manager.sessions_dir = tmp
+bridge.session_manager.scan_tmux_sessions = lambda: {'testclaude': {'tmux': 'claude-test-testclaude'}}
+bridge._sync_session_manager()
 (tmp / 'testclaude').mkdir()
 
-result = bridge.send_to_worker('testclaude', 'hello from test')
+result = bridge.send_to_session('testclaude', 'hello from test')
 assert result == True, f'Expected True, got {result}'
 assert calls['claude'] == 1, calls
 
@@ -10089,9 +10089,9 @@ shutil.rmtree(tmp)
 bridge.ClaudeBackend.send = original_send
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
-        success "send_to_worker uses backend registry correctly"
+        success "send_to_session uses backend registry correctly"
     else
-        fail "send_to_worker backend registry test failed"
+        fail "send_to_session backend registry test failed"
     fi
 }
 
@@ -10347,7 +10347,7 @@ try:
     assert '{machine}' in note, f'note missing placeholder: {note}'
 
     # Sessions are local by design.
-    rendered = bridge.worker_manager._build_welcome('localtest', None)
+    rendered = bridge.session_manager._build_welcome('localtest', None)
     assert 'bridge host' in rendered and '{machine}' not in rendered, rendered
     print('LOCAL=' + rendered)
 finally:
@@ -10993,11 +10993,11 @@ run_unit_tests() {
     log ""
     log "── Worker Discovery Tests (Unit) ───────────────────────────────────────"
     run_test test_workers_endpoint_removed
-    # Unit tests - send_to_worker abstraction
+    # Unit tests - send_to_session abstraction
     log ""
-    log "── send_to_worker Abstraction Tests (Unit) ─────────────────────────────"
-    run_test test_send_to_worker_uses_backend_registry
-    run_test test_send_to_worker_missing
+    log "── send_to_session Abstraction Tests (Unit) ─────────────────────────────"
+    run_test test_send_to_session_uses_backend_registry
+    run_test test_send_to_session_missing
     # Unit tests - Voice Mode (STT/TTS)
     log ""
     log "── Voice Mode Tests (Unit) ─────────────────────────────────────────────"
@@ -11139,7 +11139,7 @@ run_integration_tests() {
     # Bot command tests
     log ""
     log "── Bot Command Tests ───────────────────────────────────────────────────"
-    run_test test_hire_command
+    run_test test_open_session_creates_tmux
     run_test test_end_command
     run_test test_dynamic_bot_command_list_update
     # Worker naming tests (integration)
@@ -11194,10 +11194,10 @@ run_integration_tests() {
     log ""
     log "── Worker Discovery Tests (Integration) ────────────────────────────────"
     run_test test_workers_endpoint_removed
-    # send_to_worker integration tests
+    # send_to_session integration tests
     log ""
-    log "── send_to_worker Integration Tests ────────────────────────────────────"
-    run_test test_send_to_worker_integration
+    log "── send_to_session Integration Tests ────────────────────────────────────"
+    run_test test_send_to_session_integration
     # Worker-to-worker pipe communication tests (e2e behavior)
     log ""
     log "── Worker-to-Worker Pipe Tests (Integration) ───────────────────────────"

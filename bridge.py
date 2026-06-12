@@ -490,14 +490,14 @@ state = {
 # Consecutive @mention tracking (auto-focus after 2 in a row to same worker)
 
 # Watchdog state
-_worker_states = {}  # name -> (state, reason, since)
+_session_states = {}  # name -> (state, reason, since)
 _last_child_ts = {}
 _last_seen_claude = {}
 _last_hook_ts = {}
 _last_alert_ts = {}
 _alert_msg_ids = {}  # name -> message_id of last bad-state alert (for edit on recovery)
 _idle_streak = {}
-_prev_worker_states = {}
+_prev_session_states = {}
 _consecutive_probe_failures = {}
 _consecutive_good_probes = {}  # name -> int (consecutive good states after bad)
 _idle_child_baseline = {}  # name -> int (MCP server child count at idle)
@@ -2936,7 +2936,7 @@ def _send_resolved_alert(name: str, new_state: str) -> None:
     good_states = {"READY", "BUSY_TOOL", "BUSY_THINKING"}
     bad_states = {"OFFLINE", "DEAD", "STUCK", "POISONED", "EXITED", "WAITING_INPUT"}
     with _watchdog_lock:
-        prev_state = _prev_worker_states.get(name)
+        prev_state = _prev_session_states.get(name)
     if prev_state not in bad_states or new_state not in good_states:
         return
 
@@ -2986,7 +2986,7 @@ def _handle_watchdog_transition(
     bad_states = {"OFFLINE", "DEAD", "STUCK", "POISONED", "EXITED", "WAITING_INPUT"}
     good_states = {"READY", "BUSY_TOOL", "BUSY_THINKING"}
     with _watchdog_lock:
-        prev_state = _prev_worker_states.get(name)
+        prev_state = _prev_session_states.get(name)
     state_changed = prev_state is None or prev_state != state
 
     def eligible_for_alert() -> bool:
@@ -3007,7 +3007,7 @@ def _handle_watchdog_transition(
         elif state in {"OFFLINE", "DEAD", "EXITED"} and eligible_for_alert():
             _send_watchdog_alert(name, state, reason)
         with _watchdog_lock:
-            _prev_worker_states[name] = state
+            _prev_session_states[name] = state
         return
 
     if state in good_states and prev_state in bad_states:
@@ -3018,23 +3018,23 @@ def _handle_watchdog_transition(
             _send_resolved_alert(name, state)
             with _watchdog_lock:
                 _consecutive_good_probes[name] = 0
-                _prev_worker_states[name] = state
+                _prev_session_states[name] = state
         return
 
     with _watchdog_lock:
         _consecutive_good_probes[name] = 0
-        _prev_worker_states[name] = state
+        _prev_session_states[name] = state
 
 
 def _record_worker_state(name: str, state: str, reason: str, now: float) -> float:
     """Update worker state and preserve since for unchanged states."""
     with _watchdog_lock:
-        prev = _worker_states.get(name)
+        prev = _session_states.get(name)
         if prev and prev[0] == state:
             since = prev[2]
         else:
             since = now
-        _worker_states[name] = (state, reason, since)
+        _session_states[name] = (state, reason, since)
     return since
 
 
@@ -3200,9 +3200,9 @@ def watchdog_loop():
                 _update_topic_reaction(name, state)
 
             with _watchdog_lock:
-                for name in list(_worker_states.keys()):
+                for name in list(_session_states.keys()):
                     if name not in registered_names:
-                        _worker_states.pop(name, None)
+                        _session_states.pop(name, None)
                 for name in list(_last_child_ts.keys()):
                     if name not in registered_names:
                         _last_child_ts.pop(name, None)
@@ -3212,9 +3212,9 @@ def watchdog_loop():
                 for name in list(_last_hook_ts.keys()):
                     if name not in registered_names:
                         _last_hook_ts.pop(name, None)
-                for name in list(_prev_worker_states.keys()):
+                for name in list(_prev_session_states.keys()):
                     if name not in registered_names:
-                        _prev_worker_states.pop(name, None)
+                        _prev_session_states.pop(name, None)
                 for name in list(_last_alert_ts.keys()):
                     if name not in registered_names:
                         _last_alert_ts.pop(name, None)
@@ -3276,7 +3276,7 @@ def _format_watchdog_status(name: str, pending_lookup=None, state_snapshot: Opti
 
     if state_snapshot is None:
         with _watchdog_lock:
-            entry = _worker_states.get(name)
+            entry = _session_states.get(name)
     else:
         entry = state_snapshot.get(name)
     if not entry:
@@ -3804,7 +3804,7 @@ def get_worker_backend(name: str, session: Optional[dict] = None) -> str:
     return DEFAULT_BACKEND
 
 
-class WorkerManager:
+class SessionManager:
     def __init__(self, sessions_dir: Path, tmux_prefix: str):
         self.sessions_dir = sessions_dir
         self.tmux_prefix = tmux_prefix
@@ -3950,7 +3950,7 @@ class WorkerManager:
 
         return welcome
 
-    def hire(self, name: str, backend: str = DEFAULT_BACKEND, chat_id: int = None):
+    def open_session(self, name: str, backend: str = DEFAULT_BACKEND, chat_id: int = None):
         """Create a new worker instance."""
         self._sync_paths()
         if not is_valid_backend(backend):
@@ -4030,7 +4030,7 @@ class WorkerManager:
 
         return True, None
 
-    def end(self, name: str):
+    def close_session(self, name: str):
         """Kill a worker instance."""
         self._sync_paths()
         registered = self.get_registered_sessions()
@@ -4225,12 +4225,12 @@ class WorkerManager:
         return True, None
 
 
-worker_manager = WorkerManager(SESSIONS_DIR, TMUX_PREFIX)
+session_manager = SessionManager(SESSIONS_DIR, TMUX_PREFIX)
 
 
-def _sync_worker_manager():
-    worker_manager.sessions_dir = SESSIONS_DIR
-    worker_manager.tmux_prefix = TMUX_PREFIX
+def _sync_session_manager():
+    session_manager.sessions_dir = SESSIONS_DIR
+    session_manager.tmux_prefix = TMUX_PREFIX
 
 # ─────────────────────────────────────────────────────────────────────────────
 # grug say: one place for backend branching. no scatter.
@@ -4244,8 +4244,8 @@ def worker_is_online(name: str, session: dict = None) -> bool:
         name: Worker name
         session: Session dict from get_registered_sessions() (optional, avoids re-lookup)
     """
-    _sync_worker_manager()
-    return worker_manager.is_online(name, session)
+    _sync_session_manager()
+    return session_manager.is_online(name, session)
 
 
 def worker_set_pending(name: str, chat_id: int):
@@ -4265,8 +4265,8 @@ def worker_send(name: str, message: str, chat_id: int = None, session: dict = No
     Returns:
         True if send succeeded
     """
-    _sync_worker_manager()
-    return worker_manager.send(name, message, chat_id, session)
+    _sync_session_manager()
+    return session_manager.send(name, message, chat_id, session)
 
 
 def get_tmux_env_value(tmux_name: str, key: str) -> str:
@@ -4285,14 +4285,14 @@ def get_tmux_env_value(tmux_name: str, key: str) -> str:
 
 def scan_tmux_sessions():
     """Scan tmux for registered sessions."""
-    _sync_worker_manager()
-    return worker_manager.scan_tmux_sessions()
+    _sync_session_manager()
+    return session_manager.scan_tmux_sessions()
 
 
 def get_registered_sessions(registered=None):
     """Get registered sessions from tmux (all backends have tmux now)."""
-    _sync_worker_manager()
-    return worker_manager.get_registered_sessions(registered)
+    _sync_session_manager()
+    return session_manager.get_registered_sessions(registered)
 
 
 def tmux_prompt_empty(tmux_name, timeout=0.5):
@@ -4426,10 +4426,10 @@ def stop_docker_container(name):
     subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
 
-def send_to_worker(name: str, message: str, chat_id: Optional[int] = None) -> bool:
+def send_to_session(name: str, message: str, chat_id: Optional[int] = None) -> bool:
     """Send a message to a worker using the appropriate backend."""
-    _sync_worker_manager()
-    return worker_manager.send(name, message, chat_id)
+    _sync_session_manager()
+    return session_manager.send(name, message, chat_id)
 
 
 def _localize_media(name: str, media_list: list) -> list:
@@ -4469,7 +4469,7 @@ def _reap_dead_topic(name, result):
     except Exception:
         pass
     try:
-        worker_manager.end(name)
+        session_manager.close_session(name)
     except Exception as e:
         print(f"Failed to end {name} after topic deletion: {e}", flush=True)
     return True
@@ -4660,20 +4660,20 @@ def _mark_topic_request_done(name):
 
 def create_session(name, backend: str = DEFAULT_BACKEND, chat_id: int = None):
     """Create a new worker instance."""
-    _sync_worker_manager()
-    return worker_manager.hire(name, backend, chat_id=chat_id)
+    _sync_session_manager()
+    return session_manager.open_session(name, backend, chat_id=chat_id)
 
 
 def kill_session(name):
     """Kill a worker instance."""
-    _sync_worker_manager()
-    return worker_manager.end(name)
+    _sync_session_manager()
+    return session_manager.close_session(name)
 
 
 def restart_claude(name, mode: str = "relaunch"):
     """Restart claude in an existing tmux session."""
-    _sync_worker_manager()
-    return worker_manager.restart(name, mode=mode)
+    _sync_session_manager()
+    return session_manager.restart(name, mode=mode)
 
 
 # ============================================================
@@ -4759,7 +4759,7 @@ def send_typing_loop(chat_id, session_name):
         _, tid = load_topic_meta(session_name)
         thread_id = tid or None
     while is_pending(session_name):
-        st = _worker_states.get(session_name)
+        st = _session_states.get(session_name)
         if st and topic_request_stalled(st[0]):
             break
         transport.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
@@ -4857,7 +4857,7 @@ class _LegacyTransportAdapter(MessageTransport):
 
 
 class CommandRouter:
-    def __init__(self, transport, workers: WorkerManager):
+    def __init__(self, transport, workers: SessionManager):
         # Accept MessageTransport or legacy TelegramAPI-style objects (for test compat)
         if transport is not None and not isinstance(transport, MessageTransport):
             transport = _LegacyTransportAdapter(transport)
@@ -4948,7 +4948,7 @@ class CommandRouter:
         # Session is bound now — stop treating typed replies as folder-pick attempts.
         _awaiting_folder.discard((chat_id, thread_id))
         _picker_sent_at.pop((chat_id, thread_id), None)
-        # hire() skips the standalone welcome in TOPIC_MODE; deliver it here so
+        # open_session() skips the standalone welcome in TOPIC_MODE; deliver it here so
         # the worker greets ONCE. route_message keeps the typing/request tracking.
         welcome = self.workers._build_welcome(name, get_backend(DEFAULT_BACKEND))
         self.route_message(name, welcome, chat_id, None)
@@ -5049,7 +5049,7 @@ class CommandRouter:
         _topic_titles.pop(key, None)
         name = find_topic_session(chat_id, thread_id, self.workers.get_registered_sessions())
         if name:
-            self.workers.end(name)
+            self.workers.close_session(name)
             print(f"Topic session ended ({reason or 'closed'}): {name} thread={thread_id}",
                   flush=True)
         return name
@@ -5657,7 +5657,7 @@ class CommandRouter:
                 _topic_request_msg[session_name] = (chat_id, msg_id)
 
 
-command_router = CommandRouter(transport, worker_manager)
+command_router = CommandRouter(transport, session_manager)
 
 # ============================================================
 # TRANSCRIPT VIEWER
@@ -5978,8 +5978,8 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
             # If worker exists, use their actual backend; otherwise default
-            _sync_worker_manager()
-            registered = worker_manager.get_registered_sessions()
+            _sync_session_manager()
+            registered = session_manager.get_registered_sessions()
             tmux_name = ""
             if name in registered:
                 backend_name = get_worker_backend(name, registered[name])
@@ -5996,7 +5996,7 @@ class Handler(BaseHTTPRequestHandler):
                 save_claude_session_cwd(name, requested_cwd)
                 print(f"[checkin] {name}: requested_cwd={requested_cwd}, tmux={tmux_name}")
                 if tmux_name and tmux_exists(tmux_name):
-                    pane_cwd = normalize_cwd(worker_manager._get_tmux_pane_cwd(tmux_name))
+                    pane_cwd = normalize_cwd(session_manager._get_tmux_pane_cwd(tmux_name))
                     # Compare normalized paths without resolving symlinks; workers use the typed path.
                     same_cwd = pane_cwd and pane_cwd.rstrip("/") == requested_cwd.rstrip("/")
                     print(f"[checkin] {name}: pane_cwd={pane_cwd}, same_cwd={same_cwd}")
@@ -6060,7 +6060,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "Messages during restart may be lost.",
                                 )
 
-                            ok, err = worker_manager.restart(name, mode="relaunch")
+                            ok, err = session_manager.restart(name, mode="relaunch")
 
                             _recent_restarts[name] = time.time()
                             print(f"[checkin] {name}: restart result ok={ok}, err={err}")
@@ -6100,7 +6100,7 @@ class Handler(BaseHTTPRequestHandler):
                             with _restart_lock:
                                 _restart_in_progress.pop(name, None)
 
-            welcome = worker_manager._build_welcome(name, backend_obj)
+            welcome = session_manager._build_welcome(name, backend_obj)
 
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -6118,7 +6118,7 @@ class Handler(BaseHTTPRequestHandler):
             now = time.time()
             registered = get_registered_sessions()
             with _watchdog_lock:
-                state_snapshot = dict(_worker_states)
+                state_snapshot = dict(_session_states)
             workers = {}
             for name in sorted(registered.keys()):
                 entry = state_snapshot.get(name)
@@ -6273,7 +6273,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"{comment_body}"
             )
             for t in targets:
-                send_to_worker(t, worker_msg)
+                send_to_session(t, worker_msg)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -6467,7 +6467,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"{comment_body}"
             )
             for t in targets:
-                send_to_worker(t, worker_msg)
+                send_to_session(t, worker_msg)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
