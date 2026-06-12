@@ -6191,18 +6191,22 @@ print('OK')
         sleep 3
 
         # Count clean messages (each should be exactly CC-X# on its own line)
+        # NB: grep -c prints 0 AND exits 1 on no-match — `|| echo 0` would yield "0\n0",
+        # and a failing pipeline here aborts the whole suite under set -euo pipefail.
         local total_expected=25
         local clean
-        clean=$(grep -cE '^CC-[A-E][1-5]$' "$recv_log" 2>/dev/null || echo 0)
+        clean=$(grep -cE '^CC-[A-E][1-5]$' "$recv_log" 2>/dev/null || true)
+        clean=${clean:-0}
         local total
-        total=$(grep -c 'CC-' "$recv_log" 2>/dev/null || echo 0)
+        total=$(grep -c 'CC-' "$recv_log" 2>/dev/null || true)
+        total=${total:-0}
         local corrupted=$(( total - clean ))
 
         if [[ "$clean" -eq "$total_expected" && "$corrupted" -eq 0 ]]; then
             success "Concurrent sends: $clean/$total_expected clean, 0 corrupted"
         else
             fail "Concurrent sends: $clean/$total_expected clean, $corrupted corrupted"
-            grep -v '^CC-[A-E][1-5]$' "$recv_log" 2>/dev/null | grep 'CC-' | head -5 | while IFS= read -r line; do
+            { grep -v '^CC-[A-E][1-5]$' "$recv_log" 2>/dev/null | grep 'CC-' | head -5 || true; } | while IFS= read -r line; do
                 info "  corrupted: '$line'"
             done
         fi
