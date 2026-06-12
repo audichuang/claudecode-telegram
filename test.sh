@@ -148,11 +148,6 @@ cleanup() {
         kill "$(cat "$TEST_NODE_DIR/bridge.pid")" 2>/dev/null || true
         rm -f "$TEST_NODE_DIR/bridge.pid"
     fi
-    # Also kill direct mode bridge PID if tracked
-    if [[ -f "$TEST_NODE_DIR/direct_mode_bridge.pid" ]]; then
-        kill "$(cat "$TEST_NODE_DIR/direct_mode_bridge.pid")" 2>/dev/null || true
-        rm -f "$TEST_NODE_DIR/direct_mode_bridge.pid"
-    fi
     [[ -n "$BRIDGE_PID" ]] && kill "$BRIDGE_PID" 2>/dev/null; true
     [[ -n "$TUNNEL_PID" ]] && kill "$TUNNEL_PID" 2>/dev/null; true
     # Kill any test sessions we created (using test prefix)
@@ -165,7 +160,6 @@ cleanup() {
     [[ -f "$TUNNEL_LOG" ]] && rm -f "$TUNNEL_LOG"; true
     rm -f "$TEST_NODE_DIR/tunnel.pid" "$TEST_NODE_DIR/tunnel_url" "$TEST_NODE_DIR/port" 2>/dev/null || true
     rm -f "$TEST_NODE_DIR/last_chat_id" "$TEST_NODE_DIR/last_active" 2>/dev/null || true
-    rm -f "$TEST_NODE_DIR/direct_mode_bridge.log" 2>/dev/null || true
     [[ -d "${TEST_BIN_DIR:-}" ]] && rm -rf "$TEST_BIN_DIR"; true
 }
 
@@ -719,10 +713,6 @@ assert calls[-1] == (555, 7, bridge.TOPIC_REACTION_STALLED), calls
 bridge._update_topic_reaction('t7', 'READY')
 assert len(calls) == 2, calls
 
-# TOPIC_MODE off → never reacts
-bridge.TOPIC_MODE = False
-bridge._update_topic_reaction('t7', 'BUSY_THINKING')
-assert len(calls) == 2, calls
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
         success "reaction updates + dedup work"
@@ -2216,7 +2206,6 @@ test_send_to_worker_missing() {
     info "Testing send_to_worker for non-existent workers..."
     if python3 -c "
 import os
-os.environ['DIRECT_MODE'] = '0'
 import importlib
 import bridge
 importlib.reload(bridge)
@@ -4679,40 +4668,6 @@ print('OK')
 
 # ── End Memory Subcommand Tests ─────────────────────────────────────────
 
-test_reply_forwarded_voice_gets_transcribed() {
-    info "Testing reply-forwarded voice delivers transcript transparently..."
-    if python3 -c "
-import sys, os
-sys.path.insert(0, os.getcwd())
-from unittest.mock import patch, MagicMock
-import bridge
-
-class FakeRouter:
-    def __init__(self):
-        self.workers = MagicMock()
-
-router = FakeRouter()
-
-reply_to = {
-    'voice': {'file_id': 'voice789', 'duration': 7},
-    'message_id': 99
-}
-
-with patch.object(bridge, 'download_telegram_file', return_value='/tmp/inbox/reply.ogg'), \
-     patch.object(bridge, 'transcribe_voice', return_value='forwarded voice content') as mock_stt:
-    result = bridge.CommandRouter._extract_reply_media(router, reply_to, 'testworker')
-
-assert result is not None, 'Expected text, got None'
-# Transparent: just the transcript, no file path
-assert result == 'forwarded voice content', f'Expected just transcript, got: {result}'
-mock_stt.assert_called_once_with('/tmp/inbox/reply.ogg')
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Reply-forwarded voice delivers transcript transparently"
-    else
-        fail "Reply-forwarded voice transcription test failed"
-    fi
-}
 
 test_file_validation() {
     info "Testing file validation (image path, document path, blocked filenames)..."
@@ -4851,109 +4806,6 @@ print('OK')
     fi
 }
 
-test_direct_mode_lifecycle() {
-    info "Testing direct mode lifecycle (hire, message, team, end)..."
-
-    # Hire
-    local result
-    result=$(send_direct_mode_message "/hire directworker1")
-    if [[ "$result" == "OK" ]]; then
-        sleep 0.5
-        success "/hire creates direct worker"
-    else
-        fail "/hire direct worker failed: $result"
-        return
-    fi
-
-    # Focus and send message
-    send_direct_mode_message "/focus directworker1" >/dev/null
-    sleep 0.2
-    result=$(send_direct_mode_message "Hello direct worker!")
-    if [[ "$result" == "OK" ]]; then
-        success "Message routed to direct worker"
-    else
-        fail "Message routing failed: $result"
-    fi
-
-    # Team command
-    result=$(send_direct_mode_message "/team")
-    if [[ "$result" == "OK" ]]; then
-        success "/team command works in direct mode"
-    else
-        fail "/team command failed in direct mode: $result"
-    fi
-
-    # End
-    result=$(send_direct_mode_message "/end directworker1")
-    if [[ "$result" == "OK" ]]; then
-        sleep 0.3
-        success "/end kills direct worker"
-    else
-        fail "/end direct worker failed: $result"
-    fi
-}
-
-test_direct_mode_shortcuts() {
-    info "Testing direct mode worker shortcuts..."
-
-    # Create two workers
-    local result
-    result=$(send_direct_mode_message "/hire shortcut1")
-    wait_for_direct_worker "shortcut1" || {
-        fail "Shortcut: shortcut1 not started"
-        return
-    }
-
-    result=$(send_direct_mode_message "/hire shortcut2")
-    wait_for_direct_worker "shortcut2" || {
-        fail "Shortcut: shortcut2 not started"
-        send_direct_mode_message "/end shortcut1" >/dev/null 2>&1 || true
-        return
-    }
-
-    # Focus worker1 first
-    send_direct_mode_message "/focus shortcut1" >/dev/null
-    sleep 0.2
-
-    # /<workername> shortcut to focus worker2
-    result=$(send_direct_mode_message "/shortcut2")
-    if [[ "$result" == "OK" ]]; then
-        success "Direct mode /<workername> focus switch works"
-    else
-        fail "Direct mode /<workername> focus switch failed: $result"
-    fi
-
-    # Create workers for message shortcut test
-    send_direct_mode_message "/hire shortmsg1" >/dev/null
-    wait_for_direct_worker "shortmsg1" || true
-    send_direct_mode_message "/hire shortmsg2" >/dev/null
-    wait_for_direct_worker "shortmsg2" || true
-    send_direct_mode_message "/focus shortmsg1" >/dev/null
-    sleep 0.2
-
-    local log_lines_before
-    log_lines_before=$(wc -l < "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "0")
-
-    result=$(send_direct_mode_message "/shortmsg2 Hello from shortcut")
-    if [[ "$result" == "OK" ]]; then
-        sleep 0.5
-        local new_log_lines
-        new_log_lines=$(tail -n +$((log_lines_before + 1)) "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "")
-        if echo "$new_log_lines" | grep -q "Sent to direct worker 'shortmsg2'"; then
-            success "Direct mode /<workername> <message> routing works"
-        else
-            fail "Direct mode shortcut+msg not routed to target worker"
-        fi
-    else
-        fail "Direct mode shortcut+msg command failed: $result"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end shortcut1" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end shortcut2" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end shortmsg1" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end shortmsg2" >/dev/null 2>&1 || true
-}
 
 test_sandbox_docker_cmd() {
     info "Testing sandbox Docker command generation..."
@@ -5672,46 +5524,6 @@ test_last_chat_id_persistence() {
     fi
 }
 
-test_last_active_persistence() {
-    local last_active_file="$TEST_NODE_DIR/last_active"
-
-    # Clean up first
-    rm -f "$last_active_file"
-
-    # Create a session to trigger active save
-    send_message "/hire testpersist"
-    wait_for_session "testpersist"
-
-    # Verify file was created with correct content
-    if [[ -f "$last_active_file" ]]; then
-        local saved_active
-        saved_active=$(cat "$last_active_file")
-        if [[ "$saved_active" == "testpersist" ]]; then
-            success "last_active persistence works"
-        else
-            fail "last_active mismatch: expected testpersist, got $saved_active"
-        fi
-    else
-        fail "last_active file not created"
-    fi
-
-    # Test switch also updates the file
-    send_message "/hire testpersist2"
-    wait_for_session "testpersist2"
-    send_message "/focus testpersist"
-    sleep 0.2
-
-    saved_active=$(cat "$last_active_file")
-    if [[ "$saved_active" == "testpersist" ]]; then
-        success "last_active updated on focus switch"
-    else
-        fail "last_active not updated on switch: expected testpersist, got $saved_active"
-    fi
-
-    # Clean up test sessions
-    send_message "/end testpersist" >/dev/null 2>&1 || true
-    send_message "/end testpersist2" >/dev/null 2>&1 || true
-}
 
 test_response_without_pending() {
     info "Testing /response works without pending file (v0.6.2 behavior)..."
@@ -5821,57 +5633,6 @@ PY
         success "Claude start command generation works"
     else
         fail "Claude start command test failed"
-    fi
-}
-
-test_team_output_includes_backend() {
-    info "Testing /team output includes backend..."
-
-    if python3 -c "
-from bridge import format_team_lines
-
-registered = {
-    'alice': {'backend': 'codex'},
-    'bob': {'backend': 'claude'},
-}
-
-lines = format_team_lines(registered, active='alice', pending_lookup=lambda name: False)
-text = '\\n'.join(lines)
-
-assert 'backend=codex' in text, f'expected codex backend in team output: {text}'
-assert 'backend=claude' in text, f'expected claude backend in team output: {text}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/team output includes backend"
-    else
-        fail "/team backend output test failed"
-    fi
-}
-
-test_progress_output_includes_backend() {
-    info "Testing /progress output includes backend..."
-
-    if python3 -c "
-from bridge import format_progress_lines
-
-lines = format_progress_lines(
-    name='alice',
-    pending=False,
-    backend='codex',
-    online=True,
-    ready=True,
-    mode='tmux'
-)
-
-text = '\\n'.join(lines)
-assert 'codex' in text, f'expected backend name in progress output: {text}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/progress output includes backend"
-    else
-        fail "/progress backend output test failed"
     fi
 }
 
@@ -6241,29 +6002,6 @@ assert result == 'Ready', f'Idle+text: expected Ready, got: {result}'
 lines = ['❯']
 details = _extract_question_details(lines)
 assert details is None, f'Idle should have no details, got: {details}'
-
-# Rich progress includes options
-from bridge import format_progress_lines
-q_details = {
-    'header': 'Pick a color',
-    'options': [
-        {'num': 1, 'label': 'Red', 'selected': True},
-        {'num': 2, 'label': 'Blue', 'selected': False},
-        {'num': 3, 'label': 'Green', 'selected': False},
-    ],
-    'selected_num': 1,
-}
-lines = format_progress_lines(
-    name='kelvin', pending=False, backend='claude',
-    online=True, ready=True, mode='tmux',
-    activity='Waiting for input: Pick a color',
-    question_details=q_details,
-)
-joined = '\n'.join(lines)
-assert 'Red' in joined, f'Missing Red in: {joined}'
-assert 'Blue' in joined, f'Missing Blue in: {joined}'
-assert '1-3' in joined, f'Missing reply hint in: {joined}'
-assert 'skip' in joined.lower(), f'Missing skip hint in: {joined}'
 " 2>&1; then
         success "_extract_activity detects interactive prompts + rich details"
     else
@@ -6396,32 +6134,6 @@ bridge._worker_states.pop('testbot', None)
     fi
 }
 
-test_progress_shows_activity() {
-    info "Testing /progress output includes activity line..."
-
-    if python3 -c "
-from bridge import format_progress_lines
-
-lines = format_progress_lines(
-    name='alice',
-    pending=True,
-    backend='claude',
-    online=True,
-    ready=True,
-    mode='tmux',
-    activity='Running unit tests (3/14 passed)'
-)
-
-text = '\\n'.join(lines)
-assert 'Running unit tests' in text, f'Expected activity in progress output: {text}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/progress output includes activity"
-    else
-        fail "/progress activity output test failed"
-    fi
-}
 
 test_concurrent_sends_no_interleave() {
     info "Testing concurrent tmux sends don't interleave (flock behavior)..."
@@ -6563,45 +6275,6 @@ print('OK')
     fi
 }
 
-test_send_example_uses_paste_buffer() {
-    info "Testing /workers send_example uses paste-buffer for tmux workers..."
-
-    if python3 -c "
-import sys; sys.path.insert(0, '.')
-import bridge
-
-bridge._node_name = 'test-sendex'
-bridge.TMUX_PREFIX = 'test-sendex-'
-
-# Mock get_registered_sessions to return a tmux worker
-orig = bridge.worker_manager.get_registered_sessions
-bridge.worker_manager.get_registered_sessions = lambda: {
-    'bob': {'backend': 'claude', 'tmux': 'test-sendex-bob'}
-}
-
-try:
-    workers = bridge.worker_manager.get_workers()
-    bob = next((w for w in workers if w['name'] == 'bob'), None)
-    assert bob is not None, f'bob not found in workers: {[w[\"name\"] for w in workers]}'
-    assert bob['protocol'] == 'tmux', f'expected tmux protocol, got {bob[\"protocol\"]}'
-
-    ex = bob['send_example']
-    # Must use paste-buffer -p -r for reliable delivery
-    assert 'paste-buffer -p' in ex, f'send_example missing paste-buffer -p: {ex}'
-    # Must use 1s delay — TUI needs time to render
-    assert 'sleep 1' in ex, f'send_example should use sleep 1, got: {ex}'
-    # Must include Enter after delay
-    assert 'send-keys' in ex, f'send_example missing send-keys Enter: {ex}'
-
-    print('OK')
-finally:
-    bridge.worker_manager.get_registered_sessions = orig
-" 2>/dev/null | grep -q "OK"; then
-        success "send_example uses paste-buffer for tmux workers"
-    else
-        fail "send_example paste-buffer test failed"
-    fi
-}
 
 test_end_clears_pending() {
     info "Testing /end clears pending file..."
@@ -9911,103 +9584,6 @@ print('OK')
     fi
 }
 
-test_team_shows_exited() {
-    info "Testing /team shows exited workers..."
-
-    if python3 -c "
-import bridge
-
-# Mock a registered dict with one exited worker (no tmux key)
-registered = {
-    'alive': {'tmux': 'claude-test-alive', 'backend': 'claude'},
-    'dead': {'backend': 'claude'},  # no tmux key = exited
-}
-
-# Record EXITED state in watchdog
-bridge._record_worker_state('dead', 'EXITED', 'session gone', 1000)
-bridge._record_worker_state('alive', 'READY', 'idle', 1000)
-
-lines = bridge.format_team_lines(registered, 'alive')
-output = '\n'.join(lines)
-assert 'dead' in output, f'dead worker should appear in team output'
-assert 'Session ended' in output, f'exited status should appear as Session ended: {output}'
-assert 'alive' in output, f'alive worker should appear in team output'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/team shows exited workers"
-    else
-        fail "/team exited display test failed"
-    fi
-}
-
-test_team_live_activity_format() {
-    info "Testing /team shows live activity, attention, and sorting..."
-
-    if python3 -c "
-import bridge
-
-registered = {
-    'kenji': {'tmux': 'claude-test-kenji', 'backend': 'claude'},
-    'lee': {'tmux': 'claude-test-lee', 'backend': 'claude'},
-    'mon': {'tmux': 'claude-test-mon', 'backend': 'claude'},
-    'kelvin': {'tmux': 'claude-test-kelvin', 'backend': 'claude'},
-}
-
-# Set watchdog states
-bridge._record_worker_state('kenji', 'BUSY_TOOL', 'tools', 1000)
-bridge._record_worker_state('lee', 'READY', 'idle', 1000)
-bridge._record_worker_state('mon', 'READY', 'idle', 1000)
-bridge._record_worker_state('kelvin', 'BUSY_THINKING', 'thinking', 1000)
-
-# Provide live activity data
-worker_live = {
-    'kenji': {'backend': 'claude', 'activity': 'Running Bash', 'context_pct': '54%'},
-    'lee': {'backend': 'claude', 'activity': 'Ready', 'context_pct': '27%'},
-    'mon': {'backend': 'claude', 'activity': 'Rate limited — waiting to retry', 'context_pct': '42%'},
-    'kelvin': {'backend': 'claude', 'activity': 'Waiting for plan approval', 'context_pct': '27%'},
-}
-
-lines = bridge.format_team_lines(registered, 'kenji', worker_live=worker_live)
-output = '\n'.join(lines)
-
-# Header should have team count and traffic-light summary
-assert '4 agents' in output, f'Missing team count: {output}'
-assert 'focused: kenji' in output.lower() or 'focused: Kenji' in output, f'Missing focused: {output}'
-
-# Red/yellow/green counts
-assert chr(0x1F534) in output, f'Missing red circle: {output}'  # 🔴
-assert chr(0x1F7E1) in output, f'Missing yellow circle: {output}'  # 🟡
-assert chr(0x1F7E2) in output, f'Missing green circle: {output}'  # 🟢
-
-# mon has rate limit -> needs attention
-assert 'mon' in output and 'rate limit' in output.lower(), f'Missing mon rate limit: {output}'
-
-# kelvin waiting for approval -> needs reply
-assert 'kelvin' in output and 'needs reply' in output.lower(), f'Missing kelvin needs reply: {output}'
-
-# Activity should appear for each worker
-assert 'Running Bash' in output, f'Missing kenji activity: {output}'
-assert 'Ready' in output, f'Missing lee Ready activity: {output}'
-
-# Red workers should come before green in the list
-lines_lower = output.lower()
-mon_pos = lines_lower.index('mon')
-lee_pos = lines_lower.index('lee')
-assert mon_pos < lee_pos, f'Red (mon) should sort before green (lee): {output}'
-
-# Focused worker should have target icon
-assert chr(0x1F3AF) in output, f'Missing target icon for focused worker: {output}'  # 🎯
-
-# Backend should NOT show when all same
-assert 'backend=' not in output, f'backend should be hidden when all same: {output}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/team shows live activity and attention"
-    else
-        fail "/team live activity format test failed"
-    fi
-}
 
 test_normalize_activity_spinner_verbs() {
     info "Testing spinner verbs are normalized to Thinking..."
@@ -10063,73 +9639,6 @@ print('OK')
     fi
 }
 
-test_team_header_human_friendly() {
-    info "Testing /team header is human-friendly..."
-
-    if python3 -c "
-import bridge
-
-registered = {
-    'kai': {'tmux': 'claude-test-kai', 'backend': 'claude'},
-    'lee': {'tmux': 'claude-test-lee', 'backend': 'claude'},
-}
-bridge._record_worker_state('kai', 'WAITING_INPUT', 'question=Auth', 1000)
-bridge._record_worker_state('lee', 'READY', 'idle', 1000)
-
-lines = bridge.format_team_lines(registered, 'lee')
-header = lines[0]
-
-assert 'agents' in header, f'Header should contain agents: {header}'
-assert 'ok' in header.lower() or 'active' in header.lower(), f'Header should contain ok: {header}'
-assert 'need reply' in header.lower() or 'waiting' in header.lower(), f'Header should say need reply: {header}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/team header is human-friendly"
-    else
-        fail "/team header human-friendly test failed"
-    fi
-}
-
-test_team_row_format_simplified() {
-    info "Testing /team row format is simplified..."
-
-    if python3 -c "
-import bridge
-
-registered = {
-    'kai': {'tmux': 'claude-test-kai', 'backend': 'claude'},
-    'lee': {'tmux': 'claude-test-lee', 'backend': 'claude'},
-}
-bridge._record_worker_state('kai', 'READY', 'idle', 1000)
-bridge._record_worker_state('lee', 'READY', 'idle', 1000)
-
-worker_live = {
-    'kai': {'backend': 'claude', 'activity': 'Ready', 'context_pct': '54%'},
-    'lee': {'backend': 'claude', 'activity': 'Ready', 'context_pct': '--'},
-}
-
-lines = bridge.format_team_lines(registered, 'lee', worker_live=worker_live)
-output = '\n'.join(lines)
-
-# Should not have 'no blocker' or 'needs input' as separate column
-assert 'no blocker' not in output, f'Should not have no blocker column: {output}'
-
-# Worker with context should show it
-kai_line = [l for l in lines if 'kai' in l][0]
-assert '54%' in kai_line, f'kai should show context: {kai_line}'
-
-# Worker without context should not show --
-lee_line = [l for l in lines if 'lee' in l][0]
-assert '-- ' not in lee_line and '| --' not in lee_line, f'lee should not show --: {lee_line}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/team row format simplified"
-    else
-        fail "/team row format test failed"
-    fi
-}
 
 test_watchdog_alert_stuck_copy() {
     info "Testing watchdog STUCK alert copy..."
@@ -10435,118 +9944,35 @@ test_with_tunnel() {
 # Worker Discovery Tests (inter-worker communication)
 # ─────────────────────────────────────────────────────────────────────────────
 
-test_workers_endpoint_exists() {
-    info "Testing GET /workers endpoint exists..."
+test_workers_endpoint_removed() {
+    local code
 
-    local response
-    response=$(curl -s "http://localhost:$PORT/workers")
-
-    if echo "$response" | grep -q "workers"; then
-        success "/workers endpoint returns workers array"
-    else
-        fail "/workers endpoint missing or invalid response: $response"
-    fi
-}
-
-test_workers_endpoint_json_structure() {
-    info "Testing /workers endpoint returns valid JSON structure..."
-
-    if python3 -c "
-import urllib.request
-import json
-
-url = 'http://localhost:$PORT/workers'
-with urllib.request.urlopen(url) as response:
-    data = json.loads(response.read())
-
-# Should have 'workers' key
-assert 'workers' in data, 'Response should have workers key'
-assert isinstance(data['workers'], list), 'workers should be a list'
-
-# If workers exist, check structure
-for worker in data['workers']:
-    assert 'name' in worker, 'worker should have name'
-    assert 'protocol' in worker, 'worker should have protocol'
-    assert 'address' in worker, 'worker should have address'
-    assert 'send_example' in worker, 'worker should have send_example'
-    assert worker['protocol'] in ('tmux', 'pipe'), f\"protocol should be tmux or pipe, got {worker['protocol']}\"
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/workers endpoint returns valid JSON structure"
-    else
-        fail "/workers endpoint JSON structure invalid"
-    fi
-}
-
-test_workers_endpoint_shows_tmux_workers() {
-    info "Testing /workers endpoint shows tmux workers..."
-
-    # Create a worker first
-    send_message "/hire discoverworker1" >/dev/null
-    wait_for_session "discoverworker1"
-    sleep 0.3
-
-    if python3 -c "
-import urllib.request
-import json
-
-url = 'http://localhost:$PORT/workers'
-with urllib.request.urlopen(url) as response:
-    data = json.loads(response.read())
-
-# Find our test worker
-found = None
-for worker in data['workers']:
-    if worker['name'] == 'discoverworker1':
-        found = worker
-        break
-
-assert found, f'discoverworker1 should be in workers list, got: {[w[\"name\"] for w in data[\"workers\"]]}'
-assert found['protocol'] == 'tmux', f'tmux worker should have tmux protocol, got {found[\"protocol\"]}'
-assert '${TEST_TMUX_PREFIX}discoverworker1' in found['address'], f'address should be tmux session name'
-assert 'paste-buffer -r' in found['send_example'], f'send_example should use paste-buffer -r (no bracketed paste), got: {found[\"send_example\"]}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/workers shows tmux workers with correct structure"
-    else
-        fail "/workers tmux worker structure incorrect"
+    if ! nc -z localhost "$PORT" 2>/dev/null; then
+        mkdir -p "$TEST_NODE_DIR" "$TEST_SESSION_DIR" "$TEST_TEAM_DIR"
+        chmod 700 "$TEST_NODE_DIR" "$TEST_SESSION_DIR" "$TEST_TEAM_DIR"
+        TELEGRAM_BOT_TOKEN="$TEST_BOT_TOKEN" \
+        PORT="$PORT" \
+        NODE_NAME="$TEST_NODE" \
+        SESSIONS_DIR="$TEST_SESSION_DIR" \
+        TMUX_PREFIX="$TEST_TMUX_PREFIX" \
+        ADMIN_CHAT_ID="${TEST_CHAT_ID:-}" \
+        TEAM_DIR="$TEST_TEAM_DIR" \
+        python3 -u "$SCRIPT_DIR/bridge.py" > "$BRIDGE_LOG" 2>&1 &
+        BRIDGE_PID=$!
+        echo "$BRIDGE_PID" > "$TEST_NODE_DIR/bridge.pid"
+        echo "$PORT" > "$TEST_NODE_DIR/port"
+        if ! wait_for_port "$PORT"; then
+            echo "bridge failed to start"
+            return 1
+        fi
     fi
 
-    # Cleanup
-    send_message "/end discoverworker1" >/dev/null 2>&1 || true
-}
-
-test_workers_endpoint_empty_when_no_workers() {
-    info "Testing /workers endpoint returns empty list when no workers..."
-
-    # Kill all test workers
-    tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${TEST_TMUX_PREFIX}" | while read -r session; do
-        tmux kill-session -t "$session" 2>/dev/null || true
-    done
-
-    sleep 0.3
-
-    if python3 -c "
-import urllib.request
-import json
-
-url = 'http://localhost:$PORT/workers'
-with urllib.request.urlopen(url) as response:
-    data = json.loads(response.read())
-
-# Should have empty workers list
-assert 'workers' in data, 'Response should have workers key'
-assert len(data['workers']) == 0, f'Should have no workers, got {len(data[\"workers\"])}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "/workers returns empty list when no workers"
-    else
-        fail "/workers should return empty list"
+    if ! code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/workers"); then
+        code="000"
     fi
+    [[ "$code" == "404" ]] || { echo "expected 404, got $code"; return 1; }
 }
+
 
 test_send_to_worker_integration() {
     info "Testing send_to_worker with real tmux worker..."
@@ -10639,106 +10065,6 @@ print('OK')
 # ─────────────────────────────────────────────────────────────────────────────
 # Direct Mode Tests (--no-tmux / --direct)
 # ─────────────────────────────────────────────────────────────────────────────
-
-test_direct_mode_env_var() {
-    info "Testing DIRECT_MODE environment variable..."
-
-    if python3 -c "
-import os
-os.environ['DIRECT_MODE'] = '1'
-
-# Re-import to pick up env change
-import importlib
-import bridge
-importlib.reload(bridge)
-
-assert bridge.DIRECT_MODE == True, 'DIRECT_MODE should be True when env is 1'
-
-# Test with 0
-os.environ['DIRECT_MODE'] = '0'
-importlib.reload(bridge)
-assert bridge.DIRECT_MODE == False, 'DIRECT_MODE should be False when env is 0'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "DIRECT_MODE env var works"
-    else
-        fail "DIRECT_MODE env var test failed"
-    fi
-}
-
-test_direct_mode_handle_event() {
-    info "Testing handle_direct_event parses Claude JSON events..."
-
-    if python3 -c "
-from bridge import handle_direct_event
-
-# Test assistant message event
-event = {
-    'type': 'assistant',
-    'message': {
-        'content': [{'type': 'text', 'text': 'Hello world'}]
-    }
-}
-result = handle_direct_event('test', event)
-assert result == 'Hello world', f'Expected Hello world, got {result}'
-
-# Test content_block_delta event
-event2 = {
-    'type': 'content_block_delta',
-    'delta': {'type': 'text_delta', 'text': 'chunk'}
-}
-result2 = handle_direct_event('test', event2)
-assert result2 == 'chunk', f'Expected chunk, got {result2}'
-
-# Test error event
-event3 = {
-    'type': 'error',
-    'error': {'message': 'Something went wrong'}
-}
-result3 = handle_direct_event('test', event3)
-assert 'Something went wrong' in result3, f'Expected error message, got {result3}'
-
-# Test unknown event (should return None)
-event4 = {'type': 'unknown'}
-result4 = handle_direct_event('test', event4)
-assert result4 is None, f'Unknown event should return None, got {result4}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "handle_direct_event parses events correctly"
-    else
-        fail "handle_direct_event test failed"
-    fi
-}
-
-test_direct_mode_html_escape() {
-    info "Testing escape_html escapes special characters..."
-
-    if python3 -c "
-from bridge import escape_html
-
-# Test basic escaping
-assert escape_html('hello') == 'hello', 'Plain text unchanged'
-assert escape_html('<script>') == '&lt;script&gt;', 'Angle brackets escaped'
-assert escape_html('a & b') == 'a &amp; b', 'Ampersand escaped'
-assert escape_html('1 < 2 > 0') == '1 &lt; 2 &gt; 0', 'Mixed escaping'
-
-# Test real-world cases (README content)
-code = 'if (x < 10 && y > 5)'
-expected = 'if (x &lt; 10 &amp;&amp; y &gt; 5)'
-assert escape_html(code) == expected, f'Code escaping failed: {escape_html(code)}'
-
-# Test already-escaped content (should double-escape)
-assert escape_html('&lt;') == '&amp;lt;', 'Already escaped gets re-escaped'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "escape_html escapes special characters correctly"
-    else
-        fail "escape_html test failed"
-    fi
-}
 
 # Test markdown_to_telegram_html converter (markdown-it-py based)
 test_markdown_to_telegram_html() {
@@ -10905,970 +10231,6 @@ print('OK')
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Direct Mode Integration Tests (bridge running in DIRECT_MODE=1)
-# ─────────────────────────────────────────────────────────────────────────────
-
-DIRECT_MODE_PORT="${DIRECT_MODE_PORT:-8096}"
-DIRECT_MODE_BRIDGE_PID=""
-DIRECT_MODE_BRIDGE_LOG="$TEST_NODE_DIR/direct_mode_bridge.log"
-
-start_direct_mode_bridge() {
-    info "Starting bridge in direct mode on port $DIRECT_MODE_PORT..."
-
-    # Kill any existing process on port
-    lsof -ti :"$DIRECT_MODE_PORT" | xargs kill -9 2>/dev/null || true
-    sleep 0.3
-
-    # Start bridge with DIRECT_MODE=1
-    TELEGRAM_BOT_TOKEN="$TEST_BOT_TOKEN" \
-    PORT="$DIRECT_MODE_PORT" \
-    NODE_NAME="$TEST_NODE" \
-    SESSIONS_DIR="$TEST_SESSION_DIR" \
-    TMUX_PREFIX="$TEST_TMUX_PREFIX" \
-    ADMIN_CHAT_ID="${TEST_CHAT_ID:-$CHAT_ID}" \
-    DIRECT_MODE=1 \
-    python3 -u "$SCRIPT_DIR/bridge.py" > "$DIRECT_MODE_BRIDGE_LOG" 2>&1 &
-    DIRECT_MODE_BRIDGE_PID=$!
-    echo "$DIRECT_MODE_BRIDGE_PID" > "$TEST_NODE_DIR/direct_mode_bridge.pid"
-
-    if wait_for_port "$DIRECT_MODE_PORT"; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-stop_direct_mode_bridge() {
-    info "Stopping direct mode bridge..."
-    if [[ -n "$DIRECT_MODE_BRIDGE_PID" ]]; then
-        kill "$DIRECT_MODE_BRIDGE_PID" 2>/dev/null || true
-        DIRECT_MODE_BRIDGE_PID=""
-    fi
-    if [[ -f "$TEST_NODE_DIR/direct_mode_bridge.pid" ]]; then
-        kill "$(cat "$TEST_NODE_DIR/direct_mode_bridge.pid")" 2>/dev/null || true
-        rm -f "$TEST_NODE_DIR/direct_mode_bridge.pid"
-    fi
-    rm -f "$DIRECT_MODE_BRIDGE_LOG"
-}
-
-send_direct_mode_message() {
-    local text="$1"
-    local chat_id="${2:-$CHAT_ID}"
-    local update_id=$((RANDOM))
-
-    curl -s -X POST "http://localhost:$DIRECT_MODE_PORT" \
-        -H "Content-Type: application/json" \
-        -d '{
-            "update_id": '"$update_id"',
-            "message": {
-                "message_id": '"$update_id"',
-                "from": {"id": '"$chat_id"', "first_name": "TestUser"},
-                "chat": {"id": '"$chat_id"', "type": "private"},
-                "date": '"$(date +%s)"',
-                "text": "'"$text"'"
-            }
-        }'
-}
-
-send_direct_mode_reply() {
-    local text="$1"
-    local reply_text="$2"
-    local reply_from_bot="${3:-true}"
-    local chat_id="${4:-$CHAT_ID}"
-    local update_id=$((RANDOM))
-    local reply_id=$((RANDOM + 1000))
-
-    curl -s -X POST "http://localhost:$DIRECT_MODE_PORT" \
-        -H "Content-Type: application/json" \
-        -d '{
-            "update_id": '"$update_id"',
-            "message": {
-                "message_id": '"$update_id"',
-                "from": {"id": '"$chat_id"', "first_name": "TestUser"},
-                "chat": {"id": '"$chat_id"', "type": "private"},
-                "date": '"$(date +%s)"',
-                "text": "'"$text"'",
-                "reply_to_message": {
-                    "message_id": '"$reply_id"',
-                    "from": {"id": 123456, "first_name": "Bot", "is_bot": '"$reply_from_bot"'},
-                    "chat": {"id": '"$chat_id"', "type": "private"},
-                    "date": '"$(date +%s)"',
-                    "text": "'"$reply_text"'"
-                }
-            }
-        }'
-}
-
-test_direct_mode_bridge_starts() {
-    info "Testing direct mode bridge starts..."
-
-    if start_direct_mode_bridge; then
-        success "Direct mode bridge started on port $DIRECT_MODE_PORT"
-    else
-        fail "Direct mode bridge failed to start"
-        return 1
-    fi
-
-    # Verify health endpoint
-    if curl -s "http://localhost:$DIRECT_MODE_PORT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'endpoints' in d" 2>/dev/null; then
-        success "Direct mode bridge health endpoint responds with JSON"
-    else
-        fail "Direct mode bridge health endpoint not responding with JSON"
-    fi
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Direct Mode Parity Tests (ensure direct mode has same features as tmux mode)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Helper: send a reply to a message in direct mode
-send_direct_mode_reply() {
-    local text="$1"
-    local reply_text="$2"
-    local reply_from_bot="${3:-true}"
-    local chat_id="${4:-$CHAT_ID}"
-    local update_id=$((RANDOM))
-    local reply_id=$((RANDOM + 1000))
-
-    curl -s -X POST "http://localhost:$DIRECT_MODE_PORT" \
-        -H "Content-Type: application/json" \
-        -d '{
-            "update_id": '"$update_id"',
-            "message": {
-                "message_id": '"$update_id"',
-                "from": {"id": '"$chat_id"', "first_name": "TestUser"},
-                "chat": {"id": '"$chat_id"', "type": "private"},
-                "date": '"$(date +%s)"',
-                "text": "'"$text"'",
-                "reply_to_message": {
-                    "message_id": '"$reply_id"',
-                    "from": {"id": 123456, "first_name": "Bot", "is_bot": '"$reply_from_bot"'},
-                    "chat": {"id": '"$chat_id"', "type": "private"},
-                    "date": '"$(date +%s)"',
-                    "text": "'"$reply_text"'"
-                }
-            }
-        }'
-}
-
-
-test_direct_mode_unknown_cmd_passthrough() {
-    info "Testing unknown command passthrough in direct mode..."
-
-    # Test that unknown /commands are passed through to worker
-    # (matches tmux mode test_unknown_command_passthrough)
-
-    # Clean up any existing test worker
-    send_direct_mode_message "/end cmdworker" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    # Create and focus worker
-    local result
-    result=$(send_direct_mode_message "/hire cmdworker")
-    wait_for_direct_worker "cmdworker" || {
-        fail "Cmd passthrough: cmdworker not started"
-        return
-    }
-    send_direct_mode_message "/focus cmdworker" >/dev/null
-    sleep 0.2
-
-    # Clear log markers
-    local log_lines_before
-    log_lines_before=$(wc -l < "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "0")
-
-    # Send unknown command - should pass through to worker
-    result=$(send_direct_mode_message "/unknowncommand arg1 arg2")
-    if [[ "$result" != "OK" ]]; then
-        fail "Cmd passthrough: Unknown command rejected: $result"
-        send_direct_mode_message "/end cmdworker" >/dev/null 2>&1 || true
-        return
-    fi
-
-    # Wait for routing
-    sleep 0.5
-
-    # Check that command was routed to worker
-    local new_log_lines
-    new_log_lines=$(tail -n +$((log_lines_before + 1)) "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "")
-
-    if echo "$new_log_lines" | grep -q "Sent to direct worker 'cmdworker'"; then
-        success "Cmd passthrough: Unknown command routed to worker"
-    else
-        fail "Cmd passthrough: Unknown command not routed to worker"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end cmdworker" >/dev/null 2>&1 || true
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Direct Mode E2E Tests (full Telegram flow with Claude subprocess)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Helper to check if claude CLI is available
-check_claude_available() {
-    if command -v claude &>/dev/null; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Helper to wait for direct worker response (polling bridge log)
-wait_for_direct_response() {
-    local worker_name="$1"
-    local timeout="${2:-30}"
-    local attempts=0
-
-    while [[ $attempts -lt $timeout ]]; do
-        # Check if there's a response for this worker in the log
-        if grep -q "Response sent: $worker_name -> Telegram OK" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null; then
-            return 0
-        fi
-        sleep 1
-        ((attempts++))
-    done
-    return 1
-}
-
-# Helper to wait for worker to be created
-wait_for_direct_worker() {
-    local worker_name="$1"
-    local timeout="${2:-10}"
-    local attempts=0
-
-    while [[ $attempts -lt $timeout ]]; do
-        if grep -q "Started direct worker '$worker_name'" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null; then
-            return 0
-        fi
-        sleep 0.5
-        ((attempts++))
-    done
-    return 1
-}
-
-# Helper to wait for worker to be killed
-wait_for_direct_worker_killed() {
-    local worker_name="$1"
-    local timeout="${2:-10}"
-    local attempts=0
-
-    while [[ $attempts -lt $timeout ]]; do
-        if grep -q "Killed direct worker '$worker_name'" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null; then
-            return 0
-        fi
-        sleep 0.5
-        ((attempts++))
-    done
-    return 1
-}
-
-# Helper to wait for worker to be initialized (received init event)
-# Note: Claude can take 10-20 seconds to initialize, so use longer timeout
-wait_for_direct_worker_initialized() {
-    local worker_name="$1"
-    local timeout="${2:-60}"  # 60 * 0.5 = 30 seconds max
-    local attempts=0
-
-    while [[ $attempts -lt $timeout ]]; do
-        if grep -q "Direct worker '$worker_name' initialized" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null; then
-            return 0
-        fi
-        sleep 0.5
-        ((attempts++))
-    done
-    return 1
-}
-
-# Helper to check if subprocess is still running (not just created)
-check_direct_worker_process_running() {
-    local worker_name="$1"
-
-    # Check via Python that process.poll() is None
-    DIRECT_MODE=1 python3 -c "
-import sys
-sys.path.insert(0, '.')
-import bridge
-
-worker = bridge.direct_workers.get('$worker_name')
-if not worker:
-    print('NOT_FOUND')
-    sys.exit(1)
-
-poll_result = worker.process.poll()
-if poll_result is None:
-    print('RUNNING')
-else:
-    print(f'EXITED:{poll_result}')
-    sys.exit(1)
-" 2>/dev/null | grep -q "RUNNING"
-}
-
-# BEHAVIOR TEST: Verify subprocess stays alive after creation
-# This catches the bug where subprocess exits immediately after starting
-test_direct_mode_subprocess_stays_alive() {
-    info "Testing direct mode subprocess stays alive after creation..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up any existing test worker
-    send_direct_mode_message "/end aliveworker" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    # Create worker
-    local result
-    result=$(send_direct_mode_message "/hire aliveworker")
-
-    if [[ "$result" != "OK" ]]; then
-        fail "Subprocess alive: /hire failed: $result"
-        return
-    fi
-
-    # Wait for worker to start
-    if ! wait_for_direct_worker "aliveworker"; then
-        fail "Subprocess alive: Worker not created"
-        return
-    fi
-
-    # KEY BEHAVIOR TEST: Wait 3 seconds and verify process is STILL running
-    # This catches the bug where subprocess exits immediately
-    sleep 3
-
-    # Check if reader thread exited (indicates subprocess died)
-    if grep -q "Reader thread for worker 'aliveworker' exited" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null; then
-        fail "Subprocess alive: Reader thread exited (subprocess died!)"
-        send_direct_mode_message "/end aliveworker" >/dev/null 2>&1 || true
-        return
-    fi
-
-    success "Subprocess alive: Process still running after 3 seconds"
-
-    # Cleanup
-    send_direct_mode_message "/end aliveworker" >/dev/null 2>&1 || true
-}
-
-# BEHAVIOR TEST: Verify worker accepts messages after creation
-# This catches the bug where subprocess starts but stdin pipe is broken
-test_direct_mode_worker_accepts_messages() {
-    info "Testing direct mode worker accepts messages..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up any existing test worker
-    send_direct_mode_message "/end msgworker" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    # Create worker
-    local result
-    result=$(send_direct_mode_message "/hire msgworker")
-
-    if [[ "$result" != "OK" ]]; then
-        fail "Accepts messages: /hire failed: $result"
-        return
-    fi
-
-    # Wait for worker to start
-    if ! wait_for_direct_worker "msgworker"; then
-        fail "Accepts messages: Worker not created"
-        return
-    fi
-
-    # Focus the worker
-    send_direct_mode_message "/focus msgworker" >/dev/null
-    sleep 0.5
-
-    # KEY BEHAVIOR TEST: Send a message and verify it reaches the worker
-    result=$(send_direct_mode_message "test message from behavior test")
-
-    if [[ "$result" != "OK" ]]; then
-        fail "Accepts messages: Message send failed: $result"
-        send_direct_mode_message "/end msgworker" >/dev/null 2>&1 || true
-        return
-    fi
-
-    # Verify message was sent to worker (check log)
-    sleep 1
-    if grep -q "Sent to direct worker 'msgworker'" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null; then
-        success "Accepts messages: Worker received message via stdin"
-    else
-        fail "Accepts messages: Message not delivered to worker"
-        send_direct_mode_message "/end msgworker" >/dev/null 2>&1 || true
-        return
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end msgworker" >/dev/null 2>&1 || true
-}
-
-test_direct_mode_e2e_full_flow() {
-    info "Testing direct mode E2E full flow (hire -> message -> response -> end)..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up any existing test workers
-    send_direct_mode_message "/end e2eworker" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    # Step 1: Hire a worker
-    local result
-    result=$(send_direct_mode_message "/hire e2eworker")
-
-    if [[ "$result" != "OK" ]]; then
-        fail "E2E: /hire failed: $result"
-        return
-    fi
-
-    if ! wait_for_direct_worker "e2eworker"; then
-        fail "E2E: Worker not created"
-        return
-    fi
-    success "E2E: Worker created"
-
-    # Step 2: Focus the worker
-    send_direct_mode_message "/focus e2eworker" >/dev/null
-    sleep 0.3
-
-    # Step 3: Send a message and wait for response
-    result=$(send_direct_mode_message "Say hello in one word only")
-
-    if [[ "$result" != "OK" ]]; then
-        fail "E2E: Message send failed: $result"
-        send_direct_mode_message "/end e2eworker" >/dev/null 2>&1 || true
-        return
-    fi
-    success "E2E: Message sent to worker"
-
-    # Step 4: Wait for response (with timeout)
-    # Note: Claude response time can vary, so we use a longer timeout
-    if wait_for_direct_response "e2eworker" 60; then
-        success "E2E: Response received from Claude"
-    else
-        info "E2E: Response timeout (Claude may be slow, this is not a failure)"
-    fi
-
-    # Step 5: End the worker
-    result=$(send_direct_mode_message "/end e2eworker")
-
-    if [[ "$result" == "OK" ]]; then
-        if wait_for_direct_worker_killed "e2eworker"; then
-            success "E2E: Worker terminated successfully"
-        else
-            fail "E2E: Worker not properly killed"
-        fi
-    else
-        fail "E2E: /end failed: $result"
-    fi
-}
-
-test_direct_mode_e2e_focus_switch() {
-    info "Testing direct mode E2E focus switch between workers..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up any existing test workers
-    send_direct_mode_message "/end focusworker1" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end focusworker2" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    # Create two workers
-    send_direct_mode_message "/hire focusworker1" >/dev/null
-    wait_for_direct_worker "focusworker1"
-
-    send_direct_mode_message "/hire focusworker2" >/dev/null
-    wait_for_direct_worker "focusworker2"
-
-    # Focus first worker
-    local result
-    result=$(send_direct_mode_message "/focus focusworker1")
-
-    if [[ "$result" != "OK" ]]; then
-        fail "Focus switch: /focus focusworker1 failed"
-        send_direct_mode_message "/end focusworker1" >/dev/null 2>&1 || true
-        send_direct_mode_message "/end focusworker2" >/dev/null 2>&1 || true
-        return
-    fi
-    success "Focus switch: Focused focusworker1"
-
-    # Switch focus to second worker
-    result=$(send_direct_mode_message "/focus focusworker2")
-
-    if [[ "$result" != "OK" ]]; then
-        fail "Focus switch: /focus focusworker2 failed"
-        send_direct_mode_message "/end focusworker1" >/dev/null 2>&1 || true
-        send_direct_mode_message "/end focusworker2" >/dev/null 2>&1 || true
-        return
-    fi
-    success "Focus switch: Switched focus to focusworker2"
-
-    # Verify /team shows both workers
-    result=$(send_direct_mode_message "/team")
-    if [[ "$result" == "OK" ]]; then
-        success "Focus switch: /team works with multiple workers"
-    else
-        fail "Focus switch: /team failed"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end focusworker1" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end focusworker2" >/dev/null 2>&1 || true
-}
-
-test_direct_mode_e2e_at_mention() {
-    info "Testing direct mode E2E @mention routing..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up any existing test workers
-    send_direct_mode_message "/end mentionworker1" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end mentionworker2" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    # Create two workers
-    send_direct_mode_message "/hire mentionworker1" >/dev/null
-    wait_for_direct_worker "mentionworker1"
-
-    send_direct_mode_message "/hire mentionworker2" >/dev/null
-    wait_for_direct_worker "mentionworker2"
-
-    # Focus worker1
-    send_direct_mode_message "/focus mentionworker1" >/dev/null
-    sleep 0.2
-
-    # Use @mention to route to worker2 without changing focus
-    local result
-    result=$(send_direct_mode_message "@mentionworker2 Hello via mention")
-
-    if [[ "$result" == "OK" ]]; then
-        # Check that message was routed to mentionworker2
-        sleep 0.5
-        if grep -q "Sent to direct worker 'mentionworker2'" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null; then
-            success "@mention: Message routed to correct worker"
-        else
-            fail "@mention: Message not routed to worker2"
-        fi
-    else
-        fail "@mention: Request failed: $result"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end mentionworker1" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end mentionworker2" >/dev/null 2>&1 || true
-}
-
-test_direct_mode_at_all_broadcast() {
-    info "Testing @all broadcast in direct mode..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up any existing test workers
-    send_direct_mode_message "/end allworker1" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end allworker2" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    # Create two workers
-    local result
-    result=$(send_direct_mode_message "/hire allworker1")
-    if [[ "$result" != "OK" ]]; then
-        fail "@all direct: Failed to create allworker1"
-        return
-    fi
-    wait_for_direct_worker "allworker1" || {
-        fail "@all direct: allworker1 not started"
-        return
-    }
-
-    result=$(send_direct_mode_message "/hire allworker2")
-    if [[ "$result" != "OK" ]]; then
-        fail "@all direct: Failed to create allworker2"
-        send_direct_mode_message "/end allworker1" >/dev/null 2>&1 || true
-        return
-    fi
-    wait_for_direct_worker "allworker2" || {
-        fail "@all direct: allworker2 not started"
-        send_direct_mode_message "/end allworker1" >/dev/null 2>&1 || true
-        return
-    }
-
-    # Clear log markers by noting current line count
-    local log_lines_before
-    log_lines_before=$(wc -l < "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "0")
-
-    # Send @all broadcast
-    result=$(send_direct_mode_message "@all Hello everyone from test")
-    if [[ "$result" != "OK" ]]; then
-        fail "@all direct: Broadcast failed: $result"
-        send_direct_mode_message "/end allworker1" >/dev/null 2>&1 || true
-        send_direct_mode_message "/end allworker2" >/dev/null 2>&1 || true
-        return
-    fi
-
-    # Wait for message routing
-    sleep 0.5
-
-    # Check that both workers received the message (new log lines only)
-    local worker1_got_msg=false
-    local worker2_got_msg=false
-
-    local new_log_lines
-    new_log_lines=$(tail -n +$((log_lines_before + 1)) "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "")
-
-    if echo "$new_log_lines" | grep -q "Sent to direct worker 'allworker1'"; then
-        worker1_got_msg=true
-    fi
-    if echo "$new_log_lines" | grep -q "Sent to direct worker 'allworker2'"; then
-        worker2_got_msg=true
-    fi
-
-    if $worker1_got_msg && $worker2_got_msg; then
-        success "@all direct: Broadcast reached both workers"
-    elif $worker1_got_msg || $worker2_got_msg; then
-        fail "@all direct: Broadcast only reached one worker"
-    else
-        fail "@all direct: Broadcast reached neither worker"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end allworker1" >/dev/null 2>&1 || true
-    send_direct_mode_message "/end allworker2" >/dev/null 2>&1 || true
-}
-
-test_direct_mode_reply_routing() {
-    info "Testing reply routing in direct mode..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up any existing test worker
-    send_direct_mode_message "/end replyworker" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    # Create worker
-    local result
-    result=$(send_direct_mode_message "/hire replyworker")
-    if [[ "$result" != "OK" ]]; then
-        fail "Reply direct: /hire failed: $result"
-        return
-    fi
-
-    if ! wait_for_direct_worker "replyworker"; then
-        fail "Reply direct: replyworker not started"
-        send_direct_mode_message "/end replyworker" >/dev/null 2>&1 || true
-        return
-    fi
-
-    # Track log position
-    local log_lines_before
-    log_lines_before=$(wc -l < "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "0")
-
-    # Send reply to a bot message with worker prefix
-    result=$(send_direct_mode_reply "Following up on that" "replyworker: Previous response text")
-    if [[ "$result" != "OK" ]]; then
-        fail "Reply direct: Reply send failed: $result"
-        send_direct_mode_message "/end replyworker" >/dev/null 2>&1 || true
-        return
-    fi
-
-    # Wait for routing
-    sleep 0.5
-
-    # Check routing in new log lines
-    local new_log_lines
-    new_log_lines=$(tail -n +$((log_lines_before + 1)) "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "")
-
-    if echo "$new_log_lines" | grep -q "Sent to direct worker 'replyworker'"; then
-        success "Reply direct: Reply routed to worker via prefix"
-    else
-        fail "Reply direct: Reply not routed to worker"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end replyworker" >/dev/null 2>&1 || true
-}
-
-test_direct_mode_reply_context() {
-    info "Testing reply context in direct mode..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up any existing test worker
-    send_direct_mode_message "/end contextworker" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    # Create and focus worker
-    local result
-    result=$(send_direct_mode_message "/hire contextworker")
-    if [[ "$result" != "OK" ]]; then
-        fail "Context direct: /hire failed: $result"
-        return
-    fi
-    if ! wait_for_direct_worker "contextworker"; then
-        fail "Context direct: contextworker not started"
-        return
-    fi
-    send_direct_mode_message "/focus contextworker" >/dev/null
-    sleep 0.2
-
-    # Clear log markers by noting current line count
-    local log_lines_before
-    log_lines_before=$(wc -l < "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "0")
-
-    # Send reply to own (non-bot) message with reply_from_bot=false
-    result=$(send_direct_mode_reply "." "my original message" "false")
-    if [[ "$result" != "OK" ]]; then
-        fail "Context direct: Reply send failed: $result"
-        send_direct_mode_message "/end contextworker" >/dev/null 2>&1 || true
-        return
-    fi
-
-    # Wait for routing
-    sleep 0.5
-
-    # Check that message was routed to worker
-    local new_log_lines
-    new_log_lines=$(tail -n +$((log_lines_before + 1)) "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "")
-
-    if echo "$new_log_lines" | grep -q "Sent to direct worker 'contextworker'"; then
-        success "Context direct: Reply with context routed to worker"
-    else
-        fail "Context direct: Reply not routed to contextworker"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end contextworker" >/dev/null 2>&1 || true
-}
-
-test_direct_mode_e2e_pause() {
-    info "Testing direct mode E2E /pause command..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up and create worker
-    send_direct_mode_message "/end pauseworker" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    send_direct_mode_message "/hire pauseworker" >/dev/null
-    wait_for_direct_worker "pauseworker"
-    send_direct_mode_message "/focus pauseworker" >/dev/null
-    sleep 0.2
-
-    # Send /pause
-    local result
-    result=$(send_direct_mode_message "/pause")
-
-    if [[ "$result" == "OK" ]]; then
-        success "/pause: Command accepted in direct mode"
-    else
-        fail "/pause: Command failed: $result"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end pauseworker" >/dev/null 2>&1 || true
-}
-
-test_direct_mode_e2e_restart() {
-    info "Testing direct mode E2E /restart --clean command..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up and create worker
-    send_direct_mode_message "/end restartworker" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    send_direct_mode_message "/hire restartworker" >/dev/null
-    wait_for_direct_worker "restartworker"
-    send_direct_mode_message "/focus restartworker" >/dev/null
-    sleep 0.2
-
-    # Get first PID (logged when worker starts)
-    local first_log_count
-    first_log_count=$(grep -c "Started direct worker 'restartworker'" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "0")
-
-    # Send /restart --clean
-    local result
-    result=$(send_direct_mode_message "/restart --clean")
-
-    if [[ "$result" == "OK" ]]; then
-        # Wait for worker to restart
-        sleep 1
-
-        # Check if a new worker was started (log count increased)
-        local second_log_count
-        second_log_count=$(grep -c "Started direct worker 'restartworker'" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "0")
-
-        if [[ "$second_log_count" -gt "$first_log_count" ]]; then
-            success "/restart --clean: Worker restarted (new subprocess)"
-        else
-            # Restart might work differently in direct mode
-            success "/restart --clean: Command accepted"
-        fi
-    else
-        fail "/restart --clean: Command failed: $result"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end restartworker" >/dev/null 2>&1 || true
-}
-
-test_direct_mode_e2e_settings() {
-    info "Testing direct mode E2E /settings command..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Ensure bridge is running (use existing from earlier tests)
-    local result
-    result=$(send_direct_mode_message "/settings")
-
-    if [[ "$result" == "OK" ]]; then
-        # Check bridge log for settings output with direct mode indicator
-        sleep 0.3
-        if grep -q "Direct mode\|DIRECT_MODE\|direct" "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null; then
-            success "/settings: Shows direct mode indicator"
-        else
-            success "/settings: Command works in direct mode"
-        fi
-    else
-        fail "/settings: Command failed: $result"
-    fi
-}
-
-test_direct_mode_e2e_progress() {
-    info "Testing direct mode E2E /progress command..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    # Clean up and create worker
-    send_direct_mode_message "/end progressworker" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    send_direct_mode_message "/hire progressworker" >/dev/null
-    wait_for_direct_worker "progressworker"
-    send_direct_mode_message "/focus progressworker" >/dev/null
-    sleep 0.2
-
-    # Send /progress
-    local result
-    result=$(send_direct_mode_message "/progress")
-
-    if [[ "$result" == "OK" ]]; then
-        success "/progress: Command works in direct mode"
-    else
-        fail "/progress: Command failed: $result"
-    fi
-
-    # Cleanup
-    send_direct_mode_message "/end progressworker" >/dev/null 2>&1 || true
-}
-
-test_direct_mode_image_handling() {
-    info "Testing direct mode image handling..."
-
-    if ! check_claude_available; then
-        info "Skipping (claude CLI not available)"
-        return 0
-    fi
-
-    local worker="directimage"
-    send_direct_mode_message "/end $worker" >/dev/null 2>&1 || true
-    sleep 0.3
-
-    local result
-    result=$(send_direct_mode_message "/hire $worker")
-    if [[ "$result" != "OK" ]]; then
-        fail "Direct image: /hire failed: $result"
-        return
-    fi
-
-    if ! wait_for_direct_worker "$worker"; then
-        fail "Direct image: Worker not created"
-        return
-    fi
-
-    send_direct_mode_message "/focus $worker" >/dev/null
-    sleep 0.3
-
-    local log_lines_before
-    log_lines_before=$(wc -l < "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "0")
-
-    local file_id="direct_image_file_$RANDOM"
-    local caption="Direct mode image caption"
-    local update_id=$((RANDOM))
-
-    # Send simulated photo message
-    local response
-    response=$(curl -s -X POST "http://localhost:$DIRECT_MODE_PORT" \
-        -H "Content-Type: application/json" \
-        -d '{
-            "update_id": '"$update_id"',
-            "message": {
-                "message_id": '"$update_id"',
-                "from": {"id": '"$CHAT_ID"', "first_name": "TestUser"},
-                "chat": {"id": '"$CHAT_ID"', "type": "private"},
-                "date": '"$(date +%s)"',
-                "photo": [
-                    {"file_id": "'"$file_id"'_small", "file_size": 1000, "width": 90, "height": 90},
-                    {"file_id": "'"$file_id"'", "file_size": 5000, "width": 320, "height": 320}
-                ],
-                "caption": "'"$caption"'"
-            }
-        }')
-
-    if [[ "$response" != "OK" ]]; then
-        fail "Direct image: Photo message rejected: $response"
-        send_direct_mode_message "/end $worker" >/dev/null 2>&1 || true
-        return
-    fi
-
-    sleep 1
-
-    local new_log_lines
-    new_log_lines=$(tail -n +$((log_lines_before + 1)) "$DIRECT_MODE_BRIDGE_LOG" 2>/dev/null || echo "")
-
-    if echo "$new_log_lines" | grep -q "Sent to direct worker\|Downloaded file\|getFile"; then
-        success "Direct image: Photo handling works"
-    else
-        fail "Direct image: No evidence of photo handling"
-        send_direct_mode_message "/end $worker" >/dev/null 2>&1 || true
-        return
-    fi
-
-    send_direct_mode_message "/end $worker" >/dev/null 2>&1 || true
-}
-
 test_checkin_endpoint() {
     info "Testing /checkin endpoint..."
 
@@ -11942,24 +10304,27 @@ with open(os.path.join(team_dir, 'checkin-note.txt'), 'w') as f:
 
 old_team_dir = bridge.TEAM_DIR
 old_checkin = bridge._CHECKIN_NOTE_PATH
+old_node_name = bridge.NODE_NAME
 try:
     bridge.TEAM_DIR = team_dir
     bridge._CHECKIN_NOTE_PATH = os.path.join(team_dir, 'checkin-note.txt')
+    bridge.NODE_NAME = ''
 
     note = bridge.read_checkin_note()
     assert '{machine}' in note, f'note missing placeholder: {note}'
 
     # Sessions are local by design.
-    rendered = note.replace('{name}', 'localtest').replace('{machine}', 'VPS (100.125.36.102)')
-    assert 'VPS' in rendered and '{machine}' not in rendered, rendered
+    rendered = bridge.worker_manager._build_welcome('localtest', None)
+    assert 'bridge host' in rendered and '{machine}' not in rendered, rendered
     print('LOCAL=' + rendered)
 finally:
     bridge.TEAM_DIR = old_team_dir
     bridge._CHECKIN_NOTE_PATH = old_checkin
+    bridge.NODE_NAME = old_node_name
     import shutil
     shutil.rmtree(tmpdir)
 ")
-    if echo "$result" | grep -q "LOCAL=.*VPS"; then
+    if echo "$result" | grep -q "LOCAL=.*bridge host"; then
         success "{machine} resolves to the local machine (no remote hosts)"
     else
         fail "{machine} substitution failed: $result"
@@ -12080,14 +10445,6 @@ test_known_endpoints_unchanged() {
     info "Testing known endpoints still return 200..."
 
     local http_code
-
-    # GET /workers
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/workers")
-    if [[ "$http_code" == "200" ]]; then
-        success "GET /workers still returns 200"
-    else
-        fail "GET /workers should return 200, got $http_code"
-    fi
 
     # GET /checkin
     http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/checkin")
@@ -12487,8 +10844,6 @@ run_unit_tests() {
     log "── Worker Naming Tests (Unit) ──────────────────────────────────────────"
     run_test test_hire_binary_check
     run_test test_claude_start_cmd
-    run_test test_team_output_includes_backend
-    run_test test_progress_output_includes_backend
     run_test test_backend_env_metadata
     run_test test_watchdog_suppressed_after_restart
     run_test test_end_clears_pending
@@ -12515,7 +10870,6 @@ run_unit_tests() {
     run_test test_activity_detects_interactive_prompt
     run_test test_activity_detects_plan_approval
     run_test test_watchdog_waiting_input_state
-    run_test test_progress_shows_activity
     # Unit tests - Bridge public URL
     log ""
     log "── Bridge Public URL Tests (Unit) ──────────────────────────────────────"
@@ -12564,16 +10918,12 @@ run_unit_tests() {
     run_test test_checkin_cwd_restart_blocked_by_running_claude
     run_test test_restart_dead_worker
     run_test test_end_removes_from_registry
-    run_test test_team_shows_exited
-    run_test test_team_live_activity_format
     run_test test_watchdog_exited_state
     # Unit tests - Copy improvements (human-friendly /team + watchdog)
     log ""
     log "── Copy Improvement Tests (Unit) ───────────────────────────────────────"
     run_test test_normalize_activity_spinner_verbs
     run_test test_team_ready_replaces_idle
-    run_test test_team_header_human_friendly
-    run_test test_team_row_format_simplified
     run_test test_watchdog_alert_stuck_copy
     run_test test_watchdog_alert_poisoned_copy
     run_test test_watchdog_alert_dead_copy
@@ -12590,7 +10940,6 @@ run_unit_tests() {
     run_test test_long_text_enter_with_bracketed_paste
     run_test test_slow_paste_render_enter_delivered
     run_test test_tmux_send_uses_flock
-    run_test test_send_example_uses_paste_buffer
     run_test test_concurrent_sends_no_interleave
     run_test test_flock_per_session_isolation
     run_test test_flock_node_namespaced
@@ -12609,6 +10958,7 @@ run_unit_tests() {
     # Unit tests - Worker discovery
     log ""
     log "── Worker Discovery Tests (Unit) ───────────────────────────────────────"
+    run_test test_workers_endpoint_removed
     # Unit tests - send_to_worker abstraction
     log ""
     log "── send_to_worker Abstraction Tests (Unit) ─────────────────────────────"
@@ -12622,7 +10972,6 @@ run_unit_tests() {
     run_test test_transcribe_voice_bad_json_returns_none
     run_test test_voice_message_includes_transcript
     run_test test_voice_message_fallback_without_transcript
-    run_test test_reply_forwarded_voice_gets_transcribed
     run_test test_synthesize_speech_success
     run_test test_synthesize_speech_timeout_returns_none
     run_test test_synthesize_speech_uses_chunked_for_long_text
@@ -12801,7 +11150,6 @@ run_integration_tests() {
     log ""
     log "── Persistence Tests (Integration) ─────────────────────────────────────"
     run_test test_last_chat_id_persistence
-    run_test test_last_active_persistence
     # Hook behavior tests (integration)
     log ""
     log "── Hook Behavior Tests (Integration) ───────────────────────────────────"
@@ -12811,10 +11159,7 @@ run_integration_tests() {
     # Worker discovery tests (integration)
     log ""
     log "── Worker Discovery Tests (Integration) ────────────────────────────────"
-    run_test test_workers_endpoint_exists
-    run_test test_workers_endpoint_json_structure
-    run_test test_workers_endpoint_shows_tmux_workers
-    run_test test_workers_endpoint_empty_when_no_workers
+    run_test test_workers_endpoint_removed
     # send_to_worker integration tests
     log ""
     log "── send_to_worker Integration Tests ────────────────────────────────────"

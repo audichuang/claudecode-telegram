@@ -119,7 +119,6 @@ TTS_CHUNKED_THRESHOLD = 200  # chars: above this, use /synthesize/chunked endpoi
 # Update this when adding new endpoints.
 API_ENDPOINTS = {
     "GET /": "API index — lists all endpoints",
-    "GET /workers": "List active workers with send commands",
     "GET /checkin?name=<name>": "Refresh worker instructions (optional: &cwd=/path)",
     "GET /health/workers": "Watchdog state for all workers",
     "GET /transcript/<name>": "Polished HTML transcript viewer for a worker",
@@ -3373,71 +3372,6 @@ def _team_attention_summary(watchdog_status: str, activity: str) -> tuple[str, s
     return "🟢", "ok", 2
 
 
-def format_team_lines(
-    registered: dict,
-    active: Optional[str],
-    pending_lookup=None,
-    worker_live: Optional[dict] = None
-) -> list[str]:
-    """Format /team response lines with attention, activity, and context."""
-    if pending_lookup is None:
-        pending_lookup = is_pending
-    if worker_live is None:
-        worker_live = {}
-
-    with _watchdog_lock:
-        state_snapshot = dict(_worker_states)
-
-    backend_values = set()
-    for name, session in registered.items():
-        live = worker_live.get(name, {})
-        backend = normalize_backend(live.get("backend") or session.get("backend"))
-        backend_values.add(backend)
-    show_backend = len(backend_values) > 1
-
-    rows = []
-    counts = {"🔴": 0, "🟡": 0, "🟢": 0}
-    for name in sorted(registered.keys()):
-        session = registered[name]
-        watchdog_status = _format_watchdog_status(name, pending_lookup, state_snapshot=state_snapshot)
-        live = worker_live.get(name, {})
-        backend = normalize_backend(live.get("backend") or session.get("backend"))
-
-        raw_activity = (live.get("activity") or "").strip()
-        if not raw_activity or raw_activity == "Unknown":
-            raw_activity = watchdog_status
-        activity = _normalize_activity(raw_activity)
-        if len(activity) > 42:
-            activity = activity[:39].rstrip() + "..."
-
-        context_pct = (live.get("context_pct") or "").strip()
-        icon, blocker, severity_rank = _team_attention_summary(watchdog_status, raw_activity)
-        counts[icon] += 1
-
-        name_cell = f"{name} 🎯" if name == active else name
-        ctx_part = f" | ctx {context_pct}" if context_pct and context_pct != "--" else ""
-        row = f"{icon} {name_cell} — {activity}{ctx_part}"
-        if show_backend:
-            row += f" | backend={backend}"
-
-        focus_rank = 0 if name == active else 1
-        rows.append((severity_rank, focus_rank, name, blocker, row))
-
-    rows.sort(key=lambda item: (item[0], item[1], item[2]))
-    attention_rows = [f"{name} ({blocker})" for rank, _focus, name, blocker, _row in rows if rank < 2]
-
-    lines = []
-    focused = active or "(none)"
-    lines.append(
-        f"Team: {len(registered)} agents · focused: {focused} | "
-        f"🟢 {counts['🟢']} ok · 🟡 {counts['🟡']} need reply · 🔴 {counts['🔴']} blocked"
-    )
-    if attention_rows:
-        lines.append("Needs your reply: " + ", ".join(attention_rows))
-    lines.extend(row for _rank, _focus, _name, _blocker, row in rows)
-    return lines
-
-
 def _normalize_activity(raw: str) -> str:
     """Normalize Claude Code spinner verbs to human-friendly text.
 
@@ -3883,60 +3817,6 @@ def _send_interactive_reply(tmux_name: str, reply: str, details: dict) -> bool:
     return False
 
 
-def format_progress_lines(
-    name: str,
-    pending: bool,
-    backend: str,
-    online: bool,
-    ready: bool,
-    mode: str,
-    resume_line: Optional[str] = None,
-    continuity_line: Optional[str] = None,
-    needs_attention: Optional[str] = None,
-    activity: Optional[str] = None,
-    context_pct: Optional[str] = None,
-    question_details: Optional[dict] = None
-) -> list[str]:
-    """Format /progress response lines (manager-friendly)."""
-    status = []
-
-    # Header with name + context%
-    watchdog_status = _format_watchdog_status(name)
-    ctx = f" · context {context_pct}" if context_pct else ""
-    status.append(f"{name.capitalize()} ({backend}) — {watchdog_status}{ctx}")
-
-    # Activity line (what they're doing right now)
-    if activity:
-        status.append(f"Doing: {activity}")
-    elif not online:
-        status.append("Doing: Offline")
-    elif pending:
-        status.append("Doing: Working on a request")
-
-    # Rich question details (when at interactive prompt)
-    if question_details and question_details.get("options"):
-        opts = question_details["options"]
-        if question_details.get("header"):
-            status.append(f"\n{question_details['header']}")
-        for o in opts:
-            marker = "\u2794 " if o.get("selected") else "  "
-            status.append(f"{marker}{o['num']}. {o['label']}")
-        max_num = max(o["num"] for o in opts)
-        status.append(f"\nReply 1-{max_num} to pick, \"skip\" to cancel")
-
-    # Blockers / attention
-    if needs_attention:
-        status.append(f"Blocker: {needs_attention}")
-
-    # Session info
-    if continuity_line:
-        status.append(continuity_line)
-    elif resume_line:
-        status.append(resume_line)
-
-    return status
-
-
 def get_worker_backend(name: str, session: Optional[dict] = None) -> str:
     """Get backend for a worker.
 
@@ -4067,69 +3947,18 @@ class WorkerManager:
 
         return backend.send(name, tmux_name, message, BRIDGE_URL, self.sessions_dir)
 
-    def get_workers(self, caller_from: str = None):
-        """Get all active workers with their communication details."""
-        self._sync_paths()
-        workers = []
-        registered = self.get_registered_sessions()
-        for name, info in registered.items():
-            if "tmux" not in info:
-                workers.append({
-                    "name": name,
-                    "machine": "",
-                    "protocol": "none",
-                    "address": "",
-                    "status": "exited",
-                    "note": "Worker exited. Reopen its 話題 (or /cd <path> inside it) to restart.",
-                })
-                continue
-
-            tmux_name = info.get("tmux")
-            tmux_cmd = (
-                f"echo 'YOUR_NAME: your message here' | "
-                f"tmux load-buffer - && "
-                f"tmux paste-buffer -p -r -t {tmux_name} && "
-                f"sleep 1 && tmux send-keys -t {tmux_name} Enter"
-            )
-            note = "Uses paste-buffer -p (bracketed paste) for reliable delivery. Sleep 1s before Enter — TUI needs time to render. Always prefix your name."
-            workers.append({
-                "name": name,
-                "machine": "",
-                "protocol": "tmux",
-                "address": tmux_name,
-                "send_example": tmux_cmd,
-                "note": note,
-            })
-        return workers
-
     def _build_welcome(self, name: str, backend_obj) -> str:
         """Build welcome/instructions message for a worker."""
-        if TOPIC_MODE:
-            # Topic-native: one 話題 = one dedicated session, so drop the
-            # multi-worker framing (/workers discovery, name prefixing,
-            # worker-to-worker messaging).
-            welcome = (
-                "You are connected to Telegram via claudecode-telegram. This 話題 (topic) is your "
-                "dedicated session: the manager's messages arrive as prompts and your replies go "
-                "straight back into this topic. "
-                "RECEIVING FILES: Manager-sent files (images, PDFs, documents) appear as local paths you can read directly. "
-                "SENDING FILES: Use [[image:/path/to/photo.png|caption]] for images (jpg/png/webp/bmp) and animations (gif/mp4), or [[file:/path/to/file|caption]] for documents, video (mp4/mov/avi — shows player), audio (mp3/m4a/flac — shows player), and voice (ogg/opus — voice bubble). "
-                "WORKING DIRECTORY: the manager switches your project folder from Telegram with /cd <path> (reloads CLAUDE.md). "
-                f"REFRESH INSTRUCTIONS: run `curl -s $BRIDGE_URL/checkin?name={name}` to re-read these instructions anytime. "
-                "Messages from the manager arrive as prompts — there is NO polling endpoint."
-            )
-        else:
-            welcome = (
-                "You are connected to Telegram via claudecode-telegram bridge. "
-                "RECEIVING FILES: Manager sends files (images, PDFs, documents) — they appear as local paths you can read directly. "
-                "SENDING FILES: Use [[image:/path/to/photo.png|caption]] for images (jpg/png/webp/bmp) and animations (gif/mp4), or [[file:/path/to/file|caption]] for documents, video (mp4/mov/avi — shows player), audio (mp3/m4a/flac — shows player), and voice (ogg/opus — voice bubble). "
-                f"MESSAGING WORKERS: Run `curl -s \"$BRIDGE_URL/workers?from={name}\"` to discover other workers — returns JSON with a `send_example` field containing ready-to-use send commands wrapped correctly for your machine (auto-adds ssh when a peer lives elsewhere). Always call /workers?from={name} before messaging, never guess addresses. "
-                f"NAME PREFIX: Always prefix your name in messages (e.g., '{name}: your message'). "
-                f"REFRESH INSTRUCTIONS: Run `curl -s $BRIDGE_URL/checkin?name={name}` to re-read these instructions anytime. "
-                f"WORKING DIRECTORY: To switch project directory (reloads CLAUDE.md), run `curl -s \"$BRIDGE_URL/checkin?name={name}&cwd=/path/to/project\"`. "
-                "BRIDGE API: Available endpoints: GET /workers, GET /checkin. Messages from manager arrive as prompts — there is NO polling endpoint. "
-                "WARNING: Do NOT output worker messages normally — they go to Telegram. Use the send commands from /workers instead."
-            )
+        welcome = (
+            "You are connected to Telegram via claudecode-telegram. This 話題 (topic) is your "
+            "dedicated session: the manager's messages arrive as prompts and your replies go "
+            "straight back into this topic. "
+            "RECEIVING FILES: Manager-sent files (images, PDFs, documents) appear as local paths you can read directly. "
+            "SENDING FILES: Use [[image:/path/to/photo.png|caption]] for images (jpg/png/webp/bmp) and animations (gif/mp4), or [[file:/path/to/file|caption]] for documents, video (mp4/mov/avi — shows player), audio (mp3/m4a/flac — shows player), and voice (ogg/opus — voice bubble). "
+            "WORKING DIRECTORY: the manager switches your project folder from Telegram with /cd <path> (reloads CLAUDE.md). "
+            f"REFRESH INSTRUCTIONS: run `curl -s $BRIDGE_URL/checkin?name={name}` to re-read these instructions anytime. "
+            "Messages from the manager arrive as prompts — there is NO polling endpoint."
+        )
         if SANDBOX_ENABLED:
             welcome += " Running in sandbox mode (Docker container)."
 
@@ -4216,12 +4045,7 @@ class WorkerManager:
 
         time.sleep(2.0 if not SANDBOX_ENABLED else 5.0)
 
-        welcome = self._build_welcome(name, backend_obj)
-        if not TOPIC_MODE:
-            # In TOPIC_MODE the welcome is delivered folded into the topic's first
-            # message by open_topic_session (one turn -> one reply), so skip the
-            # standalone greeting here to avoid a duplicate "你好" reply.
-            self.send(name, welcome)
+        self._build_welcome(name, backend_obj)
 
         # No focus/active concept: a 話題 IS the addressing — which session you
         # talk to is decided by which topic you type in, never by bridge state.
@@ -4846,8 +4670,6 @@ def _mark_topic_request_done(name):
     Clearing the tracking is what prevents a later watchdog tick from clobbering
     the 👍 with a stale state emoji.
     """
-    if not TOPIC_MODE:
-        return
     rec = _topic_request_msg.pop(name, None)
     _topic_reaction_set.pop(name, None)
     if not rec:
@@ -4928,11 +4750,9 @@ def topic_request_stalled(state):
 def _update_topic_reaction(name, state):
     """Surface a worker's live state as a reaction on its in-flight request.
 
-    No-op unless TOPIC_MODE is on and the session has a tracked request message.
-    Dedups so the Telegram API is only called when the emoji actually changes.
+    No-op unless the session has a tracked request message. Dedups so the
+    Telegram API is only called when the emoji actually changes.
     """
-    if not TOPIC_MODE:
-        return
     rec = _topic_request_msg.get(name)
     if not rec:
         return
@@ -5463,38 +5283,6 @@ class CommandRouter:
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         return found, cleaned
 
-    def parse_worker_prefix(self, text):
-        """Parse 'name: message' prefix from bot-sent messages."""
-        if not text:
-            return None, ""
-        match = re.match(r'^\s*([a-zA-Z0-9-]+):\s*(.*)$', text, re.DOTALL)
-        if not match:
-            return None, ""
-        name = match.group(1).lower()
-        message = match.group(2).strip()
-        registered = self.workers.get_registered_sessions()
-        if name not in registered:
-            return None, ""
-        return name, message
-
-    def get_reply_context(self, reply_msg):
-        """Extract text from a replied-to message (context only, no routing)."""
-        if not reply_msg:
-            return ""
-        return reply_msg.get("text") or reply_msg.get("caption") or ""
-
-    def format_reply_context(self, reply_text, context_text):
-        reply_text = (reply_text or "").strip()
-        context_text = (context_text or "").strip()
-        if context_text:
-            return (
-                "Manager reply:\n"
-                f"{reply_text}\n\n"
-                "Context (your previous message):\n"
-                f"{context_text}"
-            )
-        return f"Manager reply:\n{reply_text}"
-
     def handle_command(self, text, chat_id, msg_id):
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower()
@@ -5824,76 +5612,6 @@ class CommandRouter:
 
         self.reply(chat_id, "\n".join(lines))
         return True
-
-    def _extract_reply_media(self, reply_to, target_worker):
-        """Download media from a reply-to message. Returns media text or None."""
-        # Check for media types in priority order
-        animation = reply_to.get("animation")
-        photo = reply_to.get("photo")
-        document = reply_to.get("document")
-        audio = reply_to.get("audio")
-        voice = reply_to.get("voice")
-        video = reply_to.get("video")
-        sticker = reply_to.get("sticker")
-
-        file_id = None
-        media_label = "media"
-
-        if animation:
-            file_id = animation.get("file_id")
-            media_label = "GIF"
-        elif photo:
-            largest = max(photo, key=lambda p: p.get("file_size", 0))
-            file_id = largest.get("file_id")
-            media_label = "image"
-        elif video:
-            file_id = video.get("file_id")
-            media_label = "video"
-        elif document:
-            file_id = document.get("file_id")
-            media_label = f"file: {document.get('file_name', 'unknown')}"
-        elif audio:
-            file_id = audio.get("file_id")
-            media_label = "audio"
-        elif voice:
-            file_id = voice.get("file_id")
-            media_label = "voice message"
-            # Will attempt transcription after download below
-        elif sticker:
-            file_id = sticker.get("file_id")
-            media_label = f"sticker: {sticker.get('emoji', '')}"
-
-        if not file_id:
-            return None
-
-        local_path = download_telegram_file(file_id, target_worker)
-        if not local_path:
-            return None
-
-        # Transcribe voice — deliver just the text transparently
-        if voice:
-            transcript = transcribe_voice(local_path)
-            if transcript:
-                return transcript
-
-        return f"Manager forwarded {media_label}: {local_path}"
-
-    def _worker_from_reply(self, msg):
-        """Extract worker name from a reply-to message's text prefix (e.g. 'bob:\\n...')."""
-        reply_to = msg.get("reply_to_message") if msg else None
-        if not reply_to:
-            return None
-        reply_text = reply_to.get("text") or reply_to.get("caption") or ""
-        if not reply_text:
-            return None
-        # Worker messages are formatted as "name:\n..." — extract the name
-        first_line = reply_text.split("\n", 1)[0]
-        if first_line.endswith(":"):
-            candidate = first_line[:-1].strip().lower()
-            registered = self.workers.get_registered_sessions()
-            if candidate in registered:
-                return candidate
-        return None
 
     def route_message(self, session_name, text, chat_id, msg_id, one_off=False):
         registered = self.workers.get_registered_sessions()
@@ -7689,11 +7407,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
 
-        # Handle /workers endpoint for inter-worker discovery
-        if parsed.path == "/workers":
-            self.handle_workers_endpoint(parsed)
-            return
-
         # Handle /checkin endpoint for worker instruction refresh
         if parsed.path == "/checkin":
             self.handle_checkin_endpoint(parsed)
@@ -7743,30 +7456,6 @@ class Handler(BaseHTTPRequestHandler):
 
         # Unknown GET endpoint
         self._send_unknown_endpoint("GET", parsed.path)
-
-    def handle_workers_endpoint(self, parsed=None):
-        """Return list of active workers with communication details.
-
-        GET /workers                 — bridge-POV send_example (legacy)
-        GET /workers?from=<name>     — caller-POV send_example, wraps ssh if cross-machine
-        Response: {"workers": [{"name": ..., "machine": ..., "protocol": ..., "address": ..., "send_example": ...}, ...]}
-        """
-        try:
-            caller_from = None
-            if parsed is not None:
-                caller_from = parse_qs(parsed.query).get("from", [None])[0]
-            workers = worker_manager.get_workers(caller_from=caller_from)
-            response = {"workers": workers}
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(response).encode())
-        except Exception as e:
-            print(f"Workers endpoint error: {e}")
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(str(e).encode())
 
     def handle_checkin_endpoint(self, parsed):
         """Return worker instructions as plain text.
