@@ -442,20 +442,18 @@ class ClaudeBackend:
 
 
 # Claude is the only backend; legacy adapters were removed in v1.0.0.
-BACKENDS = {
-    "claude": ClaudeBackend(),
-}
+CLAUDE_BACKEND = ClaudeBackend()
 
 def get_backend(name: str) -> ClaudeBackend:
-    return BACKENDS.get(name, BACKENDS[DEFAULT_BACKEND])
+    return CLAUDE_BACKEND
 
 
 def is_valid_backend(name: str) -> bool:
-    return name in BACKENDS
+    return name == DEFAULT_BACKEND
 
 
 def list_backends() -> list[str]:
-    return list(BACKENDS.keys())
+    return [DEFAULT_BACKEND]
 
 
 def _which_binary(binary: str) -> str | None:

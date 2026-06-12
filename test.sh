@@ -52,16 +52,6 @@ TEST_TEAM_DIR="$TEST_NODE_DIR/team"
 # Ensure unit tests write to isolated test sessions directory
 export SESSIONS_DIR="$TEST_SESSION_DIR"
 
-# Create stub binaries for backends not installed (needed for binary check)
-TEST_BIN_DIR="$(mktemp -d)"
-for bin_name in codex gemini opencode; do
-    if ! command -v "$bin_name" &>/dev/null; then
-        printf '#!/bin/sh\necho "stub"\n' > "$TEST_BIN_DIR/$bin_name"
-        chmod +x "$TEST_BIN_DIR/$bin_name"
-    fi
-done
-export PATH="$TEST_BIN_DIR:$PATH"
-
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -160,7 +150,6 @@ cleanup() {
     [[ -f "$TUNNEL_LOG" ]] && rm -f "$TUNNEL_LOG"; true
     rm -f "$TEST_NODE_DIR/tunnel.pid" "$TEST_NODE_DIR/tunnel_url" "$TEST_NODE_DIR/port" 2>/dev/null || true
     rm -f "$TEST_NODE_DIR/last_chat_id" "$TEST_NODE_DIR/last_active" 2>/dev/null || true
-    [[ -d "${TEST_BIN_DIR:-}" ]] && rm -rf "$TEST_BIN_DIR"; true
 }
 
 trap cleanup EXIT
@@ -4946,7 +4935,7 @@ test_open_session_creates_tmux() {
 }
 
 test_backend_env_metadata() {
-    info "Testing worker backend stored in tmux env..."
+    info "Testing worker backend env exports claude..."
 
     if python3 -c "
 import bridge
@@ -4963,10 +4952,10 @@ def fake_run(cmd, **kwargs):
 
 with mock.patch.object(bridge, 'subprocess') as mock_subprocess:
     mock_subprocess.run.side_effect = fake_run
-    bridge.export_hook_env('claude-test-backend', 'codex')
+    bridge.export_hook_env('claude-test-backend', 'claude')
 
-found = any('WORKER_BACKEND' in cmd and 'codex' in cmd for cmd in calls)
-assert found, f'WORKER_BACKEND=codex not set in tmux env: {calls}'
+found = any('WORKER_BACKEND' in cmd and 'claude' in cmd for cmd in calls)
+assert found, f'WORKER_BACKEND=claude not set in tmux env: {calls}'
 
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
@@ -5593,37 +5582,26 @@ test_response_without_pending() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 test_hire_binary_check() {
-    info "Testing /hire rejects missing backend binary..."
+    info "Testing session creation rejects missing claude binary..."
 
     if python3 -c "
-import shutil
 import bridge
 
 # Save originals
-orig_which = shutil.which
+orig_which_binary = bridge._which_binary
 
-# Make 'fakecli' not found
-def mock_which(name, path=None):
-    if name == 'fakecli':
+# Make 'claude' not found
+def mock_which_binary(name):
+    if name == 'claude':
         return None
-    return orig_which(name, path=path)
+    return orig_which_binary(name)
 
-shutil.which = mock_which
-
-# Create a backend with a missing binary
-class FakeBackend:
-    name = 'fake'
-    binary = 'fakecli'
-    def start_cmd(self, resume_id='', append_system_prompt=''): return 'echo hi'
-    def send(self, *a, **kw): return True
-    def is_online(self, *a): return True
-
-bridge.BACKENDS['fake'] = FakeBackend()
+bridge._which_binary = mock_which_binary
 
 # open_session should fail with binary-not-found error
-ok, err = bridge.session_manager.open_session('testbincheck', 'fake')
+ok, err = bridge.session_manager.open_session('testbincheck')
 assert ok is False, f'expected open_session to fail, got ok={ok}'
-assert 'fakecli' in err, f'expected binary name in error: {err}'
+assert 'claude' in err, f'expected binary name in error: {err}'
 assert 'not found' in err, f'expected not-found message: {err}'
 
 # Verify no tmux session was created
@@ -5632,14 +5610,13 @@ result = subprocess.run(['tmux', 'has-session', '-t', f'{bridge.TMUX_PREFIX}test
 assert result.returncode != 0, 'tmux session should NOT have been created'
 
 # Cleanup
-del bridge.BACKENDS['fake']
-shutil.which = orig_which
+bridge._which_binary = orig_which_binary
 
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
-        success "/hire rejects missing backend binary"
+        success "session creation rejects missing claude binary"
     else
-        fail "/hire binary check test failed"
+        fail "missing claude binary check test failed"
     fi
 }
 
@@ -10071,7 +10048,6 @@ def fake_claude_send(self, name, tmux_name, message, bridge_url, sessions_dir):
     calls['claude'] += 1
     return True
 bridge.ClaudeBackend.send = fake_claude_send
-bridge.BACKENDS['claude'] = bridge.ClaudeBackend()
 
 tmp = Path(tempfile.mkdtemp())
 bridge.SESSIONS_DIR = tmp
@@ -10226,18 +10202,13 @@ print('OK')
 }
 
 test_backend_registry_exists() {
-    info "Testing backend registry exists and contains expected backends..."
+    info "Testing backend helpers expose only claude..."
 
     if python3 -c "
 import bridge
 
-# Check BACKENDS registry exists
-assert hasattr(bridge, 'BACKENDS'), 'BACKENDS registry should exist'
-
 # Claude is the ONLY backend in the topic-only bridge (v1.0.0)
 expected = ['claude']
-for name in expected:
-    assert name in bridge.BACKENDS, f'{name} should be in BACKENDS'
 
 backend = bridge.get_backend('claude')
 assert backend is not None, 'get_backend(claude) should return backend'
@@ -10257,9 +10228,9 @@ assert set(available) == set(expected), f'list_backends should return {expected}
 
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
-        success "backend registry exists with expected backends"
+        success "backend helpers expose only claude"
     else
-        fail "backend registry test failed"
+        fail "backend helper test failed"
     fi
 }
 
