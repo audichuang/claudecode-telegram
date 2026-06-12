@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code <-> Telegram Bridge - Multi-Session Control Panel"""
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 import os
 import json
@@ -3987,7 +3987,10 @@ class SessionManager:
         if startup_cwd:
             save_claude_session_cwd(name, startup_cwd)
 
-        time.sleep(0.5)  # let the pane shell finish init before injecting env
+        # Wait for the pane shell's rc to finish before any keystroke goes in —
+        # a slow rc (zsh + heavy plugins) swallows input sent too early and the
+        # launch line never runs. Blind sleep(0.5) lost this race on-box.
+        wait_for_pane_shell_ready(tmux_name)
         export_hook_env(tmux_name, backend)
         time.sleep(0.3)
 
@@ -4293,6 +4296,37 @@ def tmux_prompt_empty(tmux_name, timeout=0.5):
             if re.search(r'^❯\s*$', result.stdout, re.MULTILINE):
                 return True
         time.sleep(0.1)
+    return False
+
+
+def wait_for_pane_shell_ready(tmux_name, timeout=10.0):
+    """Wait until a freshly born pane's interactive shell finished its rc files.
+
+    Keystrokes sent while the rc is still running can be swallowed — a slow
+    zsh rc ate the whole launch line and claude never started (the 2026-06-12
+    zsh-pane lesson, sibling of the fish one). Readiness heuristic: pane
+    content non-empty and unchanged across two consecutive 0.3s polls means
+    the rc stopped printing and the prompt is up. Times out (returning False)
+    so a pathological rc can only delay the launch, never block it.
+    """
+    prev = None
+    stable = 0
+    start = time.time()
+    while time.time() - start < timeout:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", tmux_name, "-p"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            content = result.stdout.strip()
+            if content and content == prev:
+                stable += 1
+                if stable >= 2:
+                    return True
+            else:
+                stable = 0
+            prev = content
+        time.sleep(0.3)
     return False
 
 

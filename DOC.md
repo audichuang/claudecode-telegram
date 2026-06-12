@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 1.1.0
+> Version: 1.1.1
 
 ## Current Philosophy (Summary)
 
@@ -292,6 +292,24 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.1.1 - Pane shell readiness gate (zsh launch race)
+
+**What:** Session launch no longer races the pane shell's rc files. v1.1.0's
+`make_pane_start_cmd()` made the launch line *parse* in any shell (the fish
+fix), but `create_session()` still slept a blind 0.5s before typing it — a
+slow zsh rc (heavy plugins) was still consuming startup output/input when the
+keystrokes arrived and silently swallowed the whole line, so claude never
+started. New `wait_for_pane_shell_ready()` polls the pane until its content is
+non-empty and stable (rc done printing, prompt up) before the first keystroke,
+with a 10s cap so a pathological rc can only delay a launch, never block it.
+
+**Tests:** `test_pane_start_cmd_runs_in_real_shell_panes` runs the exact
+launch line inside real tmux panes for every installed shell (bash, zsh,
+fish; missing shells are skipped), asserting the backend executed, inherited
+the tmux session env, and had `CLAUDECODE` stripped. This is the behavioral
+companion to the string-shape check added with the fish fix — that one passed
+while zsh still broke.
 
 ### v1.1.0 - Deep-clean documentation baseline and viewer extraction
 

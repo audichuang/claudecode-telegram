@@ -468,6 +468,67 @@ print('OK')
     fi
 }
 
+test_pane_start_cmd_runs_in_real_shell_panes() {
+    info "Testing pane start command executes in real bash/zsh/fish panes..."
+
+    # The 2026-06-12 t9 lesson: string-shape assertions passed while fish
+    # killed claude at birth. This test runs the EXACT line bridge sends,
+    # inside a real tmux pane per shell, and asserts the backend (a) actually
+    # executed, (b) inherited the tmux session env, (c) had CLAUDECODE
+    # stripped. Shells not installed on this box are skipped, never failed.
+    local shell shell_path sess marker line ok i
+    local tested="" skipped="" broken=""
+    for shell in bash zsh fish; do
+        shell_path=$(command -v "$shell" 2>/dev/null || true)
+        if [[ -z "$shell_path" ]]; then
+            skipped+=" $shell"
+            continue
+        fi
+        sess="${TMUX_PREFIX}panesh-$shell"
+        marker="/tmp/claudecode-telegram-test-pane-${shell}-$$"
+        rm -f "$marker"
+        tmux kill-session -t "$sess" 2>/dev/null || true
+        tmux new-session -d -s "$sess" "$shell_path" 2>/dev/null || true
+        # What bridge injects before launching: hook env + a stowaway var the
+        # backend must NOT inherit.
+        tmux set-environment -t "$sess" PANE_START_PROBE "via-$shell"
+        tmux set-environment -t "$sess" CLAUDECODE "must-be-stripped"
+        # Same readiness gate the bridge uses before its first keystroke — a
+        # slow zsh rc swallows input sent too early (sleep 0.5 lost this race).
+        python3 -c "import bridge; bridge.wait_for_pane_shell_ready('$sess')"
+
+        # The exact launch line (env-inject + unset + cd + exec), with `env`
+        # standing in for claude so the marker captures what claude would see.
+        line=$(python3 -c "import bridge; print(bridge.make_pane_start_cmd('env > $marker', '/tmp'))")
+        tmux send-keys -t "$sess" -l "$line" 2>/dev/null
+        tmux send-keys -t "$sess" Enter 2>/dev/null
+
+        ok=false
+        for i in $(seq 1 160); do
+            if grep -q "PANE_START_PROBE=via-$shell" "$marker" 2>/dev/null; then
+                ok=true
+                break
+            fi
+            sleep 0.05
+        done
+        if [[ "$ok" == "true" ]] && grep -q '^CLAUDECODE=' "$marker" 2>/dev/null; then
+            ok=false  # ran, but leaked CLAUDECODE into the backend
+        fi
+        [[ "$ok" == "true" ]] && tested+=" $shell" || broken+=" $shell"
+
+        tmux kill-session -t "$sess" 2>/dev/null || true
+        rm -f "$marker"
+    done
+
+    if [[ -n "$broken" ]]; then
+        fail "launch line broke in pane shell(s):$broken (no exec / env not injected / CLAUDECODE leaked)"
+    elif [[ -z "$tested" ]]; then
+        fail "no shell available to exercise the pane launch line (bash/zsh/fish all missing?)"
+    else
+        success "launch line works in real panes:$tested${skipped:+ (not installed:$skipped)}"
+    fi
+}
+
 test_topic_session_identity() {
     info "Testing topic-session identity helpers..."
     if python3 -c "
@@ -10644,6 +10705,7 @@ run_unit_tests() {
     run_test test_formatting
     run_test test_send_text_includes_thread_id
     run_test test_pane_start_cmd_shell_agnostic
+    run_test test_pane_start_cmd_runs_in_real_shell_panes
     run_test test_topic_session_identity
     run_test test_folder_navigator_keyboard
     run_test test_handle_callback_navigates
