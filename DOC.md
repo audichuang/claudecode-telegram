@@ -419,7 +419,7 @@ user message (≈1s apart).
 multi-worker orchestration surface is vestigial inside a topic.
 - Legacy commands (`/hire /focus /team /end /progress /pause /restart /teleport*`)
   are intercepted with a "話題模式不需要" hint instead of leaking to the worker.
-- Global commands (`/memory /voice /settings /rewind /pr /pilot`) are delegated so
+- Global commands (`/memory /voice /settings /rewind /pr`) are delegated so
   they actually work in a topic (they leaked before).
 - The Telegram command menu is a slim fixed set in TOPIC_MODE (no per-worker
   `/<name>` shortcuts); the worker welcome drops the `/workers`/name-prefix/
