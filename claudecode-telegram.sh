@@ -1221,7 +1221,7 @@ cmd_webhook() {
 
     case "$action" in
         info)   cmd_webhook_info;;
-        delete) cmd_webhook_delete;;
+        delete) cmd_webhook_delete "$@";;
         "")     error "URL required"; hint "./claudecode-telegram.sh webhook <url>"; exit 2;;
         *)      cmd_webhook_set "$action";;
     esac
@@ -1273,12 +1273,23 @@ cmd_webhook_info() {
 }
 
 cmd_webhook_delete() {
+    # Trailing flags: the global parser stops at the first positional, so
+    # `webhook delete --force` lands here un-parsed.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--force) FORCE=true; shift;;
+            *) shift;;
+        esac
+    done
+
     local node
     node=$(resolve_target_node)
 
     local token; token=$(require_token)
 
-    if ! $FORCE && ! $HEADLESS; then
+    # Prompt only on an interactive stdin — a non-tty read would hang forever
+    # (e.g. test harness / cron); non-interactive callers behave like --headless.
+    if ! $FORCE && ! $HEADLESS && [[ -t 0 ]]; then
         read -rp "Delete webhook for node '$node'? [y/N] " confirm
         [[ "$confirm" =~ ^[Yy] ]] || { log "Cancelled"; exit 0; }
     fi
