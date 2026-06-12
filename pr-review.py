@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Generate a self-contained HTML PR review page from GitHub API data."""
 
-import base64
 import json
 import html
 import sys
@@ -1759,119 +1758,13 @@ async function doMerge() {{
     return page_html
 
 
-def _fetch_file_context(owner, repo, path, line, ref, context=3):
-    """Fetch file from GitHub and return ±context lines around target line."""
-    try:
-        r = subprocess.run(
-            ["gh", "api", f"repos/{owner}/{repo}/contents/{path}?ref={ref}",
-             "--jq", ".content"],
-            capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            return None, ref[:12]
-        content = base64.b64decode(r.stdout.strip()).decode("utf-8", errors="replace")
-        lines = content.split('\n')
-        start = max(0, line - context - 1)
-        end = min(len(lines), line + context)
-        snippet = []
-        for i in range(start, end):
-            ln = i + 1
-            marker = " \u2190" if ln == line else ""
-            snippet.append(f"\u2502 {ln:>4}: {lines[i]}{marker}")
-        return '\n'.join(snippet), ref[:12]
-    except Exception as e:
-        print(f"[pr-comment] Failed to fetch file context: {e}")
-        return None, ref[:12]
-
-
-def _format_comment_with_context(comment_body, pr_num, path, line, context_snippet, short_sha):
-    """Build a rich comment message with file context."""
-    parts = [f"PR #{pr_num} comment on {path}:{line} (ref {short_sha})"]
-    if context_snippet:
-        parts.append(context_snippet)
-    parts.append("")
-    parts.append(comment_body)
-    return '\n'.join(parts)
-
-
-def _notify_telegram(comment_body, pr_num, path, line, context_snippet=None, short_sha=""):
-    """Send PR comment notification to Telegram via bridge's /notify endpoint."""
-    bridge_url = os.environ.get("BRIDGE_URL", "http://localhost:8271")
-    text = "\U0001f4ac " + _format_comment_with_context(
-        comment_body, pr_num, path, line, context_snippet, short_sha)
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            f"{bridge_url}/notify",
-            data=json.dumps({"text": text}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST")
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        print(f"[pr-comment] Telegram notify failed: {e}")
-
-
-def _route_mentions_to_workers(comment_body, pr_num, path, line, context_snippet=None, short_sha=""):
-    """Parse @mentions and send the comment to targeted workers via tmux."""
-    tmux_prefix = os.environ.get("TMUX_PREFIX", "claude-prod-")
-    mentions = re.findall(r'@(\w+)', comment_body)
-    if not mentions:
-        return
-    try:
-        r = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=5)
-        active_sessions = set(r.stdout.strip().split('\n')) if r.returncode == 0 else set()
-    except Exception:
-        active_sessions = set()
-
-    msg = "manager: " + _format_comment_with_context(
-        comment_body, pr_num, path, line, context_snippet, short_sha)
-
-    for mention in mentions:
-        target_session = f"{tmux_prefix}{mention}"
-        if target_session not in active_sessions:
-            continue
-        try:
-            import tempfile as _tf
-            import uuid as _uuid
-            buf_name = f"pr-{_uuid.uuid4().hex[:8]}"
-            fd, tmpfile = _tf.mkstemp(suffix=".msg", prefix="pr-send-")
-            try:
-                os.write(fd, msg.encode())
-                os.close(fd)
-                subprocess.run(
-                    ["tmux", "load-buffer", "-b", buf_name, tmpfile],
-                    capture_output=True, timeout=5)
-                subprocess.run(
-                    ["tmux", "paste-buffer", "-b", buf_name, "-t", target_session],
-                    capture_output=True, timeout=5)
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", target_session, "Enter"],
-                    capture_output=True, timeout=5)
-                subprocess.run(
-                    ["tmux", "delete-buffer", "-b", buf_name],
-                    capture_output=True, timeout=5)
-            finally:
-                try:
-                    os.unlink(tmpfile)
-                except OSError:
-                    pass
-            print(f"[pr-comment] Routed to @{mention} via tmux")
-        except Exception as e:
-            print(f"[pr-comment] Failed to route to @{mention}: {e}")
-
-
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <pr_url_or_number> [--port PORT]", file=sys.stderr)
-        sys.exit(1)
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        stream = sys.stdout if len(sys.argv) >= 2 else sys.stderr
+        print(f"Usage: {sys.argv[0]} <pr_url_or_number> [--fresh]", file=stream)
+        sys.exit(0 if len(sys.argv) >= 2 else 1)
 
     pr_input = sys.argv[1]
-    port = 10171
-
-    for i, arg in enumerate(sys.argv):
-        if arg == '--port' and i + 1 < len(sys.argv):
-            port = int(sys.argv[i + 1])
 
     # Parse PR URL or number (supports #issuecomment-XXXXX fragments)
     highlight_comment_id = None
@@ -1907,125 +1800,6 @@ def main():
     with open(out_path, 'w') as f:
         f.write(html_content)
     print(f"Written to {out_path}")
-
-    # Serve
-    if '--no-serve' not in sys.argv:
-        import http.server
-        import socketserver
-        from urllib.parse import urlparse, parse_qs
-
-        os.chdir('/tmp')
-        base_handler = http.server.SimpleHTTPRequestHandler
-
-        class PRHandler(base_handler):
-            def log_message(self, fmt, *args):
-                pass
-
-            def do_POST(self):
-                if self.path == '/pr-comment':
-                    length = int(self.headers.get('Content-Length', 0))
-                    body = self.rfile.read(length)
-                    try:
-                        data = json.loads(body)
-                    except (json.JSONDecodeError, ValueError):
-                        self.send_response(400)
-                        self.end_headers()
-                        self.wfile.write(b"Invalid JSON")
-                        return
-                    o = data.get("owner", "")
-                    r = data.get("repo", "")
-                    pn = data.get("pr_num", 0)
-                    path = data.get("path", "")
-                    line = data.get("line", 0)
-                    side = data.get("side", "RIGHT")
-                    comment_body = data.get("body", "").strip()
-                    head_sha = data.get("head_sha", "")
-                    if not all([o, r, pn, path, line, comment_body, head_sha]):
-                        self.send_response(400)
-                        self.end_headers()
-                        self.wfile.write(b"Missing required fields")
-                        return
-                    gh_payload = json.dumps({
-                        "body": comment_body, "commit_id": head_sha,
-                        "path": path, "line": line, "side": side,
-                    })
-                    try:
-                        result = subprocess.run(
-                            ["gh", "api", f"repos/{o}/{r}/pulls/{pn}/comments",
-                             "--method", "POST", "--input", "-"],
-                            input=gh_payload, capture_output=True, text=True, timeout=15)
-                        if result.returncode != 0:
-                            err = result.stderr.strip() or result.stdout.strip()
-                            self.send_response(502)
-                            self.end_headers()
-                            self.wfile.write(f"GitHub API error: {err}".encode())
-                            return
-                    except subprocess.TimeoutExpired:
-                        self.send_response(504)
-                        self.end_headers()
-                        self.wfile.write(b"GitHub API timeout")
-                        return
-
-                    # Fetch surrounding lines for context
-                    context_snippet, short_sha = _fetch_file_context(
-                        o, r, path, line, head_sha)
-
-                    # Notify Telegram via bridge
-                    _notify_telegram(comment_body, pn, path, line,
-                                     context_snippet, short_sha)
-
-                    # Route @mentions to workers via tmux
-                    _route_mentions_to_workers(
-                        comment_body, pn, path, line,
-                        context_snippet, short_sha)
-
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"ok": True}).encode())
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-            def do_GET(self):
-                parsed = urlparse(self.path)
-                if parsed.path == '/pr-file-content':
-                    params = parse_qs(parsed.query)
-                    o = params.get('owner', [''])[0]
-                    r = params.get('repo', [''])[0]
-                    fp = params.get('path', [''])[0]
-                    ref = params.get('ref', [''])[0]
-                    if not all([o, r, fp, ref]):
-                        self.send_response(400)
-                        self.end_headers()
-                        return
-                    try:
-                        result = subprocess.run(
-                            ["gh", "api", f"repos/{o}/{r}/contents/{fp}?ref={ref}",
-                             "--jq", ".content"],
-                            capture_output=True, text=True, timeout=15)
-                        if result.returncode != 0:
-                            self.send_response(404)
-                            self.end_headers()
-                            return
-                        import base64 as b64
-                        content = b64.b64decode(result.stdout.strip()).decode("utf-8", errors="replace")
-                        lines = content.split('\n')
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(json.dumps(lines).encode())
-                    except Exception:
-                        self.send_response(500)
-                        self.end_headers()
-                    return
-                super().do_GET()
-
-        with socketserver.TCPServer(("0.0.0.0", port), PRHandler) as httpd:
-            url = f"http://100.125.36.102:{port}/pr-review-{pr_num}.html"
-            print(f"\nServing at {url}")
-            print("Press Ctrl+C to stop")
-            httpd.serve_forever()
 
 
 if __name__ == '__main__':
