@@ -1026,6 +1026,39 @@ print('OK')
     fi
 }
 
+test_extension_seam_command() {
+    info "Testing EXTRA_COMMANDS dispatch seam..."
+    if python3 - <<'EOF' 2>/dev/null | grep -q "OK"; then
+import bridge
+
+calls = []
+bridge.EXTRA_COMMANDS["/dummyext"] = (
+    lambda router, arg, chat_id: (calls.append((arg, chat_id)), True)[1]
+)
+router = bridge.command_router
+handled = router.handle_command("/dummyext hello", 12345, 99)
+assert handled is True, "extension command should be handled"
+assert calls == [("hello", 12345)], f"seam not dispatched: {calls}"
+
+calls.clear()
+routed = []
+bridge._awaiting_folder.clear()
+bridge._picker_sent_at.clear()
+router.workers.get_registered_sessions = lambda registered=None: {"tExt": {}}
+bridge.find_topic_session = lambda chat_id, thread_id, registered: "tExt"
+router.route_message = lambda *args, **kwargs: routed.append(args)
+msg = {"message_thread_id": 777, "text": "/dummyext topic", "chat": {"id": 12345}}
+router._handle_topic_message(msg, "/dummyext topic", 12345, 100)
+assert calls == [("topic", 12345)], f"topic seam not dispatched: {calls}"
+assert routed == [], f"extension command leaked to worker: {routed}"
+print("OK")
+EOF
+        success "EXTRA_COMMANDS dispatch seam invokes callback"
+    else
+        fail "EXTRA_COMMANDS dispatch seam failed"
+    fi
+}
+
 test_topic_command_menu_is_slim() {
     info "Testing TOPIC_MODE advertises a slim command menu (no hire/focus/team, no per-worker shortcuts)..."
     if python3 -c "
@@ -10324,7 +10357,7 @@ finally:
     import shutil
     shutil.rmtree(tmpdir)
 ")
-    if echo "$result" | grep -q "LOCAL=.*bridge host"; then
+    if [[ "$result" == *"LOCAL="* && "$result" == *"bridge host"* ]]; then
         success "{machine} resolves to the local machine (no remote hosts)"
     else
         fail "{machine} substitution failed: $result"
@@ -10803,6 +10836,7 @@ run_unit_tests() {
     run_test test_topic_cd_rejects_bad_path
     run_test test_topic_legacy_command_rejected
     run_test test_topic_global_command_delegated
+    run_test test_extension_seam_command
     run_test test_topic_command_menu_is_slim
     run_test test_topic_welcome_drops_multiworker_framing
     run_test test_topic_open_sends_welcome_only

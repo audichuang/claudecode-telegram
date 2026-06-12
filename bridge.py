@@ -529,6 +529,15 @@ REWIND_TOKENS = {}
 PR_REVIEW_TOKENS = {}
 REWIND_TIMEOUT = 5 * 60  # 5 minutes
 
+# --- Extension seams (v1.1.0) ---------------------------------------
+# Satellites register here instead of editing the router/Handler.
+# EXTRA_COMMANDS: "/cmd" -> fn(router, arg, chat_id) -> True if handled
+# EXTRA_GET_ROUTES: "/path-prefix" -> fn(handler, parsed) (sends its own response)
+# EXTRA_POST_ROUTES: "/path-prefix" -> fn(handler, parsed, body)
+EXTRA_COMMANDS = {}
+EXTRA_GET_ROUTES = {}
+EXTRA_POST_ROUTES = {}
+
 # Tombstones for the removed multi-worker orchestration era: typing one of
 # these in a 話題 gets a short hint instead of leaking to the worker as text.
 TOPIC_LEGACY_CMDS = {
@@ -5172,11 +5181,11 @@ class CommandRouter:
                        "話題模式不需要這個指令 —— 每個話題就是一個獨立的工作階段。\n"
                        "用 /cd 換資料夾、/close 結束、/memory 搜尋記憶。")
             return
-        # Global commands behave the same inside a 話題 — delegate to the shared
-        # dispatcher rather than leaking them to the worker.
-        if cmd in TOPIC_GLOBAL_CMDS:
-            self.handle_command(text, chat_id, msg_id)
-            return
+        # Global and extension commands behave the same inside a 話題: delegate
+        # to the shared dispatcher rather than leaking them to the worker.
+        if cmd in TOPIC_GLOBAL_CMDS or cmd in EXTRA_COMMANDS:
+            if self.handle_command(text, chat_id, msg_id):
+                return
 
         name = find_topic_session(chat_id, thread_id, registered)
         if (chat_id, thread_id) in _awaiting_folder:
@@ -5276,6 +5285,9 @@ class CommandRouter:
         elif cmd in BLOCKED_COMMANDS:
             self.reply(chat_id, f"{cmd} is interactive and not supported here.", outcome="Needs decision")
             return True
+        elif cmd in EXTRA_COMMANDS:
+            if EXTRA_COMMANDS[cmd](self, arg, chat_id):
+                return True
 
         return False
 
@@ -7236,6 +7248,11 @@ class Handler(BaseHTTPRequestHandler):
         # Only accept Telegram webhook on root path — 404 for unknown POST paths
         parsed = urlparse(self.path)
         if parsed.path != "/":
+            for prefix, route in EXTRA_POST_ROUTES.items():
+                if parsed.path.startswith(prefix):
+                    body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                    route(self, parsed, body)
+                    return
             self._send_unknown_endpoint("POST", parsed.path)
             return
 
@@ -7421,6 +7438,11 @@ class Handler(BaseHTTPRequestHandler):
                 "note": "Messages from manager arrive as prompts. There is no polling endpoint.",
             })
             return
+
+        for prefix, route in EXTRA_GET_ROUTES.items():
+            if parsed.path.startswith(prefix):
+                route(self, parsed)
+                return
 
         # Unknown GET endpoint
         self._send_unknown_endpoint("GET", parsed.path)
