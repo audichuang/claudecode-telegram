@@ -759,7 +759,7 @@ TOPIC_LEGACY_CMDS = {
     "/teleport", "/teleport-check", "/teleback",
 }
 # Global commands that behave the same inside a 話題 — delegated to handle_command.
-TOPIC_GLOBAL_CMDS = {"/memory", "/voice", "/settings", "/rewind", "/pr", "/pilot"}
+TOPIC_GLOBAL_CMDS = {"/memory", "/voice", "/settings", "/rewind", "/pr"}
 # The slimmed command menu advertised to users in TOPIC_MODE.
 TOPIC_BOT_COMMANDS = [
     {"command": "cd", "description": "切換這個話題的工作資料夾: /cd <path>"},
@@ -6430,8 +6430,6 @@ class CommandRouter:
             return self.cmd_settings(chat_id)
         elif cmd == "/voice":
             return self.cmd_voice(arg, chat_id)
-        elif cmd == "/pilot":
-            return self.cmd_pilot(arg, chat_id)
         elif cmd == "/rewind":
             return self.cmd_rewind(arg, chat_id)
         elif cmd == "/pr":
@@ -6449,35 +6447,6 @@ class CommandRouter:
     def cmd_quota(self, chat_id):
         """Show subscriber usage (5h/7d) from claude-hud's external snapshot."""
         self.reply(chat_id, format_quota(read_usage_snapshot()))
-        return True
-
-    def cmd_pilot(self, name, chat_id):
-        if not name:
-            self.reply(chat_id, "Usage: /pilot <name>", outcome="Needs decision")
-            return True
-        name = name.lower().strip()
-        # Resolve to tmux session name
-        prefix = os.environ.get("TMUX_PREFIX", "claude-prod-")
-        session_name = f"{prefix}{name}" if not name.startswith("claude-") else name
-        pilot_port = os.environ.get("PILOT_PORT", "10170")
-        try:
-            import urllib.request
-            import json as _json
-            # Pass remote host to pilot if worker is teleported
-            worker_host = get_worker_host(name)
-            url = f"http://localhost:{pilot_port}/api/pilot?session={session_name}"
-            if worker_host:
-                url += f"&host={urllib.parse.quote(worker_host)}"
-            req = urllib.request.Request(url, method="POST")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                _json.loads(resp.read())
-            # Derive host from BRIDGE_PUBLIC_URL (auto-detected at startup)
-            from urllib.parse import urlparse
-            host = urlparse(BRIDGE_PUBLIC_URL).hostname if BRIDGE_PUBLIC_URL else "localhost"
-            pilot_url = f"http://{host}:{pilot_port}/session/{session_name}"
-            self.reply(chat_id, f"✈️ Pilot on for {name} (5min)\n{pilot_url}")
-        except Exception as e:
-            self.reply(chat_id, f"Pilot error: {e}", outcome="Needs decision")
         return True
 
     def cmd_rewind(self, name, chat_id):
