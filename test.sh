@@ -52,6 +52,13 @@ TEST_TEAM_DIR="$TEST_NODE_DIR/team"
 # Ensure unit tests write to isolated test sessions directory
 export SESSIONS_DIR="$TEST_SESSION_DIR"
 
+# Voice endpoints default to DISABLED (empty) in bridge.py. Give the suite explicit
+# test endpoints so voice tests exercise real logic (they mock urllib). The empty
+# *source* default is verified separately by test_voice_endpoints_not_hardcoded,
+# which unsets these in its own subprocess env.
+export STT_ENDPOINT="${STT_ENDPOINT:-http://stt.test/transcribe}"
+export TTS_ENDPOINT="${TTS_ENDPOINT:-http://tts.test/synthesize}"
+
 # Create stub binaries for backends not installed (needed for binary check)
 TEST_BIN_DIR="$(mktemp -d)"
 for bin_name in codex gemini opencode; do
@@ -14315,6 +14322,30 @@ test_cmd_run_launches_bridge_detached() {
     fi
 }
 
+# "Never hardcode" guard: STT/TTS endpoints must default to empty (voice disabled
+# until explicitly configured), not to a private Tailscale IP baked into source.
+test_voice_endpoints_not_hardcoded() {
+    info "Testing STT/TTS endpoints default to disabled (no hardcoded private IP)..."
+    if python3 -c "
+import subprocess, sys, os
+env = {k: v for k, v in os.environ.items() if k not in ('STT_ENDPOINT', 'TTS_ENDPOINT')}
+env['TELEGRAM_BOT_TOKEN'] = 'test'
+result = subprocess.run([sys.executable, '-c', '''
+import bridge
+stt, tts = bridge.STT_ENDPOINT, bridge.TTS_ENDPOINT
+assert stt == \"\", f\"STT_ENDPOINT should default empty (disabled), got {stt!r}\"
+assert tts == \"\", f\"TTS_ENDPOINT should default empty (disabled), got {tts!r}\"
+print(\"OK\")
+'''], capture_output=True, text=True, env=env)
+assert result.returncode == 0, result.stderr or result.stdout
+print(result.stdout.strip())
+" 2>/dev/null | grep -q "OK"; then
+        success "STT/TTS endpoints default to disabled (no hardcoded private IP)"
+    else
+        fail "STT/TTS endpoints carry a hardcoded default IP — should be empty/disabled"
+    fi
+}
+
 # ============================================================
 # TEST RUNNERS
 # ============================================================
@@ -14437,6 +14468,7 @@ run_unit_tests() {
     run_test test_process_inspection_remote
     run_test test_project_slug
     run_test test_cmd_run_launches_bridge_detached
+    run_test test_voice_endpoints_not_hardcoded
     run_test test_bridge_public_url_auto_detect
     run_test test_bridge_public_url_auto_bind
     run_test test_bridge_public_url_no_auto_bind_when_explicit

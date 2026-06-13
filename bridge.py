@@ -88,9 +88,12 @@ if _bridge_url_env and not _bridge_url_env.startswith(("http://localhost", "http
     BRIDGE_URL = _bridge_url_env
 else:
     BRIDGE_URL = f"http://localhost:{PORT}"
-# BRIDGE_PUBLIC_URL: reachable URL for teleported workers (e.g., http://100.125.36.102:8271)
-# When set and BRIDGE_BIND is not explicitly set, auto-bind to 0.0.0.0
-# Auto-detect from Tailscale IP if not explicitly set.
+# BRIDGE_PUBLIC_URL: a LAN/Tailscale-reachable base URL for links the admin opens
+# off-box — the /rewind & /pilot viewer pages and PR-notify callbacks (NOT the
+# Telegram webhook, which reaches the bridge via the cloudflared tunnel hitting
+# localhost). Auto-detected from the Tailscale IP when unset. When set (and
+# BRIDGE_BIND is not explicitly given) the bridge binds 0.0.0.0 so those links
+# resolve from a phone — binding 127.0.0.1 would make /rewind & /pilot URLs dead.
 BRIDGE_PUBLIC_URL = os.environ.get("BRIDGE_PUBLIC_URL", "").rstrip("/")
 if not BRIDGE_PUBLIC_URL:
     try:
@@ -109,11 +112,13 @@ if BRIDGE_PUBLIC_URL and not os.environ.get("BRIDGE_BIND"):
 BRIDGE_SSH_TARGET = os.environ.get("BRIDGE_SSH_TARGET", "vps")
 PERSISTENCE_NOTE = "They'll stay on your team."
 
-# Voice mode: STT (speech-to-text) and TTS (text-to-speech) endpoints
-# STT: transcribe incoming voice messages so workers can read them
-# TTS: generate voice from worker text responses (explicit [[speak]] tag)
-STT_ENDPOINT = os.environ.get("STT_ENDPOINT", "http://100.126.187.125:10110/transcribe")
-TTS_ENDPOINT = os.environ.get("TTS_ENDPOINT", "http://100.126.187.125:10111/synthesize")
+# Voice mode: STT (speech-to-text) and TTS (text-to-speech) endpoints. Default
+# DISABLED (empty) — set STT_ENDPOINT / TTS_ENDPOINT (e.g. in the node .env) to a
+# reachable transcribe/synthesize service to turn voice on. No private IP is baked
+# into source: the old default pointed at a Tailscale-only box, dead on any other
+# host. transcribe_voice()/synthesize_speech() fail-open to text when unset.
+STT_ENDPOINT = os.environ.get("STT_ENDPOINT", "")
+TTS_ENDPOINT = os.environ.get("TTS_ENDPOINT", "")
 TTS_VOICE = os.environ.get("TTS_VOICE", "Serena")
 STT_TIMEOUT = int(os.environ.get("STT_TIMEOUT", "10"))  # seconds, fail-open
 TTS_TIMEOUT = int(os.environ.get("TTS_TIMEOUT", "60"))  # seconds, TTS runs in background thread
