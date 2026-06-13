@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fast-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # FAST suite drives real tmux panes in bash/zsh/fish to prove the launch
+      # path is shell-agnostic; missing shells make those tests skip, so install
+      # all three. cloudflared is FULL-only (tunnel) and intentionally omitted.
+      - name: Install tmux + shells + net tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux zsh fish lsof netcat-openbsd
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync locked dependencies
+        run: uv sync --frozen
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: FAST test suite
+        env:
+          # FAST mode needs no real bot; unit tests accept this dummy token.
+          TEST_BOT_TOKEN: '1234567890:TEST-dummy-token-for-unit-suite'
+          FAST: '1'
+        run: ./test.sh
