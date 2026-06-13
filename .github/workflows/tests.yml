@@ -32,6 +32,34 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check .
 
+      - name: Debug zsh pane with ZDOTDIR (temporary)
+        continue-on-error: true
+        env:
+          TMUX_PREFIX: 'claude-test-'
+        run: |
+          set +e
+          zdotdir=$(mktemp -d); : > "$zdotdir/.zshrc"
+          marker=/tmp/zdbg-marker
+          launch_cmd="env ZDOTDIR=$zdotdir $(command -v zsh)"
+          echo "launch_cmd: $launch_cmd"
+          tmux new-session -d -s zdbg "$launch_cmd"
+          sleep 1.5
+          echo "--- pane after start (wizard gone?) ---"
+          tmux capture-pane -p -t zdbg
+          echo "--- ZDOTDIR seen by pane ---"
+          tmux send-keys -t zdbg -l 'print -r -- ZD=$ZDOTDIR'; tmux send-keys -t zdbg Enter
+          sleep 0.8; tmux capture-pane -p -t zdbg | grep -E '^ZD=' || echo "(no ZD line)"
+          tmux set-environment -t zdbg PANE_START_PROBE via-zsh
+          tmux set-environment -t zdbg CLAUDECODE must-be-stripped
+          uv run python -c "import bridge; bridge.wait_for_pane_shell_ready('zdbg')"
+          line=$(uv run python -c "import bridge; print(bridge.make_pane_start_cmd('env > $marker', '/tmp'))")
+          echo "--- launch line ---"; printf '%s\n' "$line"
+          tmux send-keys -t zdbg -l "$line"; tmux send-keys -t zdbg Enter
+          sleep 2
+          echo "--- marker PROBE/CLAUDECODE ---"; grep -E 'PANE_START_PROBE|CLAUDECODE' "$marker" 2>/dev/null || echo "(no marker written)"
+          echo "--- pane after launch send ---"; tmux capture-pane -p -t zdbg
+          tmux kill-session -t zdbg 2>/dev/null || true; rm -rf "$zdotdir"
+
       - name: FAST test suite
         env:
           # FAST mode needs no real bot; unit tests accept this dummy token.
