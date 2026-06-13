@@ -572,11 +572,22 @@ cmd_run() {
         sleep 3
     fi
 
-    # Start the bridge fully detached: setsid + </dev/null so a closing terminal
-    # or session teardown can never SIGHUP/SIGKILL it (the 07:47 silent-death
-    # lesson — see CLAUDE.md). The subshell records its own pid before exec, so
-    # after exec that pid *is* the bridge — portable, no ss/lsof/grep -P needed.
-    setsid bash -c "echo \$\$ > '$node_dir/bridge.pid'; exec '$PY' -u '$SCRIPT_DIR/bridge.py' >> '$bridge_log' 2>&1" </dev/null >/dev/null 2>&1 &
+    # Start the bridge fully detached so a closing terminal/session can never
+    # SIGHUP/SIGKILL it (the 07:47 silent-death lesson — see CLAUDE.md). The
+    # subshell records its own pid before exec, so after exec that pid *is* the
+    # bridge — portable, no ss/lsof/grep -P needed.
+    #   - Linux: setsid puts it in a brand-new session (no controlling terminal).
+    #   - macOS (no setsid): nohup makes it ignore SIGHUP, which together with the
+    #     intentional-stop trap below survives host teardown without a new session.
+    # Clear any stale pid first so the readback loop below can only ever observe
+    # the new child's pid (guards against a leftover pid whose number got reused).
+    : > "$node_dir/bridge.pid"
+    local _bridge_cmd="echo \$\$ > '$node_dir/bridge.pid'; exec '$PY' -u '$SCRIPT_DIR/bridge.py' >> '$bridge_log' 2>&1"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid bash -c "$_bridge_cmd" </dev/null >/dev/null 2>&1 &
+    else
+        nohup bash -c "$_bridge_cmd" </dev/null >/dev/null 2>&1 &
+    fi
     echo "$port" > "$node_dir/port"
     # $! is the transient setsid wrapper — read back the real pid the child wrote.
     local bridge_pid="" _i
@@ -654,7 +665,7 @@ cmd_run() {
     # SIGHUP, whose EXIT trap still fires in bash — must NOT take the bridge down;
     # surviving host teardown is the whole point of detaching it (the 07:47
     # lesson). Only an INTENTIONAL stop (Ctrl+C / stop / kill) tears it down.
-    local _intentional_stop=0
+    local _intentional_stop=0 _bridge_dead=0
     on_stop_signal() { _intentional_stop=1; exit 0; }
     cleanup_and_exit() {
         stop_poll_fallback
@@ -663,6 +674,10 @@ cmd_run() {
             log ""
             log "Shutting down node '${node:-unknown}'..."
             [[ -n "${bridge_pid:-}" ]] && kill "$bridge_pid" 2>/dev/null || true
+            [[ -n "${node_dir:-}" ]] && rm -f "$node_dir/bridge.pid" "$node_dir/port" "$node_dir/bot_id" "$node_dir/bot_username"
+        elif [[ "$_bridge_dead" == 1 ]]; then
+            # The bridge already died (watchdog detected it). Clear its now-stale
+            # pid files so `status` and a later `run` don't trip over a dead pid.
             [[ -n "${node_dir:-}" ]] && rm -f "$node_dir/bridge.pid" "$node_dir/port" "$node_dir/bot_id" "$node_dir/bot_username"
         else
             log ""
@@ -681,6 +696,7 @@ cmd_run() {
     while true; do
         if ! kill -0 "$bridge_pid" 2>/dev/null; then
             error "Bridge died unexpectedly"
+            _bridge_dead=1
             exit 1
         fi
 

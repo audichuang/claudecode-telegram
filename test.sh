@@ -12632,11 +12632,12 @@ test_cmd_run_launches_bridge_detached() {
     local body
     body=$(awk '/^cmd_run\(\)/{f=1} f{print} f&&/^}$/{exit}' "$script")
 
-    # 1. Bridge launched fully detached (setsid + </dev/null).
-    if grep -q 'setsid' <<<"$body" && grep -q '</dev/null' <<<"$body"; then
-        success "cmd_run uses setsid + </dev/null to detach the bridge"
+    # 1. Bridge launched fully detached (</dev/null), portably: setsid on Linux
+    #    with a nohup fallback for macOS (which has no setsid).
+    if grep -q 'setsid' <<<"$body" && grep -q 'nohup' <<<"$body" && grep -q '</dev/null' <<<"$body"; then
+        success "cmd_run detaches the bridge portably (setsid + nohup fallback + </dev/null)"
     else
-        fail "cmd_run launches the bridge attached (no setsid/</dev/null) — 07:47 silent-death risk"
+        fail "cmd_run launch is not portably detached (need setsid + nohup fallback + </dev/null) — 07:47 silent-death / macOS risk"
     fi
 
     # 2. Real pid comes from the detached child, not \$! (which is the setsid wrapper).
