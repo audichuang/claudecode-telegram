@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code <-> Telegram Bridge - Multi-Session Control Panel"""
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 import os
 import json
@@ -4136,6 +4136,12 @@ class SessionManager:
             docker_cmd = get_docker_run_cmd(name, resume_id=resume_id)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, docker_cmd, "Enter"])
         else:
+            # Gate on pane-shell readiness before launching backend (in-place restart
+            # path).  Mirrors create_session and _restart_dead_worker: the old Claude
+            # process has just exited, so the shell rc may still be re-initialising.
+            # fail-open: if wait times out we continue and let send_pane_start_cmd
+            # handle any transient delay via its sentinel/bounded-resend logic.
+            wait_for_pane_shell_ready(tmux_name)
             send_pane_start_cmd(tmux_name, backend.start_cmd(resume_id), startup_cwd)
 
         # Re-send welcome/instructions so worker gets fresh context after restart

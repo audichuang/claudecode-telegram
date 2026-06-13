@@ -19,16 +19,27 @@ FAIL=0
 note() { echo "  $1"; }
 bad()  { echo "  ✗ $1"; FAIL=1; }
 
+listener_pid_for_port() {
+  local port="$1" pid=""
+  if command -v ss >/dev/null 2>&1; then
+    pid="$(ss -ltnp 2>/dev/null | grep ":$port " | grep -Eo 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)"
+  fi
+  if [[ -z "$pid" ]] && command -v lsof >/dev/null 2>&1; then
+    pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+  fi
+  printf '%s\n' "$pid"
+}
+
 echo "== verify node=$NODE port=$PORT =="
 
-PID="$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
+PID="$(listener_pid_for_port "$PORT")"
 if [[ -z "$PID" ]]; then
   bad "nothing listening on :$PORT"
 else
   note "✓ listening: pid=$PID"
   REC="$(cat "$NODE_DIR/bridge.pid" 2>/dev/null || echo '?')"
   [[ "$REC" == "$PID" ]] && note "✓ bridge.pid matches" || bad "bridge.pid says $REC, port owner is $PID"
-  CMD="$(tr '\0' ' ' < "/proc/$PID/cmdline" 2>/dev/null || true)"
+  CMD="$(tr '\0' ' ' < "/proc/$PID/cmdline" 2>/dev/null || ps -p "$PID" -o command= 2>/dev/null || true)"
   [[ "$CMD" == *".venv/bin/python"* ]] && note "✓ runs from .venv" || bad "unexpected interpreter: $CMD"
   # True detachment = no controlling terminal AND its own session (setsid).
   # PPID flips to 1 only after the launcher shell exits, so PPID alone is a
@@ -41,6 +52,8 @@ else
   fi
 fi
 
+# Known un-automated guard gap: pgrep -af is GNU-specific. On BSD/macOS this
+# health check may report the forwarder missing even when it is alive.
 if pgrep -af 'getUpdates' >/dev/null 2>&1; then
   note "✓ poll forwarder alive (NEVER kill it — it is independent and auto-resumes)"
 else

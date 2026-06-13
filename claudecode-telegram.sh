@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIG + GLOBALS
 # ============================================================
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # uv-managed interpreter: prefer the synced .venv, fall back to system python3.
@@ -275,7 +275,17 @@ require_token() {
 check_cmd() { command -v "$1" &>/dev/null; }
 
 port_in_use() {
-    nc -z localhost "$1" 2>/dev/null
+    local port="$1"
+    # Known un-automated guard gap: /dev/tcp is a bash feature, not POSIX.
+    # This script runs under bash; nc remains the fallback where /dev/tcp fails.
+    if (: >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v nc >/dev/null 2>&1; then
+        nc -z localhost "$port" >/dev/null 2>&1
+        return $?
+    fi
+    return 1
 }
 
 require_port_free() {
@@ -289,16 +299,16 @@ require_port_free() {
 
 telegram_api() {
     local token="$1" method="$2" data="$3"
-    curl -s -X POST "https://api.telegram.org/bot${token}/${method}" \
+    curl -s --max-time 10 -X POST "https://api.telegram.org/bot${token}/${method}" \
         -H "Content-Type: application/json" -d "$data"
 }
 
 telegram_set_webhook() {
     local token="$1" url="$2"
     if [[ -n "${TELEGRAM_WEBHOOK_SECRET:-}" ]]; then
-        curl -s "https://api.telegram.org/bot${token}/setWebhook?url=${url}&secret_token=${TELEGRAM_WEBHOOK_SECRET}"
+        curl -s --max-time 10 "https://api.telegram.org/bot${token}/setWebhook?url=${url}&secret_token=${TELEGRAM_WEBHOOK_SECRET}"
     else
-        curl -s "https://api.telegram.org/bot${token}/setWebhook?url=${url}"
+        curl -s --max-time 10 "https://api.telegram.org/bot${token}/setWebhook?url=${url}"
     fi
 }
 
@@ -306,7 +316,7 @@ bridge_notify() {
     local port="$1" message="$2"
     local body
     body=$(printf '{"text":"%s"}' "$message")
-    curl -s -X POST "http://localhost:$port/notify" \
+    curl -s --max-time 10 -X POST "http://localhost:$port/notify" \
         -H "Content-Type: application/json" \
         -d "$body" >/dev/null 2>&1 || true
 }
@@ -1166,6 +1176,7 @@ EOF
             if [[ -n "$pane_pid" ]]; then
                 claude_pid=$(pgrep -P "$pane_pid" -f "claude" 2>/dev/null | head -1 || true)
                 if [[ -n "$claude_pid" ]]; then
+                    # Linux-node-only: /proc/$pid mtime has no portable macOS equivalent here.
                     claude_start=$(stat -c %Y "/proc/$claude_pid" 2>/dev/null || echo 0)
                 fi
             fi

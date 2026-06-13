@@ -383,6 +383,8 @@ exists" — monkeypatch `bridge.tmux_exists = lambda *a: False` alongside. And p
 the monkeypatch iron rule: patch bridge module attributes (`bridge.X = ...`),
 never rebind imported copies.
 
+**Never inject multi-line bash syntax via send-keys into a tmux pane.** The pane shell may be fish (e.g., on this Linux box `~/.bashrc` execs fish), which treats an unclosed bash `while`/`do`/`done` block as an incomplete buffer and never executes it. For receiver-side logic, always start the pane with the command directly: `tmux new-session -d -s "$name" -x 200 -y 50 "/bin/sh -c 'your loop here'"`. Do not use `/bin/bash` as the pane command — interactive bash on this box also execs fish.
+
 **Opaque failures: instrument, don't guess.** Tests suppress stderr
 (`2>/dev/null`) and `cleanup()` deletes `$BRIDGE_LOG` on exit, so a failing
 integration test leaves no evidence. Temporarily patch the test's redirect to
@@ -397,14 +399,21 @@ keep a knob (`PANE_LAUNCH_CONFIRM_SECS=8`) that reproduces the old red.
 
 ### Known environmental flaky tests on this Linux box
 
-**Problem:** Two tests fail on this box regardless of code version — re-triaging
-them on every suite run wastes hours.
+**Problem:** One integration test still fails on this box in specific modes —
+re-triaging it on every suite run wastes hours.
 
-**Known list (verified against baseline/HEAD~1 worktree controls, 2026-06-12):**
-- `Concurrent sends` (flock interleaving test): 0/25 delivered, fails even on
-  known-good commits.
-- `test_send_to_session_integration`: `/cd` fails to create tmain in the test
-  bridge; fails identically on v1.1.1 and v1.1.2.
+**Known list (verified against baseline/HEAD~1 worktree controls, 2026-06-12; updated 2026-06-13):**
+- `test_send_to_session_integration` — three distinct failure modes:
+  (a) **Structural red under TEST_FILTER**: filtering skips `test_bridge_starts`, so port 8295
+      has no listener when the integration test runs; start the test bridge manually first.
+  (b) **Launch race**: `open_dm_session` waits ≤2s for the session to appear, but full
+      claude TUI launch takes ~5.3s; `unique_msg` can be wiped by TUI clear-screen
+      (symptom: `message not found`) or hit a restart race (symptom: `sent False`).
+  (c) **Orphan workers.json cross-run pollution**: if `/close` kills a session mid-flight,
+      `open_session` still calls `_registry_add` at its tail — leaving a phantom worker entry
+      that causes watchdog alerts and `/cd` restart paths on the next run.
+  Bridge-side fixes (bridge.py L4027/L5088/L5311) are deferred. For now, run the full suite
+  (not filtered) and ignore this test when it fails in isolation.
 
 **Rule:** Before blaming a change for a suite failure, run the SAME filtered test
 on the previous commit via a scratch worktree (`git worktree add /tmp/wt HEAD~1`,

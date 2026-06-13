@@ -30,6 +30,17 @@ TMUX_PREFIX="${TMUX_PREFIX:-claude-$NODE-}"
 SESSIONS_DIR="${SESSIONS_DIR:-$NODE_DIR/sessions}"
 TOPIC_ROOT="${TOPIC_ROOT:-$HOME}"
 
+listener_pid_for_port() {
+  local port="$1" pid=""
+  if command -v ss >/dev/null 2>&1; then
+    pid="$(ss -ltnp 2>/dev/null | grep ":$port " | grep -Eo 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)"
+  fi
+  if [[ -z "$pid" ]] && command -v lsof >/dev/null 2>&1; then
+    pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+  fi
+  printf '%s\n' "$pid"
+}
+
 if [[ "$NODE" == "prod" && "${CONFIRM_PROD:-0}" != "1" ]]; then
   echo "REFUSED: prod restarts are the owner's call. Re-run with CONFIRM_PROD=1." >&2
   exit 2
@@ -41,7 +52,7 @@ OLD_PID="$(cat "$NODE_DIR/bridge.pid" 2>/dev/null || true)"
 echo "node=$NODE port=$PORT repo=$REPO old_pid=${OLD_PID:-none}"
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  echo "[dry-run] would: kill -TERM $OLD_PID; setsid relaunch; poll ss for new pid"
+  echo "[dry-run] would: kill -TERM $OLD_PID; setsid relaunch; poll listener pid for new bridge"
   exit 0
 fi
 
@@ -56,14 +67,24 @@ setsid bash -c "
          SESSIONS_DIR='$SESSIONS_DIR' TMUX_PREFIX='$TMUX_PREFIX'
   ${ADMIN_CHAT_ID:+export ADMIN_CHAT_ID='$ADMIN_CHAT_ID'}
   cd '$REPO'
-  for i in \$(seq 1 120); do ss -ltn 2>/dev/null | grep -q \":$PORT \" || break; sleep 0.25; done
+  for i in \$(seq 1 120); do
+    if command -v ss >/dev/null 2>&1; then
+      ss -ltn 2>/dev/null | grep -q \":$PORT \" || break
+    elif command -v lsof >/dev/null 2>&1; then
+      lsof -nP -iTCP:'$PORT' -sTCP:LISTEN >/dev/null 2>&1 || break
+    else
+      break
+    fi
+    sleep 0.25
+  done
   exec ./.venv/bin/python -u bridge.py >> '$NODE_DIR/bridge.log' 2>&1
 " </dev/null >/dev/null 2>&1 &
 
-# 3. Verify via ss (NOT curl: the old bridge holds the port for tens of
-#    seconds while sending shutdown notifications; curl 000 is a false alarm).
+# 3. Verify via the listening port owner (NOT curl: the old bridge holds the
+#    port for tens of seconds while sending shutdown notifications; curl 000 is
+#    a false alarm).
 for i in $(seq 1 240); do
-  NEW_PID="$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
+  NEW_PID="$(listener_pid_for_port "$PORT")"
   if [[ -n "$NEW_PID" && "$NEW_PID" != "$OLD_PID" ]]; then
     echo "$NEW_PID" > "$NODE_DIR/bridge.pid"
     echo "NEW bridge pid=$NEW_PID (ppid=$(ps -o ppid= -p "$NEW_PID" | tr -d ' '))"

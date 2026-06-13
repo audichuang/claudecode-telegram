@@ -22,6 +22,8 @@ esac
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 PY="$REPO/.venv/bin/python"; [[ -x "$PY" ]] || PY="python3"
 
+# Known un-automated guard gap: pgrep -af is GNU-specific. The forwarder guard
+# is still covered on the Linux nodes where this script currently runs.
 if pgrep -af "getUpdates.*localhost:$PORT" >/dev/null 2>&1; then
   echo "poll forwarder for :$PORT already running — not starting a second one"
   exit 0
@@ -32,7 +34,7 @@ API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
 
 # getUpdates conflicts with an active webhook — clear it first.
 set -a; source "$ENV_FILE"; set +a
-curl -s "$API_BASE/bot$TELEGRAM_BOT_TOKEN/deleteWebhook" >/dev/null || true
+curl -s --max-time 10 "$API_BASE/bot$TELEGRAM_BOT_TOKEN/deleteWebhook" >/dev/null || true
 
 setsid bash -c "
   set -a; source '$ENV_FILE'; set +a

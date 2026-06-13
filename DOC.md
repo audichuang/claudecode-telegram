@@ -293,6 +293,48 @@ This prevents other users on multi-user systems from reading chat IDs or session
 
 ## Changelog
 
+### v1.1.3 - Test hardening wave 2 + in-place restart readiness gate
+
+**What:** Seven hardening tasks (T1-T7) from the 2026-06-13 second-wave spec.
+
+(T1) Two general polling helpers added to test.sh: `wait_for_file_content` and
+`wait_for_log`, replacing conservative blind-waits with early-exit poll loops so
+tests turn deterministically red on failure instead of flaking on timing.
+
+(T2) Incoming document/image e2e assertions tightened: removed the
+`grep 'Downloaded file'` log-fallback that matched bridge's own rejection
+message and gave false-green; inbox paths now computed via `bridge.get_inbox_dir`
+so they include the node segment; assertions poll the inbox for an actual file;
+guard `[[ inbox_dir == */test/* ]]` prevents silent TMUX_PREFIX drift.
+
+(T3) `test_pane_start_cmd_no_resend_into_running_backend` rc sleep scaled from
+12s→4s, confirmation window `PANE_LAUNCH_CONFIRM_SECS=5` (>4 → green), cleanup
+loop 2s→1s; sensitivity knob `PANE_LAUNCH_CONFIRM_SECS=2` reliably turns test
+red (window expires before sentinel → resend leaked).
+
+(T4) TUI three-sibling tests replace post-send blind sleeps (10s, 3s, 8s) with
+`wait_for_file_content` polling on result_file for `ENTERS:` count reaching
+threshold; startup `sleep 1` kept as-is (pane TUI readiness cannot be polled).
+
+(T5) `verify-node.sh`, `restart-node.sh`, `check-versions.sh`, `poll-forwarder.sh`,
+`claudecode-telegram.sh`: `grep -oP 'pid=\K'` → `grep -Eo 'pid=[0-9]+'` + cut for
+BSD/macOS portability; `ss -ltnp` gains `lsof` fallback; `nc -z` in `port_in_use`
+gains `/dev/tcp` primary + nc fallback; GNU-only guards annotated.
+
+(T6) All Telegram API curl calls gain `--max-time 10`: `setWebhook`,
+`deleteWebhook` in `claudecode-telegram.sh`; forward curl in `poll-forwarder.sh`.
+
+(T7) `restart()` live-path (tmux session already exists) now calls
+`wait_for_pane_shell_ready` before `send_pane_start_cmd`, aligning all four
+startup entry-points (create, register, dead-worker revive, in-place restart)
+with the same shell-readiness gate. fail-open: timeout returns False and launch
+continues. No double-wait in the live path.
+
+**Tests:** `test_wait_for_file_content_helper`, `test_wait_for_log_helper` (T1
+self-tests); `test_bridge_ops_scripts_are_bsd_portable` sensitivity on `grep -oP`
+(T5); `test_restart_inplace_waits_for_pane_shell_ready` (T7 — patches tmux_exists
+True to walk live path, asserts wait before launch and len(waits)==1).
+
 ### v1.1.2 - Confirmed launch (resend) + lossless poll forwarding + revive gate
 
 **What:** Three reliability fixes around session launch and update delivery.

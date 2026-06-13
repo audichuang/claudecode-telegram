@@ -29,12 +29,11 @@ TEST_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" TEST_CHAT_ID="$TEST_CHAT_ID" \
 
 ## 2. 已知環境性失敗(這台 Linux 機器)
 
-中了清單就不用再驗屍 — 都做過 baseline/HEAD~1 對照證明與程式碼無關:
+中了清單就不用再驗屍 — 都做過 baseline/HEAD~1 對照；`Concurrent sends` 已證實是 test bug 並修掉,不再列為環境性失敗:
 
 | 測試 | 症狀 | 驗證日 |
 |------|------|--------|
-| `Concurrent sends`(flock interleave) | 0/25 delivered | 2026-06-12 |
-| `test_send_to_session_integration` | `/cd` 建不出 tmain,sent: False | 2026-06-12 |
+| `test_send_to_session_integration` | (a) filtered 跑無 bridge listener → structural red；(b) launch 競態 → `message not found` 或 `sent False`；(c) orphan workers.json 污染 → watchdog 告警或 `/cd` restart 路徑 | 2026-06-13 |
 
 修好或新增證明過的項目時,同步更新這張表和 CLAUDE.md 的對應 learning。
 

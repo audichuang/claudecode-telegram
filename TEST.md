@@ -59,14 +59,14 @@ FAST=1 TEST_BOT_TOKEN='1234567890:TEST-dummy-token-for-unit-suite' ./test.sh
 
 ## Current Test Count
 
-As of v1.1.2:
+As of v1.1.3:
 
 | Scope | Count |
 |-------|-------|
-| Test functions defined in `test.sh` | 268 |
-| FAST invocations (`run_unit_tests` + `run_cli_tests`) | 225 |
-| Default invocations | 268 |
-| FULL invocations | 269, including `test_with_tunnel` |
+| Test functions defined in `test.sh` | 273 |
+| FAST invocations (`run_unit_tests` + `run_cli_tests`) | 230 |
+| Default invocations | 272 |
+| FULL invocations | 273, including `test_with_tunnel` |
 
 `test_workers_endpoint_removed` intentionally runs in both FAST and integration
 mode because it checks both pure routing behavior and the live bridge endpoint.
@@ -133,7 +133,7 @@ assert that:
 
 ## Complete Inventory By Runner Group
 
-Keep this section grouped by runner rather than listing all 263 names. The
+Keep this section grouped by runner rather than listing all 273 names. The
 source of truth for exact names is the `run_test ...` calls inside `test.sh`.
 
 ### Unit Tests (FAST)
@@ -146,7 +146,8 @@ source of truth for exact names is the `run_test ...` calls inside `test.sh`.
 | Formatting/media | response formatting, Telegram HTML, message splitting, media tags, file validation, inbound media typing |
 | Voice | STT/TTS success/failure/timeout, auto-TTS, speak tags, `/voice` toggle |
 | Claude/tmux helpers | Claude start command, tmux send locks, bracketed paste, flock isolation, concurrent-send baseline |
-| Launch confirmation | `send_pane_start_cmd` sentinel resend when an rc eats the launch line (`test_pane_start_cmd_survives_stdin_eating_rc`), no junk resend into a backend that already exec'd (`test_pane_start_cmd_no_resend_into_running_backend`), revive uses the readiness gate (`test_revive_waits_for_pane_shell_ready`), readiness heuristic sensitivity incl. missing pane → False (`test_wait_for_pane_shell_ready_paths`), launch fails open when the pane never readies (`test_create_fail_open_when_wait_returns_false`) |
+| Launch confirmation | `send_pane_start_cmd` sentinel resend when an rc eats the launch line (`test_pane_start_cmd_survives_stdin_eating_rc`), no junk resend into a backend that already exec'd (`test_pane_start_cmd_no_resend_into_running_backend`), revive uses the readiness gate (`test_revive_waits_for_pane_shell_ready`), **in-place restart also waits** before sending the launch line (`test_restart_inplace_waits_for_pane_shell_ready`), readiness heuristic sensitivity incl. missing pane → False (`test_wait_for_pane_shell_ready_paths`), launch fails open when the pane never readies (`test_create_fail_open_when_wait_returns_false`) |
+| Polling helpers | `wait_for_file_content` fast-exits on match, returns 1 after limit with no match (`test_wait_for_file_content_helper`); `wait_for_log` delegates to file content poll on BRIDGE_LOG (`test_wait_for_log_helper`) |
 | Poll forwarder | failed POST does not advance the `getUpdates` offset and the update is redelivered (`test_poll_forwarder_retries_failed_post`); offset advances past delivered updates so no duplicates (`test_poll_forwarder_idempotent`) |
 | Watchdog/hooks | state computation, alerts, poison signal files, tool-failure hook |
 | Registry/checkin | session registry, checkin CWD, dead session restart, registry cleanup |
@@ -177,15 +178,13 @@ source of truth for exact names is the `run_test ...` calls inside `test.sh`.
 
 ## Known Local Baseline Failure
 
-On this machine, `test_concurrent_sends_no_interleave` can fail with:
-
-```text
-Concurrent sends: 0/25 clean
-```
-
-That is a local tmux/environment baseline issue. Do not fix product code for
-this Task 11 gate. The gate is green when there are no failures other than that
-whitelisted symptom.
+Fixed 2026-06-13: `test_concurrent_sends_no_interleave` used to fail 0/25 on
+this machine. Root cause was a test bug, not the environment — the receiver
+loop was injected via `send-keys` in bash syntax, which a fish pane shell
+never executes. The receiver now starts as the pane command (`/bin/sh -c`),
+and the test passes 25/25. No whitelisted failures remain in FAST mode; the
+remaining known-flaky integration test is `test_send_to_session_integration`
+(see CLAUDE.md "Known environmental flaky tests" for its three failure modes).
 
 ## Environment Variables
 

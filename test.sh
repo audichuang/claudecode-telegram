@@ -152,6 +152,9 @@ cleanup() {
     tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${TEST_TMUX_PREFIX}" | while read -r session; do
         tmux kill-session -t "$session" 2>/dev/null || true
     done || true
+    tmux ls -F '#{session_name}' 2>/dev/null \
+        | grep -E '^(test-(conc|paste-buf|imgcap|bp-long|slowpaste|flock)-|claude-regtest-)' \
+        | while read -r s; do tmux kill-session -t "=$s" 2>/dev/null || true; done || true
     # Clean up test session files (but keep node dir for next run)
     [[ -d "$TEST_SESSION_DIR" ]] && rm -rf "$TEST_SESSION_DIR"; true
     [[ -f "$BRIDGE_LOG" ]] && rm -f "$BRIDGE_LOG"; true
@@ -216,6 +219,68 @@ wait_for_session_gone() {
         ((attempts++)) || true
     done
     ! tmux has-session -t "${TEST_TMUX_PREFIX}${session}" 2>/dev/null
+}
+
+wait_for_file_content() {
+    local file="$1" pattern="$2" max_tenths="$3" attempts=0
+    while [[ $attempts -lt $max_tenths ]]; do
+        if [[ -f "$file" ]] && grep -Eq "$pattern" "$file"; then
+            return 0
+        fi
+        sleep 0.1
+        ((attempts++)) || true
+    done
+    [[ -f "$file" ]] && grep -Eq "$pattern" "$file"
+}
+
+wait_for_log() {
+    local pattern="$1" max_tenths="$2"
+    wait_for_file_content "$BRIDGE_LOG" "$pattern" "$max_tenths"
+}
+
+test_wait_for_file_content_helper() {
+    info "Testing wait_for_file_content helper..."
+
+    local tmp
+    tmp="$(mktemp)"
+    printf 'status=ready\n' > "$tmp"
+
+    if wait_for_file_content "$tmp" '^status=ready$' 5; then
+        success "wait_for_file_content returns 0 on matching content"
+    else
+        fail "wait_for_file_content should return 0 on matching content"
+    fi
+
+    if wait_for_file_content "$tmp" '^missing$' 2; then
+        fail "wait_for_file_content should return 1 for a missing pattern"
+    else
+        success "wait_for_file_content returns 1 after no match"
+    fi
+
+    rm -f "$tmp"
+}
+
+test_wait_for_log_helper() {
+    info "Testing wait_for_log helper..."
+
+    local tmp
+    tmp="$(mktemp)"
+    local BRIDGE_LOG="$tmp"
+    printf 'bridge ready\n' > "$BRIDGE_LOG"
+
+    if wait_for_log '^bridge ready$' 5; then
+        success "wait_for_log returns 0 on matching bridge log content"
+    else
+        fail "wait_for_log should return 0 on matching bridge log content"
+    fi
+
+    if wait_for_log '^not present$' 2; then
+        fail "wait_for_log should return 1 for a missing log pattern"
+    else
+        success "wait_for_log returns 1 after no log match"
+    fi
+
+    rm -f "$tmp"
 }
 
 send_message() {
@@ -618,14 +683,12 @@ test_pane_start_cmd_no_resend_into_running_backend() {
     # finally ends, line 1 execs the backend and the buffered line 2 + Enter is
     # delivered into the freshly started backend's stdin as a junk prompt line.
     #
-    # The defense is TIME: PANE_LAUNCH_CONFIRM_SECS (default 20s) outlasts the
-    # rc tail, so the sentinel appears before any resend decision. This test
-    # uses an rc that sleeps 12s — longer than the OLD 8s window (red on old
-    # code: junk gets the resent line), shorter than the 20s default (green
-    # now: no resend at all). The launched "backend" execs `cat >> $junk`
-    # (long-lived, reads stdin) and the junk file must never receive a line.
-    # the marker proves the backend launched at all; if junk got the line the
-    # OLD code's bug is reproduced and the test fails.
+    # The defense is TIME: PANE_LAUNCH_CONFIRM_SECS outlasts the rc tail, so
+    # the sentinel appears before any resend decision. This test uses an rc
+    # that sleeps 4s — shorter than the 5s green window, longer than the 2s
+    # sensitivity window. The launched "backend" execs `cat >> $junk`
+    # (long-lived, reads stdin) and the junk file must never receive a line;
+    # the marker proves the backend launched at all.
     local sh
     sh=$(command -v bash 2>/dev/null || true)
     if [[ -z "$sh" ]]; then
@@ -650,28 +713,29 @@ exec cat >> $junk
 BKEOF
     chmod +x "$backend"
 
-    # rc that prints, goes quiet long enough to trip "stable", then sleeps 12s
-    # WITHOUT reading stdin — past the OLD 8s window (send #1 buffers, window
-    # expires, old code resends → junk), within the 20s default (sentinel
-    # appears at ~12s, no resend ever fires).
+    # rc that prints, goes quiet long enough to trip "stable", then sleeps 4s
+    # WITHOUT reading stdin. Green path: a 5s confirmation window waits long
+    # enough for the sentinel. Red-light path: PANE_LAUNCH_CONFIRM_SECS=2
+    # expires first, resends, and leaks the buffered line into the backend.
     cat > "$rcfile" <<RCEOF
 echo boot
-sleep 12
+sleep 4
 RCEOF
 
     tmux kill-session -t "$sess" 2>/dev/null || true
     tmux new-session -d -s "$sess" "$sh --rcfile $rcfile -i" 2>/dev/null || true
 
-    # Default confirmation window (20s) on purpose — the property under test
-    # is that it outlasts this rc's 12s tail so no resend ever fires. To see
-    # the old bug, rerun with PANE_LAUNCH_CONFIRM_SECS=8 (red: junk polluted).
+    # Default this test to a 5s confirmation window; keep the env override so
+    # PANE_LAUNCH_CONFIRM_SECS=2 remains a stable red-light sensitivity check.
     python3 -c "
+import os
 import bridge
+bridge.PANE_LAUNCH_CONFIRM_SECS = float(os.environ.get('PANE_LAUNCH_CONFIRM_SECS', '5'))
 bridge.wait_for_pane_shell_ready('$sess')
 bridge.send_pane_start_cmd('$sess', '$backend', '/tmp')
 " 2>&1
 
-    # Wait for the backend to actually launch (rc sleeps 12s; the python call
+    # Wait for the backend to actually launch (rc sleeps 4s; the python call
     # above blocks until the sentinel lands, so this resolves fast after it).
     local ok i
     ok=false
@@ -684,7 +748,7 @@ bridge.send_pane_start_cmd('$sess', '$backend', '/tmp')
     done
 
     # Give any stray buffered resend a moment to land in the backend's stdin.
-    for i in $(seq 1 20); do sleep 0.1; done
+    for i in $(seq 1 10); do sleep 0.1; done
 
     local leaked=""
     if [[ -e "$junk" && -s "$junk" ]]; then
@@ -1151,6 +1215,7 @@ bridge.save_claude_session_cwd = lambda n, c: saved.__setitem__(n, c)
 bridge.export_hook_env = lambda *a, **k: None
 bridge.ensure_session_dir = lambda n: None
 bridge.time.sleep = lambda *a, **k: None
+bridge.wait_for_pane_shell_ready = lambda *a, **k: True
 try:
     wm.open_session('546', chat_id=11)         # later stages may no-op/raise; new-session runs first
 except Exception:
@@ -1230,6 +1295,7 @@ bridge.save_claude_session_cwd = lambda n, c: None
 bridge.export_hook_env = lambda *a, **k: None
 bridge.ensure_session_dir = lambda n: None
 bridge.time.sleep = lambda *a, **k: None
+bridge.wait_for_pane_shell_ready = lambda *a, **k: True
 wm._build_welcome = lambda n, b: 'hi'
 wm.send = lambda *a, **k: True
 bridge.set_focus = lambda n: None
@@ -1533,6 +1599,7 @@ bridge.save_claude_session_cwd = lambda n, c: None
 bridge.export_hook_env = lambda *a, **k: None
 bridge.ensure_session_dir = lambda n: None
 bridge.time.sleep = lambda *a, **k: None
+bridge.wait_for_pane_shell_ready = lambda *a, **k: True
 bridge.state['active'] = None
 focused = []
 bridge.set_focus = lambda name: focused.append(name)
@@ -5069,6 +5136,12 @@ test_bridge_starts() {
     mkdir -p "$TEST_TEAM_DIR"
     chmod 700 "$TEST_NODE_DIR" "$TEST_SESSION_DIR" "$TEST_TEAM_DIR"
 
+    # Reset test node's workers.json to prevent cross-run orphan pollution
+    local wjson="$TEST_NODE_DIR/workers.json"
+    if [[ "$wjson" == *"/nodes/test/"* ]]; then
+        printf '{"workers":{}}' > "$wjson" 2>/dev/null || true
+    fi
+
     # Start bridge with test node isolation
     TELEGRAM_BOT_TOKEN="$TEST_BOT_TOKEN" \
     PORT="$PORT" \
@@ -5345,6 +5418,14 @@ test_incoming_document_e2e() {
         return 0
     fi
 
+    local inbox_dir
+    inbox_dir=$(python3 -c 'import bridge; print(bridge.get_inbox_dir("tmain"))')
+    if [[ "$inbox_dir" != */test/* ]]; then
+        fail "Refusing to use non-test inbox path: $inbox_dir"
+        return
+    fi
+    rm -rf "$inbox_dir"
+
     # Create worker to receive document
     open_dm_session
 
@@ -5390,24 +5471,35 @@ test_incoming_document_e2e() {
             }
         }' >/dev/null
 
-    sleep 3
+    # Check if document was downloaded to inbox. Only real files count; bridge
+    # log messages include rejection paths and are not a success signal.
+    local inbox_manifest
+    inbox_manifest="$(mktemp)"
+    local got_file=0 attempts=0
+    while [[ $attempts -lt 50 ]]; do
+        : > "$inbox_manifest"
+        local f
+        for f in "$inbox_dir"/*.txt; do
+            [[ -f "$f" ]] && printf '%s\n' "$f" >> "$inbox_manifest"
+        done
+        if wait_for_file_content "$inbox_manifest" '\.txt$' 0; then
+            got_file=1
+            break
+        fi
+        sleep 0.1
+        ((attempts++)) || true
+    done
 
-    # Check if document was downloaded to inbox
-    local inbox_dir="/tmp/claudecode-telegram/tmain/inbox"
-    if ls "$inbox_dir"/*.txt 2>/dev/null; then
+    if [[ "$got_file" == "1" ]]; then
         success "Incoming document downloaded to inbox"
         ls -la "$inbox_dir"/ 2>/dev/null | head -3
     else
-        # Check bridge log for download attempt
-        if grep -q "Downloaded file" "$BRIDGE_LOG" 2>/dev/null; then
-            success "Incoming document download attempted (check log)"
-        else
-            fail "Incoming document not downloaded to inbox"
-        fi
+        fail "Incoming document not downloaded to inbox"
     fi
 
     # Cleanup
     close_dm_session
+    rm -f "$inbox_manifest"
     rm -f /tmp/e2e-test-document.txt
 }
 
@@ -5419,6 +5511,14 @@ test_incoming_image_e2e() {
         info "Skipping (requires TEST_CHAT_ID for real Telegram upload)"
         return 0
     fi
+
+    local inbox_dir
+    inbox_dir=$(python3 -c 'import bridge; print(bridge.get_inbox_dir("tmain"))')
+    if [[ "$inbox_dir" != */test/* ]]; then
+        fail "Refusing to use non-test inbox path: $inbox_dir"
+        return
+    fi
+    rm -rf "$inbox_dir"
 
     # Create worker to receive image
     open_dm_session
@@ -5476,24 +5576,35 @@ PYEOF
             }
         }' >/dev/null
 
-    sleep 3
+    # Check if image was downloaded to inbox. Only real files count; bridge log
+    # messages include rejection paths and are not a success signal.
+    local inbox_manifest
+    inbox_manifest="$(mktemp)"
+    local got_file=0 attempts=0
+    while [[ $attempts -lt 50 ]]; do
+        : > "$inbox_manifest"
+        local f
+        for f in "$inbox_dir"/*.png "$inbox_dir"/*.jpg "$inbox_dir"/*.jpeg; do
+            [[ -f "$f" ]] && printf '%s\n' "$f" >> "$inbox_manifest"
+        done
+        if wait_for_file_content "$inbox_manifest" '\.(png|jpg|jpeg)$' 0; then
+            got_file=1
+            break
+        fi
+        sleep 0.1
+        ((attempts++)) || true
+    done
 
-    # Check if image was downloaded to inbox
-    local inbox_dir="$TEST_SESSION_DIR/tmain/inbox"
-    if ls "$inbox_dir"/*.png 2>/dev/null || ls "$inbox_dir"/*.jpg 2>/dev/null; then
+    if [[ "$got_file" == "1" ]]; then
         success "Incoming image downloaded to inbox"
         ls -la "$inbox_dir"/ 2>/dev/null | head -3
     else
-        # Check bridge log for download attempt
-        if grep -q "Downloaded file" "$BRIDGE_LOG" 2>/dev/null; then
-            success "Incoming image download attempted (check log)"
-        else
-            fail "Incoming image not downloaded to inbox"
-        fi
+        fail "Incoming image not downloaded to inbox"
     fi
 
     # Cleanup
     close_dm_session
+    rm -f "$inbox_manifest"
 }
 
 test_inbox_directory() {
@@ -6231,17 +6342,28 @@ test_concurrent_sends_no_interleave() {
 
     local test_session="test-conc-$$"
     local recv_log="/tmp/test-conc-recv-$$.log"
-    tmux new-session -d -s "$test_session" -x 200 -y 50 2>/dev/null
+    rm -f "$recv_log"
+    tmux new-session -d -s "$test_session" -x 200 -y 50 \
+        "/bin/sh -c 'while IFS= read -r line; do printf \"%s\\n\" \"\$line\" >> $recv_log; done'"
 
     if ! tmux has-session -t "$test_session" 2>/dev/null; then
         fail "Could not create test tmux session"
         return
     fi
 
-    # Start a simple receiver that logs each line
-    rm -f "$recv_log"
-    tmux send-keys -t "$test_session" "while IFS= read -r line; do printf '%s\n' \"\$line\" >> $recv_log; done" Enter
-    sleep 0.5
+    # Wait for the receiver command to be active without assuming pane shell syntax.
+    local ready=0
+    for _ in $(seq 1 20); do
+        [[ -f "$recv_log" ]] && ready=1 && break
+        [[ "$(tmux display-message -p -t "$test_session" '#{pane_current_command}' 2>/dev/null || true)" == "sh" ]] && ready=1 && break
+        sleep 0.1
+    done
+    if [[ "$ready" -ne 1 ]]; then
+        fail "Receiver did not start"
+        tmux kill-session -t "$test_session" 2>/dev/null || true
+        rm -f "$recv_log"
+        return
+    fi
 
     # 5 parallel threads, 5 messages each, all via tmux_send_message (has flock)
     if python3 -c "
@@ -6269,7 +6391,12 @@ for t in threads:
 assert not results['errors'], f'Send errors: {results[\"errors\"]}'
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
-        sleep 3
+        for _ in $(seq 1 30); do
+            local lines
+            lines=$(wc -l < "$recv_log" 2>/dev/null || echo 0)
+            [[ "$lines" -ge 25 ]] && break
+            sleep 0.1
+        done
 
         # Count clean messages (each should be exactly CC-X# on its own line)
         # NB: grep -c prints 0 AND exits 1 on no-match — `|| echo 0` would yield "0\n0",
@@ -8141,7 +8268,7 @@ TUITEST
 
     # Chaos: send 10 image+caption messages rapidly
     local sent=0
-    local failed=0
+    local send_failed=0
     for i in $(seq 1 $chaos_count); do
         if python3 -c "
 import sys; sys.path.insert(0, '.')
@@ -8156,7 +8283,7 @@ print('OK' if result else 'FAIL')
 " 2>/dev/null | grep -q "OK"; then
             sent=$((sent + 1))
         else
-            failed=$((failed + 1))
+            send_failed=$((send_failed + 1))
         fi
     done
 
@@ -8167,14 +8294,29 @@ print('OK' if result else 'FAIL')
         return
     fi
 
-    # Wait for TUI to process all (TUI deadline is 8s, wait beyond it)
-    sleep 10
+    # Wait for TUI to process all. Success exits as soon as the simulator
+    # writes the expected ENTERS count; failures still wait through its 30s
+    # internal deadline before judging red.
+    local attempts=0
+    while [[ $attempts -lt 300 ]]; do
+        if [[ -f "$result_file" ]] && wait_for_file_content "$result_file" '^ENTERS:' 0; then
+            local observed_enters
+            observed_enters=$(grep -Eo '^ENTERS:[0-9]+' "$result_file" 2>/dev/null | head -1 | cut -d: -f2 || true)
+            observed_enters=${observed_enters:-0}
+            [[ "$observed_enters" -ge "$chaos_count" ]] && break
+        fi
+        sleep 0.1
+        ((attempts++)) || true
+    done
 
     if [ -f "$result_file" ]; then
         local pastes enters renders
-        pastes=$(grep -oP 'PASTES:\K\d+' "$result_file" 2>/dev/null || echo 0)
-        enters=$(grep -oP 'ENTERS:\K\d+' "$result_file" 2>/dev/null || echo 0)
-        renders=$(grep -oP 'ENTER_DURING_RENDER:\K\d+' "$result_file" 2>/dev/null || echo 0)
+        pastes=$(grep -Eo '^PASTES:[0-9]+' "$result_file" 2>/dev/null | head -1 | cut -d: -f2 || true)
+        enters=$(grep -Eo '^ENTERS:[0-9]+' "$result_file" 2>/dev/null | head -1 | cut -d: -f2 || true)
+        renders=$(grep -Eo '^ENTER_DURING_RENDER:[0-9]+' "$result_file" 2>/dev/null | head -1 | cut -d: -f2 || true)
+        pastes=${pastes:-0}
+        enters=${enters:-0}
+        renders=${renders:-0}
         if [ "$enters" -ge "$chaos_count" ]; then
             success "Chaos: $enters/$chaos_count image+caption Enter delivered ($pastes pastes, $renders during render)"
         elif [ "$enters" -gt 0 ]; then
@@ -8299,8 +8441,16 @@ print('OK')
         return
     fi
 
-    # Wait for TUI to process
-    sleep 3
+    # Wait for TUI to process. Success exits as soon as Enter-after-paste is
+    # recorded; failures still wait through the simulator's 5s deadline.
+    local attempts=0
+    while [[ $attempts -lt 50 ]]; do
+        if [[ -f "$result_file" ]] && wait_for_file_content "$result_file" '^ENTER_AFTER_PASTE$' 0; then
+            break
+        fi
+        sleep 0.1
+        ((attempts++)) || true
+    done
 
     if [ -f "$result_file" ]; then
         local has_paste has_enter
@@ -8428,13 +8578,29 @@ print('OK' if result else 'FAIL')
         fi
     done
 
-    sleep 8
+    # Wait for TUI to process all. Success exits as soon as the simulator
+    # writes the expected ENTERS count; failures still wait through its 15s
+    # internal deadline before judging red.
+    local attempts=0
+    while [[ $attempts -lt 150 ]]; do
+        if [[ -f "$result_file" ]] && wait_for_file_content "$result_file" '^ENTERS:' 0; then
+            local observed_enters
+            observed_enters=$(grep -Eo '^ENTERS:[0-9]+' "$result_file" 2>/dev/null | head -1 | cut -d: -f2 || true)
+            observed_enters=${observed_enters:-0}
+            [[ "$observed_enters" -ge "$msg_count" ]] && break
+        fi
+        sleep 0.1
+        ((attempts++)) || true
+    done
 
     if [ -f "$result_file" ]; then
         local pastes enters renders
-        pastes=$(grep -oP 'PASTES:\K\d+' "$result_file" 2>/dev/null || echo 0)
-        enters=$(grep -oP 'ENTERS:\K\d+' "$result_file" 2>/dev/null || echo 0)
-        renders=$(grep -oP 'ENTER_DURING_RENDER:\K\d+' "$result_file" 2>/dev/null || echo 0)
+        pastes=$(grep -Eo '^PASTES:[0-9]+' "$result_file" 2>/dev/null | head -1 | cut -d: -f2 || true)
+        enters=$(grep -Eo '^ENTERS:[0-9]+' "$result_file" 2>/dev/null | head -1 | cut -d: -f2 || true)
+        renders=$(grep -Eo '^ENTER_DURING_RENDER:[0-9]+' "$result_file" 2>/dev/null | head -1 | cut -d: -f2 || true)
+        pastes=${pastes:-0}
+        enters=${enters:-0}
+        renders=${renders:-0}
         if [ "$enters" -ge "$msg_count" ]; then
             success "Slow paste: $enters/$msg_count Enter delivered ($renders during render)"
         else
@@ -9707,6 +9873,84 @@ print('OK')
     fi
 }
 
+test_restart_inplace_waits_for_pane_shell_ready() {
+    # T7: restart() live-path (tmux session exists) must call wait_for_pane_shell_ready
+    # BEFORE send_pane_start_cmd, exactly like _restart_dead_worker and create_session.
+    # Sensitivity: A) remove the wait line -> kinds.index('wait') ValueError FAIL;
+    #              B) put it after send -> wait_idx > launch_idx FAIL;
+    #              C) double-wait -> len(waits) != 1 FAIL.
+    info "Testing in-place restart gates launch line on pane shell readiness..."
+    if python3 -c "
+import tempfile, json
+from pathlib import Path
+from types import SimpleNamespace
+import bridge
+
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp
+bridge.NODE_DIR = tmp
+bridge.WORKER_REGISTRY_FILE = tmp / 'workers.json'
+bridge.SANDBOX_ENABLED = False
+
+# Register a live worker
+data = {'version': 1, 'workers': {
+    'livewk': {'backend': 'claude', 'chat_id': 123, 'hire_time': 1000}
+}}
+bridge.WORKER_REGISTRY_FILE.write_text(json.dumps(data))
+
+prefix = 'claude-inplace-'
+bridge.TMUX_PREFIX = prefix
+wm = bridge.SessionManager(tmp, prefix)
+
+events = []
+
+class FakeProc:
+    returncode = 0
+    stdout = ''
+
+def fake_run(args, *a, **k):
+    if isinstance(args, (list, tuple)):
+        tag = ' '.join(str(x) for x in args[:4])
+        events.append(('run', tag))
+    return FakeProc()
+
+# walk the live path (tmux session exists)
+bridge.tmux_exists = lambda *a, **k: True
+bridge.is_claude_running = lambda *a, **k: False
+bridge.subprocess.run = fake_run
+bridge.wait_for_pane_shell_ready = lambda pane, **k: events.append(('wait', pane)) or True
+bridge.send_pane_start_cmd = lambda pane, cmd, cwd: events.append(('launch', pane, cmd))
+bridge.export_hook_env = lambda *a, **k: None
+bridge.time.sleep = lambda *a, **k: None
+bridge._which_binary = lambda b: '/usr/bin/' + b
+bridge.clear_pending = lambda *a, **k: None
+bridge._clear_hook_failures = lambda *a, **k: None
+bridge.save_claude_session_cwd = lambda *a, **k: None
+wm._get_startup_cwd = lambda name, fallback_cwd='': ''
+wm.send = lambda *a, **k: None
+wm._build_welcome = lambda *a, **k: 'hi'
+wm.scan_tmux_sessions = lambda: {}
+
+ok, err = wm.restart('livewk', mode='relaunch')
+assert ok, ('restart should succeed', err)
+
+kinds = [e[0] for e in events]
+waits = [e for e in events if e[0] == 'wait']
+assert 'wait' in kinds, ('restart never called wait_for_pane_shell_ready', kinds)
+assert len(waits) == 1, ('expected exactly 1 wait (no double-wait)', waits)
+launch_idx = next(i for i, e in enumerate(events) if e[0] == 'launch')
+wait_idx = kinds.index('wait')
+assert wait_idx < launch_idx, ('wait must precede launch line', kinds)
+
+import shutil; shutil.rmtree(tmp)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "in-place restart gates launch line on pane shell readiness (wait before launch, exactly once)"
+    else
+        fail "in-place restart does not wait for pane shell readiness before launching"
+    fi
+}
+
 test_wait_for_pane_shell_ready_paths() {
     info "Testing wait_for_pane_shell_ready True/False paths against real panes..."
     # Increment B part 1: a nonexistent pane returns False after ~timeout
@@ -9818,6 +10062,7 @@ bridge.SESSIONS_DIR = Path(tmpdir) / 'sessions'
 bridge.SESSIONS_DIR.mkdir()
 
 prefix = 'claude-regtest-'
+bridge.TMUX_PREFIX = prefix  # _sync_paths() resets self.tmux_prefix to the global; without this the kill targets the wrong name
 wm = bridge.SessionManager(bridge.SESSIONS_DIR, prefix)
 
 # Create a tmux session to simulate a live worker
@@ -9837,6 +10082,11 @@ assert ok, f'end should succeed, got err: {err}'
 data = bridge._load_registry()
 assert 'endtest' not in data.get('workers', {}), 'worker should be removed from registry after end'
 
+# Verify the tmux session was actually killed (not just deregistered)
+rc = subprocess.run(['tmux', 'has-session', '-t', f'={tmux_name}'], capture_output=True).returncode
+assert rc != 0, 'tmux session should be killed after end'
+
+subprocess.run(['tmux', 'kill-session', '-t', f'={tmux_name}'], capture_output=True)
 import shutil; shutil.rmtree(tmpdir)
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
@@ -11034,6 +11284,55 @@ _pick_free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
 }
 
+test_bridge_ops_scripts_are_bsd_portable() {
+    info "Testing bridge-ops scripts avoid GNU grep -P..."
+
+    # Narrow static guard: this proves the three bridge-ops extraction sites do
+    # not use GNU-only grep -P. Known unautomated portability gaps remain:
+    # claudecode-telegram.sh uses bash /dev/tcp, and poll-forwarder.sh still
+    # uses pgrep -af for its idempotency guard.
+    local repo="$SCRIPT_DIR"
+    local bad=""
+    local file
+    for file in \
+        "$repo/.claude/skills/bridge-ops/scripts/restart-node.sh" \
+        "$repo/.claude/skills/bridge-ops/scripts/verify-node.sh" \
+        "$repo/.claude/skills/bridge-ops/scripts/check-versions.sh"; do
+        if grep -nE 'grep[[:space:]]+-oP|grep[[:space:]]+-P' "$file" >/tmp/bridge-ops-grep-p-$$ 2>/dev/null; then
+            bad+="$file: $(cat /tmp/bridge-ops-grep-p-$$) "
+        fi
+    done
+    rm -f /tmp/bridge-ops-grep-p-$$
+
+    if [[ -z "$bad" ]]; then
+        success "bridge-ops scripts avoid GNU-only grep -P"
+    else
+        fail "bridge-ops scripts still use grep -P: $bad"
+    fi
+}
+
+test_telegram_api_curls_have_max_time() {
+    info "Testing Telegram API curls have max-time bounds..."
+
+    local bad=""
+    local cli="$SCRIPT_DIR/claudecode-telegram.sh"
+    local fwd="$SCRIPT_DIR/.claude/skills/bridge-ops/scripts/poll-forwarder.sh"
+
+    local cli_hits
+    cli_hits=$(grep -nE 'curl -s .*https://api\.telegram\.org' "$cli" 2>/dev/null | grep -v -- '--max-time' || true)
+    [[ -n "$cli_hits" ]] && bad+="claudecode-telegram.sh: $cli_hits "
+
+    local fwd_hits
+    fwd_hits=$(grep -nE 'curl -s .*\$API_BASE/bot\$TELEGRAM_BOT_TOKEN/deleteWebhook' "$fwd" 2>/dev/null | grep -v -- '--max-time' || true)
+    [[ -n "$fwd_hits" ]] && bad+="poll-forwarder.sh: $fwd_hits "
+
+    if [[ -z "$bad" ]]; then
+        success "Telegram API curls have --max-time"
+    else
+        fail "Telegram API curl missing --max-time: $bad"
+    fi
+}
+
 # Increment A: poll-forwarder must NOT advance offset on a failed POST.
 # A failed forward that still bumps offset silently drops the update forever.
 test_poll_forwarder_retries_failed_post() {
@@ -11240,12 +11539,9 @@ test_restart_node_env_propagation() {
 
     require_token
 
-    # restart-node.sh / verify-node.sh are ss-based (ss -ltnp, grep -oP) and so
-    # is this test's own pid poll — all Linux-only. On macOS (the primary target
-    # platform) ss is absent, so the script under test cannot even verify itself
-    # and our poll would never find new_pid → guaranteed false failure + an
-    # orphaned bridge (restart-node only writes bridge.pid after its own ss loop,
-    # which never succeeds without ss). Skip cleanly rather than false-fail.
+    # This test's own pid poll is ss-based and Linux-only. The scripts have an
+    # lsof fallback, but this test would never find new_pid on macOS and could
+    # leave an orphaned bridge. Skip cleanly rather than false-fail.
     if ! command -v ss >/dev/null 2>&1; then
         success "restart-node env test skipped (ss unavailable — restart-node.sh is ss-based/Linux-only)"
         return 0
@@ -11336,6 +11632,8 @@ test_restart_node_env_propagation() {
 run_unit_tests() {
     # Unit tests (no bridge needed)
     log "── Unit Tests ──────────────────────────────────────────────────────────"
+    run_test test_wait_for_file_content_helper
+    run_test test_wait_for_log_helper
     run_test test_formatting
     run_test test_send_text_includes_thread_id
     run_test test_pane_start_cmd_shell_agnostic
@@ -11478,6 +11776,7 @@ run_unit_tests() {
     run_test test_checkin_cwd_restart_blocked_by_running_claude
     run_test test_restart_dead_worker
     run_test test_revive_waits_for_pane_shell_ready
+    run_test test_restart_inplace_waits_for_pane_shell_ready
     run_test test_wait_for_pane_shell_ready_paths
     run_test test_create_fail_open_when_wait_returns_false
     run_test test_end_removes_from_registry
@@ -11621,6 +11920,8 @@ run_unit_tests() {
     # Unit tests - bridge-ops poll-forwarder
     log ""
     log "── bridge-ops poll-forwarder Tests (Unit) ──────────────────────────────"
+    run_test test_bridge_ops_scripts_are_bsd_portable
+    run_test test_telegram_api_curls_have_max_time
     run_test test_poll_forwarder_retries_failed_post
     run_test test_poll_forwarder_idempotent
 }

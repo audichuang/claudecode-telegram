@@ -5,9 +5,9 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 
-SH=$(grep -oP '^VERSION="\K[^"]+' "$REPO/claudecode-telegram.sh" | head -1)
-PY=$(grep -oP '^version = "\K[^"]+' "$REPO/pyproject.toml" | head -1)
-BR=$(grep -oP '^VERSION = "\K[^"]+' "$REPO/bridge.py" | head -1)
+SH=$(sed -nE 's/^VERSION="([^"]+)".*/\1/p' "$REPO/claudecode-telegram.sh" | head -1)
+PY=$(sed -nE 's/^version = "([^"]+)".*/\1/p' "$REPO/pyproject.toml" | head -1)
+BR=$(sed -nE 's/^VERSION = "([^"]+)".*/\1/p' "$REPO/bridge.py" | head -1)
 
 echo "claudecode-telegram.sh : $SH"
 echo "pyproject.toml         : $PY"

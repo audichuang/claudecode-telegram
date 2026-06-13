@@ -56,6 +56,7 @@ description: claudecode-telegram 的完整測試工作流 — 用對的模式跑
 
 ## 失敗了?
 
-換 **test-triage** skill:單測重跑 → 已知環境性失敗清單(concurrent-sends、
-send_to_session_integration)→ worktree HEAD~1 對照實驗 → 插桩。在歸因前
-不要急著改程式碼或回滾。
+換 **test-triage** skill:單測重跑 → 已知環境性失敗清單(目前僅
+send_to_session_integration,三種紅法見該 skill 第 2 節;concurrent-sends
+已於 2026-06-13 證實為 test bug 並修復)→ worktree HEAD~1 對照實驗 → 插桩。
+在歸因前不要急著改程式碼或回滾。
