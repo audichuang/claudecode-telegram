@@ -14280,6 +14280,41 @@ print('OK')
     fi
 }
 
+# Guards the 07:47 silent-death regression: cmd_run MUST launch the bridge
+# setsid-detached (so a closing terminal/session can never SIGHUP it), capture
+# the real detached pid (not $! of the setsid wrapper), and must NOT kill that
+# detached bridge on an unintended teardown — only on an intentional stop.
+test_cmd_run_launches_bridge_detached() {
+    log "Test: cmd_run launches the bridge setsid-detached (07:47 silent-death guard)"
+    local script="$SCRIPT_DIR/claudecode-telegram.sh"
+    local body
+    body=$(awk '/^cmd_run\(\)/{f=1} f{print} f&&/^}$/{exit}' "$script")
+
+    # 1. Bridge launched fully detached (setsid + </dev/null).
+    if grep -q 'setsid' <<<"$body" && grep -q '</dev/null' <<<"$body"; then
+        success "cmd_run uses setsid + </dev/null to detach the bridge"
+    else
+        fail "cmd_run launches the bridge attached (no setsid/</dev/null) — 07:47 silent-death risk"
+    fi
+
+    # 2. Real pid comes from the detached child, not \$! (which is the setsid wrapper).
+    if grep -qE 'bridge_pid=\$!' <<<"$body"; then
+        fail "cmd_run captures \$! (the setsid wrapper), not the real detached bridge pid"
+    else
+        success "cmd_run does not rely on \$! for the detached bridge pid"
+    fi
+
+    # 3. Cleanup must guard the bridge kill behind an intentional-stop flag, so a
+    #    closing terminal (HUP -> EXIT trap) does not take the detached bridge down.
+    local cleanup_body
+    cleanup_body=$(awk '/cleanup_and_exit\(\)/{f=1} f{print} f&&/^    }$/{exit}' "$script")
+    if grep -qE '_intentional_stop|intentional' <<<"$cleanup_body"; then
+        success "cleanup guards the bridge kill behind an intentional-stop flag"
+    else
+        fail "cleanup kills the bridge unconditionally — a HUP would take the detached bridge down too"
+    fi
+}
+
 # ============================================================
 # TEST RUNNERS
 # ============================================================
@@ -14401,6 +14436,7 @@ run_unit_tests() {
     run_test test_tmux_exists_remote
     run_test test_process_inspection_remote
     run_test test_project_slug
+    run_test test_cmd_run_launches_bridge_detached
     run_test test_bridge_public_url_auto_detect
     run_test test_bridge_public_url_auto_bind
     run_test test_bridge_public_url_no_auto_bind_when_explicit

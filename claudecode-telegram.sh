@@ -572,11 +572,24 @@ cmd_run() {
         sleep 3
     fi
 
-    # Start bridge server in background
-    "$PY" -u "$SCRIPT_DIR/bridge.py" >> "$bridge_log" 2>&1 &
-    local bridge_pid=$!
-    echo "$bridge_pid" > "$node_dir/bridge.pid"
+    # Start the bridge fully detached: setsid + </dev/null so a closing terminal
+    # or session teardown can never SIGHUP/SIGKILL it (the 07:47 silent-death
+    # lesson — see CLAUDE.md). The subshell records its own pid before exec, so
+    # after exec that pid *is* the bridge — portable, no ss/lsof/grep -P needed.
+    setsid bash -c "echo \$\$ > '$node_dir/bridge.pid'; exec '$PY' -u '$SCRIPT_DIR/bridge.py' >> '$bridge_log' 2>&1" </dev/null >/dev/null 2>&1 &
     echo "$port" > "$node_dir/port"
+    # $! is the transient setsid wrapper — read back the real pid the child wrote.
+    local bridge_pid="" _i
+    for _i in $(seq 1 100); do
+        bridge_pid=$(cat "$node_dir/bridge.pid" 2>/dev/null || true)
+        [[ -n "$bridge_pid" ]] && kill -0 "$bridge_pid" 2>/dev/null && break
+        sleep 0.1
+    done
+    if [[ -z "$bridge_pid" ]] || ! kill -0 "$bridge_pid" 2>/dev/null; then
+        error "Bridge failed to start (no live pid in $node_dir/bridge.pid)"
+        [[ -n "${tunnel_pid:-}" ]] && kill "$tunnel_pid" 2>/dev/null || true
+        exit 1
+    fi
 
     # Save bot info for status command
     local bot_info; bot_info=$(telegram_api "$token" "getMe" "{}")
@@ -636,18 +649,31 @@ cmd_run() {
     chmod 600 "$pid_file"
     log "$(dim "PID: $$ ($pid_file)")"
 
-    # Cleanup on exit
+    # Cleanup on exit. The bridge is setsid-detached (its own session), so an
+    # UNINTENDED teardown of this supervisor — e.g. a closing terminal delivering
+    # SIGHUP, whose EXIT trap still fires in bash — must NOT take the bridge down;
+    # surviving host teardown is the whole point of detaching it (the 07:47
+    # lesson). Only an INTENTIONAL stop (Ctrl+C / stop / kill) tears it down.
+    local _intentional_stop=0
+    on_stop_signal() { _intentional_stop=1; exit 0; }
     cleanup_and_exit() {
-        log ""
-        log "Shutting down node '${node:-unknown}'..."
         stop_poll_fallback
         [[ -n "${tunnel_pid:-}" ]] && kill "$tunnel_pid" 2>/dev/null || true
-        [[ -n "${bridge_pid:-}" ]] && kill "$bridge_pid" 2>/dev/null || true
+        if [[ "$_intentional_stop" == 1 ]]; then
+            log ""
+            log "Shutting down node '${node:-unknown}'..."
+            [[ -n "${bridge_pid:-}" ]] && kill "$bridge_pid" 2>/dev/null || true
+            [[ -n "${node_dir:-}" ]] && rm -f "$node_dir/bridge.pid" "$node_dir/port" "$node_dir/bot_id" "$node_dir/bot_username"
+        else
+            log ""
+            log "Supervisor exiting — leaving the detached bridge for node '${node:-unknown}' running."
+        fi
         [[ -n "${pid_file:-}" ]] && rm -f "$pid_file"
-        [[ -n "${node_dir:-}" ]] && rm -f "$node_dir/bridge.pid" "$node_dir/tunnel.pid" "$node_dir/tunnel.log" "$node_dir/tunnel_url" "$node_dir/port" "$node_dir/bot_id" "$node_dir/bot_username"
+        [[ -n "${node_dir:-}" ]] && rm -f "$node_dir/tunnel.pid" "$node_dir/tunnel.log" "$node_dir/tunnel_url"
         exit 0
     }
-    trap cleanup_and_exit EXIT INT TERM
+    trap on_stop_signal INT TERM
+    trap cleanup_and_exit EXIT
 
     # 5. Watchdog loop
     local webhook_check_counter=0
