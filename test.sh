@@ -541,7 +541,7 @@ test_pane_start_cmd_runs_in_real_shell_panes() {
     # inside a real tmux pane per shell, and asserts the backend (a) actually
     # executed, (b) inherited the tmux session env, (c) had CLAUDECODE
     # stripped. Shells not installed on this box are skipped, never failed.
-    local shell shell_path sess marker line ok i
+    local shell shell_path sess marker line ok i launch_cmd zdotdir
     local tested="" skipped="" broken=""
     for shell in bash zsh fish; do
         shell_path=$(command -v "$shell" 2>/dev/null || true)
@@ -553,7 +553,19 @@ test_pane_start_cmd_runs_in_real_shell_panes() {
         marker="/tmp/claudecode-telegram-test-pane-${shell}-$$"
         rm -f "$marker"
         tmux kill-session -t "$sess" 2>/dev/null || true
-        tmux new-session -d -s "$sess" "$shell_path" 2>/dev/null || true
+        # A pristine box has no ~/.zshrc, so an interactive zsh drops into the
+        # zsh-newuser-install wizard which eats the launch line (the CI repro:
+        # apt zsh on a bare runner). Real users always have an rc; hand zsh a
+        # throwaway ZDOTDIR with an empty .zshrc so this test exercises the
+        # launch line, never the box's own zsh config.
+        launch_cmd="$shell_path"
+        zdotdir=""
+        if [[ "$shell" == "zsh" ]]; then
+            zdotdir=$(mktemp -d)
+            : > "$zdotdir/.zshrc"
+            launch_cmd="env ZDOTDIR=$zdotdir $shell_path"
+        fi
+        tmux new-session -d -s "$sess" "$launch_cmd" 2>/dev/null || true
         # What bridge injects before launching: hook env + a stowaway var the
         # backend must NOT inherit.
         tmux set-environment -t "$sess" PANE_START_PROBE "via-$shell"
@@ -583,6 +595,7 @@ test_pane_start_cmd_runs_in_real_shell_panes() {
 
         tmux kill-session -t "$sess" 2>/dev/null || true
         rm -f "$marker"
+        if [[ -n "$zdotdir" ]]; then rm -rf "$zdotdir"; fi
     done
 
     if [[ -n "$broken" ]]; then

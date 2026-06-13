@@ -32,28 +32,6 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check .
 
-      - name: Debug zsh pane (temporary)
-        continue-on-error: true
-        env:
-          TMUX_PREFIX: 'claude-test-'
-        run: |
-          set +e
-          echo "zsh: $(zsh --version)"
-          tmux new-session -d -s zdbg zsh
-          sleep 1.5
-          echo "--- pane right after start ---"
-          tmux capture-pane -p -t zdbg
-          tmux set-environment -t zdbg PANE_START_PROBE via-zsh
-          tmux set-environment -t zdbg CLAUDECODE must-be-stripped
-          uv run python -c "import bridge; bridge.wait_for_pane_shell_ready('zdbg')"
-          line=$(uv run python -c "import bridge; print(bridge.make_pane_start_cmd('env > /tmp/m', '/tmp'))")
-          echo "--- launch line ---"; printf '%s\n' "$line"
-          tmux send-keys -t zdbg -l "$line"; tmux send-keys -t zdbg Enter
-          sleep 2
-          echo "--- marker (PROBE/CLAUDECODE) ---"; grep -E 'PANE_START_PROBE|CLAUDECODE' /tmp/m 2>/dev/null || echo "(no marker written)"
-          echo "--- pane after send ---"; tmux capture-pane -p -t zdbg
-          tmux kill-session -t zdbg 2>/dev/null || true
-
       - name: FAST test suite
         env:
           # FAST mode needs no real bot; unit tests accept this dummy token.
