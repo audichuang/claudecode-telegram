@@ -13759,41 +13759,27 @@ test_checkin_note() {
 }
 
 test_checkin_note_machine_substitution() {
-    info "Testing checkin note {machine} substitution (all sessions are local in v1.0.0)..."
+    info "Testing checkin note {machine} substitution renders the real local host (v1.0.0)..."
 
     local result
     result=$(python3 -c "
-import os, tempfile
+import os
 import bridge
 
-tmpdir = tempfile.mkdtemp()
-team_dir = os.path.join(tmpdir, 'team')
-os.makedirs(team_dir)
-with open(os.path.join(team_dir, 'checkin-note.txt'), 'w') as f:
-    f.write('You are {name}. You are on: {machine}.')
+# Exercise the REAL production substitution helper (not a re-implementation).
+note = 'You are {name}. You are on: {machine}.'
+rendered = bridge._render_checkin_note(note, 'localtest')
 
-old_team_dir = bridge.TEAM_DIR
-old_checkin = bridge._CHECKIN_NOTE_PATH
-try:
-    bridge.TEAM_DIR = team_dir
-    bridge._CHECKIN_NOTE_PATH = os.path.join(team_dir, 'checkin-note.txt')
-
-    note = bridge.read_checkin_note()
-    assert '{machine}' in note, f'note missing placeholder: {note}'
-
-    # Teleport was removed: get_worker_host is always None -> local machine.
-    assert bridge.get_worker_host('anyname') is None, 'all sessions must be local'
-    rendered = note.replace('{name}', 'localtest').replace('{machine}', 'VPS (100.125.36.102)')
-    assert 'VPS' in rendered and '{machine}' not in rendered, rendered
-    print('LOCAL=' + rendered)
-finally:
-    bridge.TEAM_DIR = old_team_dir
-    bridge._CHECKIN_NOTE_PATH = old_checkin
-    import shutil
-    shutil.rmtree(tmpdir)
+assert '{name}' not in rendered and '{machine}' not in rendered, f'unsubstituted: {rendered}'
+assert 'localtest' in rendered, rendered
+# {machine} must be THIS host's real name, never the dead hardcoded VPS IP.
+assert '100.125.36.102' not in rendered, f'stale hardcoded VPS IP leaked: {rendered}'
+host = os.uname().nodename or 'this machine'
+assert host in rendered, f'expected real hostname {host!r} in: {rendered}'
+print('OK=' + rendered)
 ")
-    if echo "$result" | grep -q "LOCAL=.*VPS"; then
-        success "{machine} resolves to the local machine (no remote hosts)"
+    if echo "$result" | grep -q "OK=.*localtest"; then
+        success "{machine} renders the real local host (no hardcoded VPS IP)"
     else
         fail "{machine} substitution failed: $result"
     fi

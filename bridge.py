@@ -937,6 +937,21 @@ def read_checkin_note():
     return ""
 
 
+def _render_checkin_note(note: str, name: str) -> str:
+    """Substitute {name} and {machine} in a manager checkin note.
+
+    {machine} is this host's name. Every session is local in v1.0.0 (teleport
+    removed), so there is no remote-vs-local branch — the label is just the
+    machine the bridge runs on.
+    """
+    machine = ""
+    try:
+        machine = os.uname().nodename
+    except Exception:
+        pass
+    return note.replace("{name}", name).replace("{machine}", machine or "this machine")
+
+
 # Reserved names that cannot be used as worker names (would clash with commands)
 RESERVED_NAMES = {
     # Bridge commands
@@ -4948,14 +4963,7 @@ class WorkerManager:
         # Append manager note if set (with {name} and {machine} substitution)
         note = read_checkin_note()
         if note:
-            rendered = note.replace("{name}", name)
-            host = get_worker_host(name)
-            if host:
-                machine = f"Mac Mini ({host})"
-            else:
-                machine = "VPS (100.125.36.102)"
-            rendered = rendered.replace("{machine}", machine)
-            welcome += f"\n\nMANAGER NOTE:\n{rendered}"
+            welcome += f"\n\nMANAGER NOTE:\n{_render_checkin_note(note, name)}"
             print(f"Checkin note included for {name}")
 
         return welcome
