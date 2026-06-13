@@ -294,45 +294,6 @@ def _project_slug(cwd: str) -> str:
     return cwd.replace("/", "-")
 
 
-# Default rsync excludes for teleport directory sync
-TELEPORT_RSYNC_EXCLUDES = [
-    "node_modules", ".git", "__pycache__", ".venv", "venv",
-    ".next", "build", "dist", "target", ".gradle", ".cache",
-    ".tox", ".mypy_cache", ".pytest_cache", "*.pyc",
-    ".build", ".claude/worktrees",
-]
-
-# ============================================================
-# GIT-BASED TELEPORT SYNC
-# ============================================================
-# VPS hosts bare repos at ~/git-server/<project>.git.
-# Workers push WIP state (via git stash create) to per-worker branches,
-# target fetches deltas. ~0-50s vs 600s+ for rsync over Tailscale.
-
-GIT_SERVER_DIR = os.path.expanduser("~/git-server")
-
-
-def _bare_repo_url(bare_repo_path: str, target_host: str = None) -> str:
-    """Return the URL to access the bare repo from target_host.
-
-    Local targets get the direct path. Remote targets get an SSH URL to VPS.
-    """
-    if target_host:
-        return f"claude@100.125.36.102:{bare_repo_path}"
-    return bare_repo_path
-
-
-def _ensure_bare_repo(project_name: str) -> str:
-    """Create bare repo at GIT_SERVER_DIR/<project>.git if missing. Returns path."""
-    bare_path = os.path.join(GIT_SERVER_DIR, f"{project_name}.git")
-    if not os.path.isdir(bare_path):
-        os.makedirs(GIT_SERVER_DIR, exist_ok=True)
-        subprocess.run(
-            ["git", "init", "--bare", bare_path],
-            capture_output=True, text=True, check=True)
-    return bare_path
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared tmux helpers (used by multiple backends)
 # ─────────────────────────────────────────────────────────────────────────────

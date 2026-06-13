@@ -9535,84 +9535,6 @@ print(result.stdout.strip())
     fi
 }
 
-# ── Git-Based Teleport Sync Tests ──────────────────────────────────────
-
-test_ensure_bare_repo_creates_new() {
-    info "Testing _ensure_bare_repo creates a new bare repo..."
-
-    if python3 -c "
-import tempfile, shutil, os
-import bridge
-
-tmpdir = tempfile.mkdtemp()
-orig = bridge.GIT_SERVER_DIR
-bridge.GIT_SERVER_DIR = tmpdir
-
-path = bridge._ensure_bare_repo('test-project')
-assert path == os.path.join(tmpdir, 'test-project.git'), f'unexpected path: {path}'
-assert os.path.isdir(path), 'bare repo dir should exist'
-assert os.path.isfile(os.path.join(path, 'HEAD')), 'bare repo should have HEAD'
-
-bridge.GIT_SERVER_DIR = orig
-shutil.rmtree(tmpdir)
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_ensure_bare_repo creates new bare repo"
-    else
-        fail "_ensure_bare_repo create test failed"
-    fi
-}
-
-test_ensure_bare_repo_idempotent() {
-    info "Testing _ensure_bare_repo is idempotent..."
-
-    if python3 -c "
-import tempfile, shutil, os
-import bridge
-
-tmpdir = tempfile.mkdtemp()
-orig = bridge.GIT_SERVER_DIR
-bridge.GIT_SERVER_DIR = tmpdir
-
-path1 = bridge._ensure_bare_repo('myrepo')
-path2 = bridge._ensure_bare_repo('myrepo')
-assert path1 == path2, f'paths differ: {path1} vs {path2}'
-assert os.path.isdir(path1), 'bare repo should still exist'
-
-bridge.GIT_SERVER_DIR = orig
-shutil.rmtree(tmpdir)
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "_ensure_bare_repo is idempotent"
-    else
-        fail "_ensure_bare_repo idempotent test failed"
-    fi
-}
-
-test_bare_repo_url_for_remote() {
-    info "Testing bare repo URL generation for remote targets..."
-
-    if python3 -c "
-import bridge
-
-# Local target should use direct path
-url = bridge._bare_repo_url('/home/claude/git-server/test.git', target_host=None)
-assert url == '/home/claude/git-server/test.git', f'local: {url}'
-
-# Remote target should use SSH URL
-url = bridge._bare_repo_url('/home/claude/git-server/test.git',
-                             target_host='beastoin-agents-f1-mac-mini')
-assert 'claude@100.125.36.102:' in url, f'remote should SSH to VPS: {url}'
-assert '/home/claude/git-server/test.git' in url, f'should include path: {url}'
-
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "Bare repo URL correct for remote targets"
-    else
-        fail "Bare repo URL test failed"
-    fi
-}
-
 test_export_hook_env_remaps_remote_sessions_dir() {
     info "Testing export_hook_env remaps SESSIONS_DIR for teleported workers..."
 
@@ -14464,9 +14386,6 @@ run_unit_tests() {
     # Unit tests - Git-Based Teleport Sync
     log ""
     log "── Git Sync Tests (Unit) ───────────────────────────────────────────────"
-    run_test test_ensure_bare_repo_creates_new
-    run_test test_ensure_bare_repo_idempotent
-    run_test test_bare_repo_url_for_remote
     run_test test_export_hook_env_remaps_remote_sessions_dir
     run_test test_export_hook_env_uses_public_url_for_remote
     run_test test_resolved_alert_cooldown
