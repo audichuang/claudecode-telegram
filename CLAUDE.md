@@ -186,7 +186,7 @@ SESSIONS_DIR="$HOME/.claude/telegram/sessions"
 - Parent exports to child's environment (e.g., `tmux send-keys "export VAR=value"`)
 - Child process reads env var
 
-**Check all entry points:** If a session can be created via `create_session()`, `register_session()`, or `restart_claude()`, ALL of them must export the required env vars.
+**Check all entry points:** If a session can be created via `create_session()` or `restart_claude()`, ALL of them must export the required env vars.
 
 ### When adding configurable behavior, audit all code paths
 
@@ -338,7 +338,7 @@ machine hosting prod has `prod.env`, etc.).
 **Problem:** Deployed v0.9.2 fix directly to prod without testing on dev node first. Ran local stress test but skipped real integration testing on dev.
 
 **Fix:** Always test on dev node before prod deployment:
-1. Start dev bridge with dev bot token on port 8272
+1. Start dev bridge with the dev bot token on the dev node's configured port (per the port table / `ss` check — defaults lie; this box runs dev on 8270)
 2. Run full integration tests against dev
 3. Test manually via Telegram on dev bot
 4. Only then deploy to prod

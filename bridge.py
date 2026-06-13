@@ -552,8 +552,6 @@ state = {
     "tts_enabled": False,  # Auto-TTS for worker responses (toggle with /voice)
 }
 
-# Consecutive @mention tracking (auto-focus after 2 in a row to same worker)
-
 # Watchdog state
 _worker_states = {}  # name -> (state, reason, since)
 _last_child_ts = {}
@@ -626,7 +624,7 @@ BLOCKED_COMMANDS = [
 # ============================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Persistence (last chat ID and last active worker survive restart)
+# Persistence (last admin chat ID survives restart)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_last_chat_id(chat_id):
@@ -2310,9 +2308,6 @@ def get_chat_id_file(name):
 # Root directory the folder navigator is confined to (topic-session feature).
 TOPIC_ROOT = os.path.expanduser(os.environ.get("TOPIC_ROOT", "~"))
 
-# Topic-session routing mode. When on, inbound messages are routed by forum
-# thread (話題) instead of the legacy @mention/focus model. Default OFF so
-# legacy behavior is fully preserved.
 # Topic-only bridge (v1.0.0): one Telegram forum 話題 = one session. This is
 # the only mode — the legacy hire/focus/team router was removed. The constant
 # is kept (always True) so remaining gates read naturally until they are
@@ -2656,7 +2651,7 @@ def _scan_latest_session_id(cwd: str) -> str:
 
 
 def _cache_session_id(name: str, sid: str) -> None:
-    """Write session_id to local VPS cache file (best effort, 0o600)."""
+    """Write session_id to a local cache file (best effort, 0o600)."""
     if not sid:
         return
     try:
