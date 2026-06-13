@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 1.0.0
+> Version: 1.1.0
 
 ## Current Philosophy (Summary)
 
@@ -339,6 +339,43 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.1.0 - The deferred cleanup pass + launch/voice hardening
+
+Closes the v1.0.0 promise to "fold the dead `host=` branches away in a cosmetic
+pass", plus fixes launch/voice issues surfaced by a 3-model audit
+(Sonnet→Opus→Codex) and a 6-Opus review. bridge.py 9,905 → 8,814 lines; test.sh
+dropped 39 dead tests (243 FAST tests, all green).
+
+**Launch (P0):** `run` starts the bridge fully detached — `setsid` (Linux) or
+`nohup` (macOS, which ships no setsid) + `</dev/null` — so a closing terminal can
+no longer SIGHUP it (the 07:47 silent-death mode reached the `run` path too, not
+just skill restarts). The supervisor's EXIT trap no longer kills the detached
+bridge on an unintended teardown (intentional-stop flag); the bridge-died path
+clears its stale pid; the pid is read back from a pre-truncated bridge.pid (no
+PID-reuse race).
+
+**Voice + bind (P1):** STT/TTS endpoints default DISABLED (empty) instead of a
+hardcoded private Tailscale IP — set `STT_ENDPOINT` / `TTS_ENDPOINT` to enable.
+The `0.0.0.0` auto-bind is kept (it serves the /rewind & /pilot viewer URLs over
+Tailscale) with its stale "teleported workers" comment corrected.
+
+**Checkin (P2):** the `{machine}` placeholder renders the real local hostname
+(`os.uname().nodename`) instead of a dead else-branch literal "VPS (100.x)"; its
+tautological test was rewritten to exercise the real renderer.
+
+**Dead code removed (P2):** `get_worker_host` and its ~180 `host=`/`if host:`
+branches, `_remote_run`/`_remote_copy`, the teleport/git-sync + remote
+session-sync helpers, the watchdog SSH probe, `_wrap_for_caller`,
+`_start_transcript_sync`, `get_any_session_id`, `BRIDGE_SSH_TARGET`; every
+`if not backend.is_interactive` branch (only ClaudeBackend exists), the adapter
+machinery, and the worker-to-worker named-pipe subsystem (`in.pipe` — which
+CLAUDE.md already claimed was gone). Preserved the live `_project_slug`,
+`BRIDGE_PUBLIC_URL`, `parse_at_mentions` (GitHub PR path), and the topic surface.
+
+**Process:** the host=/backend collapse was executed by Codex under an
+audit-derived plan and independently verified (import, FAST, ruff, preserve/dead
+greps, test-set diff) before commit.
 
 ### v1.0.0 - Topic-only bridge (the multi-worker era is deleted)
 
