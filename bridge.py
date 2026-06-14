@@ -532,6 +532,30 @@ REWIND_TOKENS = {}
 PR_REVIEW_TOKENS = {}
 REWIND_TIMEOUT = 5 * 60  # 5 minutes
 
+
+def _pr_cache_path(owner, repo, pr_num):
+    """Cache filename for a generated PR review, keyed by owner/repo/pr_num.
+
+    The output is a single flat filename under /tmp: the sanitizer maps '/' to
+    '_' so no path separator survives, hence a hostile owner/repo cannot escape
+    /tmp (traversal is structurally impossible, not merely because '..' is
+    stripped — it is not). Collision across two different repos' PR #N is closed
+    by the trailing digest below (C8). The SAME function is used by the producer
+    (cmd_pr_review) and the server (handle_pr_review_endpoint) so they always
+    agree on the path.
+    """
+    def safe(v):
+        return re.sub(r'[^A-Za-z0-9_.-]', '_', str(v))
+    # A digest over the RAW (owner, repo, pr_num) tuple keeps the path injective
+    # even when the sanitizer or the '-' field separator would otherwise alias two
+    # distinct repos (e.g. alpha/repo-A#5 vs alpha-repo/A#5 both flatten to
+    # ...-alpha-repo-A-5...). The readable prefix is kept for debuggability; the
+    # digest is what actually prevents the collision.
+    digest = hashlib.sha256(
+        json.dumps([str(owner), str(repo), str(pr_num)], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"/tmp/pr-review-{safe(owner)}-{safe(repo)}-{safe(pr_num)}-{digest}.html"
+
 # --- Extension seams (v1.1.0) ---------------------------------------
 # Satellites register here instead of editing the router/Handler.
 # EXTRA_COMMANDS: "/cmd" -> fn(router, arg, chat_id) -> True if handled
@@ -5493,10 +5517,11 @@ class CommandRouter:
 
         # Run pr-review.py — pass full URL (with fragment) so it can highlight linked comment
         script_path = Path(__file__).parent / "pr-review.py"
-        out_path = f"/tmp/pr-review-{pr_num}.html"
+        # Key the cache file by owner/repo/pr_num so two repos' PR #N never collide (C8).
+        out_path = _pr_cache_path(owner, repo, pr_num)
         try:
             r = subprocess.run(
-                [sys.executable, str(script_path), arg, "--no-serve"],
+                [sys.executable, str(script_path), arg, "--no-serve", "--out", out_path],
                 capture_output=True, text=True, timeout=300)
             if r.returncode != 0 or not os.path.exists(out_path):
                 self.reply(chat_id, f"Failed to generate PR review:\n{r.stderr[:500]}", outcome="Needs decision")
@@ -6313,8 +6338,11 @@ class Handler(BaseHTTPRequestHandler):
 
         PR_REVIEW_TOKENS[token]["expires_at"] = now + 300
 
-        owner = params.get("owner", [None])[0]
-        repo = params.get("repo", [None])[0]
+        # owner/repo are authoritative from the token, never the query string (C8) —
+        # prevents reading files from an arbitrary repo via the bridge's gh token.
+        info = PR_REVIEW_TOKENS[token]
+        owner = info["owner"]
+        repo = info["repo"]
         path = params.get("path", [None])[0]
         ref = params.get("ref", [None])[0]
 
@@ -6381,9 +6409,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         PR_REVIEW_TOKENS[token]["expires_at"] = now + 300
 
-        owner = data.get("owner", "")
-        repo = data.get("repo", "")
-        pr_num = data.get("pr_num", 0)
+        # owner/repo/pr_num are authoritative from the token, never the request body (C8).
+        info = PR_REVIEW_TOKENS[token]
+        owner = info["owner"]
+        repo = info["repo"]
+        pr_num = info["pr_num"]
         comment_body = data.get("body", "").strip()
         if not all([owner, repo, pr_num, comment_body]):
             self.send_response(400)
@@ -6454,9 +6484,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         PR_REVIEW_TOKENS[token]["expires_at"] = now + 300
 
-        owner = data.get("owner", "")
-        repo = data.get("repo", "")
-        pr_num = data.get("pr_num", 0)
+        # owner/repo/pr_num are authoritative from the token, never the request body (C8).
+        info = PR_REVIEW_TOKENS[token]
+        owner = info["owner"]
+        repo = info["repo"]
+        pr_num = info["pr_num"]
         merge_method = data.get("merge_method", "merge")
         if merge_method not in ("merge", "squash", "rebase"):
             merge_method = "merge"
@@ -6526,7 +6558,7 @@ class Handler(BaseHTTPRequestHandler):
 
         info = PR_REVIEW_TOKENS[token]
         pr_num = info["pr_num"]
-        html_path = f"/tmp/pr-review-{pr_num}.html"
+        html_path = _pr_cache_path(info["owner"], info["repo"], pr_num)
 
         if not os.path.exists(html_path):
             self.send_response(404)
@@ -6563,9 +6595,11 @@ class Handler(BaseHTTPRequestHandler):
         # Extend token expiry on use
         PR_REVIEW_TOKENS[token]["expires_at"] = now + 300
 
-        owner = data.get("owner", "")
-        repo = data.get("repo", "")
-        pr_num = data.get("pr_num", 0)
+        # owner/repo/pr_num are authoritative from the token, never the request body (C8).
+        info = PR_REVIEW_TOKENS[token]
+        owner = info["owner"]
+        repo = info["repo"]
+        pr_num = info["pr_num"]
         path = data.get("path", "")
         line = data.get("line", 0)
         side = data.get("side", "RIGHT")

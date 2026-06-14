@@ -12067,6 +12067,264 @@ test_bridge_death_exits_nonzero() {
     fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.3.5 Task 6 — PR review cross-repo cache + body-trusted owner/repo (C8)
+# ─────────────────────────────────────────────────────────────────────────────
+
+test_pr_cache_keyed_by_owner_repo_num() {
+    info "Testing PR review cache path is keyed by owner/repo/pr_num (no cross-repo collision)..."
+
+    if python3 -c "
+import io, os
+from urllib.parse import urlparse
+import bridge
+
+calls = []
+def fake_run(cmd, *a, **k):
+    out = None
+    if '--out' in cmd:
+        out = cmd[cmd.index('--out') + 1]
+    calls.append({'cmd': list(cmd), 'out': out})
+    if out:
+        with open(out, 'w') as f:
+            f.write('CONTENT-FOR ' + out)
+    class R: pass
+    r = R(); r.returncode = 0; r.stdout = ''; r.stderr = ''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.admin_chat_id = None
+bridge.BRIDGE_PUBLIC_URL = ''
+bridge.PR_REVIEW_TOKENS.clear()
+
+class FakeHandler:
+    def __init__(self):
+        self.status=None; self.headers={}; self.wfile=io.BytesIO(); self.replies=[]
+    def reply(self, chat_id, text, **kw): self.replies.append(text)
+    def send_response(self, c): self.status=c
+    def send_header(self, k, v): self.headers[k]=v
+    def end_headers(self): pass
+    def _send_html(self, data): self.status=200; self.wfile.write(data)
+
+written = []
+try:
+    h1 = FakeHandler()
+    bridge.CommandRouter.cmd_pr_review(h1, 'https://github.com/alpha/repoA/pull/5', 1)
+    h2 = FakeHandler()
+    bridge.CommandRouter.cmd_pr_review(h2, 'https://github.com/beta/repoB/pull/5', 1)
+    for c in calls:
+        if c['out']: written.append(c['out'])
+
+    assert calls[0]['out'] is not None, 'first /pr did not pass --out: ' + str(calls[0]['cmd'])
+    assert calls[1]['out'] is not None, 'second /pr did not pass --out: ' + str(calls[1]['cmd'])
+    assert calls[0]['out'] != calls[1]['out'], 'cross-repo cache collision (same path for two repos): ' + calls[0]['out']
+    assert 'alpha' in calls[0]['out'] and 'repoA' in calls[0]['out'], 'cache path missing owner/repo: ' + calls[0]['out']
+    # injectivity: legal owner/repo names must not alias through the '-' separator
+    assert bridge._pr_cache_path('alpha', 'repo-A', 5) != bridge._pr_cache_path('alpha-repo', 'A', 5), \
+        'legal owner/repo names still collide through hyphen separator'
+
+    tokens = list(bridge.PR_REVIEW_TOKENS.keys())
+    assert len(tokens) == 2, 'expected 2 tokens, got ' + str(len(tokens))
+    served = []
+    for tok in tokens:
+        hh = FakeHandler()
+        bridge.Handler.handle_pr_review_endpoint(hh, urlparse('/pr-review/5?token=' + tok))
+        served.append(hh.wfile.getvalue().decode('utf-8', 'replace'))
+    assert served[0] != served[1], 'endpoint served identical content for two repos (cache collision at serve time)'
+
+    # path-traversal: malicious owner/repo must be sanitized to a flat /tmp filename
+    p = bridge._pr_cache_path('ev/il', 'ot/../her', 9)
+    assert p.startswith('/tmp/pr-review-'), 'unexpected cache path: ' + p
+    assert '/' not in p[len('/tmp/'):], 'unsanitized slash in cache filename: ' + p
+
+    print('OK')
+finally:
+    for p in set(written):
+        try: os.remove(p)
+        except OSError: pass
+" 2>/dev/null | grep -q "OK"; then
+        success "PR review cache keyed by owner/repo/pr_num (no collision)"
+    else
+        fail "PR review cache collides across repos with same PR number"
+    fi
+}
+
+test_pr_comment_uses_token_owner_repo_not_body() {
+    info "Testing /pr-comment derives owner/repo from token, not request body..."
+
+    if python3 -c "
+import io, json, time
+import bridge
+import urllib.request as _ur
+_ur.urlopen = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('blocked'))
+
+calls = []
+def fake_run(cmd, *a, **k):
+    calls.append(list(cmd))
+    class R: pass
+    r=R(); r.returncode=0; r.stdout=''; r.stderr=''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.admin_chat_id = None
+bridge.PR_REVIEW_TOKENS.clear()
+tok = 'TESTTOKEN'
+bridge.PR_REVIEW_TOKENS[tok] = {'pr_num': 5, 'owner': 'realowner', 'repo': 'realrepo', 'expires_at': time.time()+300}
+
+class FakeHandler:
+    def __init__(self): self.status=None; self.headers={}; self.wfile=io.BytesIO()
+    def send_response(self,c): self.status=c
+    def send_header(self,k,v): self.headers[k]=v
+    def end_headers(self): pass
+
+body = json.dumps({'token': tok, 'owner': 'evil', 'repo': 'other', 'pr_num': 999,
+                   'path': 'src/x.py', 'line': 10, 'side': 'RIGHT',
+                   'body': 'looks good', 'head_sha': 'abc123'}).encode()
+h = FakeHandler()
+bridge.Handler.handle_pr_comment(h, body)
+assert h.status == 200, 'status=' + str(h.status)
+assert calls, 'no gh api call made'
+api_path = calls[0][2]
+assert api_path == 'repos/realowner/realrepo/pulls/5/comments', 'wrong repo target: ' + api_path
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/pr-comment uses token owner/repo (ignores body claim)"
+    else
+        fail "/pr-comment trusts body owner/repo (wrong-repo gh action)"
+    fi
+}
+
+test_pr_merge_uses_token_owner_repo_not_body() {
+    info "Testing /pr-merge derives owner/repo from token, not request body..."
+
+    if python3 -c "
+import io, json, time
+import bridge
+import urllib.request as _ur
+_ur.urlopen = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('blocked'))
+
+calls = []
+def fake_run(cmd, *a, **k):
+    calls.append(list(cmd))
+    class R: pass
+    r=R(); r.returncode=0; r.stdout=''; r.stderr=''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.admin_chat_id = None
+bridge.PR_REVIEW_TOKENS.clear()
+tok = 'TESTTOKEN'
+bridge.PR_REVIEW_TOKENS[tok] = {'pr_num': 5, 'owner': 'realowner', 'repo': 'realrepo', 'expires_at': time.time()+300}
+
+class FakeHandler:
+    def __init__(self): self.status=None; self.headers={}; self.wfile=io.BytesIO()
+    def send_response(self,c): self.status=c
+    def send_header(self,k,v): self.headers[k]=v
+    def end_headers(self): pass
+
+body = json.dumps({'token': tok, 'owner': 'evil', 'repo': 'other', 'pr_num': 999,
+                   'merge_method': 'squash'}).encode()
+h = FakeHandler()
+bridge.Handler.handle_pr_merge(h, body)
+assert h.status == 200, 'status=' + str(h.status)
+assert calls, 'no gh api call made'
+api_path = calls[0][2]
+assert api_path == 'repos/realowner/realrepo/pulls/5/merge', 'wrong repo target: ' + api_path
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/pr-merge uses token owner/repo (ignores body claim)"
+    else
+        fail "/pr-merge trusts body owner/repo (wrong-repo gh action)"
+    fi
+}
+
+test_pr_general_comment_uses_token_owner_repo_not_body() {
+    info "Testing /pr-general-comment derives owner/repo from token, not request body..."
+
+    if python3 -c "
+import io, json, time
+import bridge
+import urllib.request as _ur
+_ur.urlopen = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('blocked'))
+
+calls = []
+def fake_run(cmd, *a, **k):
+    calls.append(list(cmd))
+    class R: pass
+    r=R(); r.returncode=0; r.stdout=''; r.stderr=''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.admin_chat_id = None
+bridge.PR_REVIEW_TOKENS.clear()
+tok = 'TESTTOKEN'
+bridge.PR_REVIEW_TOKENS[tok] = {'pr_num': 5, 'owner': 'realowner', 'repo': 'realrepo', 'expires_at': time.time()+300}
+
+class FakeHandler:
+    def __init__(self): self.status=None; self.headers={}; self.wfile=io.BytesIO()
+    def send_response(self,c): self.status=c
+    def send_header(self,k,v): self.headers[k]=v
+    def end_headers(self): pass
+
+body = json.dumps({'token': tok, 'owner': 'evil', 'repo': 'other', 'pr_num': 999,
+                   'body': 'general comment'}).encode()
+h = FakeHandler()
+bridge.Handler.handle_pr_general_comment(h, body)
+assert h.status == 200, 'status=' + str(h.status)
+assert calls, 'no gh api call made'
+api_path = calls[0][2]
+assert api_path == 'repos/realowner/realrepo/issues/5/comments', 'wrong repo target: ' + api_path
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/pr-general-comment uses token owner/repo (ignores body claim)"
+    else
+        fail "/pr-general-comment trusts body owner/repo (wrong-repo gh action)"
+    fi
+}
+
+test_pr_file_content_uses_token_owner_repo_not_query() {
+    info "Testing /pr-file-content derives owner/repo from token, not query string..."
+
+    if python3 -c "
+import io, time, base64
+from urllib.parse import urlparse
+import bridge
+
+calls = []
+def fake_run(cmd, *a, **k):
+    calls.append(list(cmd))
+    class R: pass
+    r=R(); r.returncode=0
+    r.stdout = base64.b64encode(b'line1\nline2').decode()
+    r.stderr=''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.PR_REVIEW_TOKENS.clear()
+tok = 'TESTTOKEN'
+bridge.PR_REVIEW_TOKENS[tok] = {'pr_num': 5, 'owner': 'realowner', 'repo': 'realrepo', 'expires_at': time.time()+300}
+
+class FakeHandler:
+    def __init__(self): self.status=None; self.headers={}; self.wfile=io.BytesIO()
+    def send_response(self,c): self.status=c
+    def send_header(self,k,v): self.headers[k]=v
+    def end_headers(self): pass
+
+parsed = urlparse('/pr-file-content?token=' + tok + '&owner=evil&repo=other&path=src/x.py&ref=abc123')
+h = FakeHandler()
+bridge.Handler.handle_pr_file_content(h, parsed)
+assert h.status == 200, 'status=' + str(h.status)
+assert calls, 'no gh api call made'
+api_path = calls[0][2]
+assert api_path.startswith('repos/realowner/realrepo/contents/'), 'wrong repo target: ' + api_path
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/pr-file-content uses token owner/repo (ignores query claim)"
+    else
+        fail "/pr-file-content trusts query owner/repo (cross-repo file read)"
+    fi
+}
+
 # ============================================================
 # TEST RUNNERS
 # ============================================================
@@ -12318,6 +12576,14 @@ run_unit_tests() {
     run_test test_transcript_prompts_filter
     run_test test_transcript_dynamic_avatars
     run_test test_transcript_sidebar_stats
+    # Unit tests - PR Review security (v1.3.5 Task 6 / C8)
+    log ""
+    log "── PR Review Security Tests (Unit) ─────────────────────────────────────"
+    run_test test_pr_cache_keyed_by_owner_repo_num
+    run_test test_pr_comment_uses_token_owner_repo_not_body
+    run_test test_pr_merge_uses_token_owner_repo_not_body
+    run_test test_pr_general_comment_uses_token_owner_repo_not_body
+    run_test test_pr_file_content_uses_token_owner_repo_not_query
     # Unit tests - Transcript Index (transcript-index.py)
     log ""
     log "── Transcript Index Tests (Unit) ───────────────────────────────────────"
