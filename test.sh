@@ -2753,6 +2753,7 @@ import sys, os, json, tempfile
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch, MagicMock
 import bridge
+bridge.STT_ENDPOINT = 'http://stt.test/transcribe'  # endpoint now defaults to '' (5b); set it so transcribe_voice doesn't fail-open
 
 # Create a temp file to simulate audio
 tmp = tempfile.NamedTemporaryFile(suffix='.ogg', delete=False)
@@ -2782,18 +2783,24 @@ finally:
 test_transcribe_voice_timeout_returns_none() {
     info "Testing transcribe_voice returns None on timeout..."
     if python3 -c "
-import sys, os
+import sys, os, tempfile
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch
-import urllib.error
 import bridge
+bridge.STT_ENDPOINT = 'http://stt.test/transcribe'  # endpoint defaults to '' (5b); set it so we reach the timeout path
 
-# Simulate timeout
-with patch('urllib.request.urlopen', side_effect=Exception('timeout')):
-    result = bridge.transcribe_voice('/tmp/test.ogg')
-
-assert result is None, f'Expected None, got {result!r}'
-print('OK')
+# A real audio file is required, or transcribe_voice returns on the missing-file
+# early-return BEFORE urlopen — a false-green that never tests the timeout path.
+tmp = tempfile.NamedTemporaryFile(suffix='.ogg', delete=False)
+tmp.write(b'fake audio data'); tmp.close()
+try:
+    with patch('urllib.request.urlopen', side_effect=Exception('timeout')) as mock_url:
+        result = bridge.transcribe_voice(tmp.name)
+    mock_url.assert_called_once()  # prove we actually reached the network call
+    assert result is None, f'Expected None, got {result!r}'
+    print('OK')
+finally:
+    os.unlink(tmp.name)
 " 2>/dev/null | grep -q "OK"; then
         success "transcribe_voice returns None on timeout"
     else
@@ -2804,21 +2811,29 @@ print('OK')
 test_transcribe_voice_bad_json_returns_none() {
     info "Testing transcribe_voice returns None on bad JSON..."
     if python3 -c "
-import sys, os
+import sys, os, tempfile
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch, MagicMock
 import bridge
+bridge.STT_ENDPOINT = 'http://stt.test/transcribe'  # endpoint defaults to '' (5b); set it so we reach the bad-JSON path
 
 mock_response = MagicMock()
 mock_response.read.return_value = b'not json'
 mock_response.__enter__ = lambda s: s
 mock_response.__exit__ = MagicMock(return_value=False)
 
-with patch('urllib.request.urlopen', return_value=mock_response):
-    result = bridge.transcribe_voice('/tmp/test.ogg')
-
-assert result is None, f'Expected None, got {result!r}'
-print('OK')
+# Real file required, or transcribe_voice returns on the missing-file early-return
+# BEFORE urlopen — a false-green that never tests JSON-parse failure.
+tmp = tempfile.NamedTemporaryFile(suffix='.ogg', delete=False)
+tmp.write(b'fake audio data'); tmp.close()
+try:
+    with patch('urllib.request.urlopen', return_value=mock_response) as mock_url:
+        result = bridge.transcribe_voice(tmp.name)
+    mock_url.assert_called_once()  # prove we actually reached the JSON-parse path
+    assert result is None, f'Expected None, got {result!r}'
+    print('OK')
+finally:
+    os.unlink(tmp.name)
 " 2>/dev/null | grep -q "OK"; then
         success "transcribe_voice returns None on bad JSON"
     else
@@ -2894,6 +2909,7 @@ import sys, os, tempfile
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch, MagicMock
 import bridge
+bridge.TTS_ENDPOINT = 'http://tts.test/synthesize'  # endpoint now defaults to '' (5b); set it so synthesize_speech doesn't fail-open
 
 # Mock urllib to return audio bytes
 mock_response = MagicMock()
@@ -2930,6 +2946,7 @@ import sys, os
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch
 import bridge
+bridge.TTS_ENDPOINT = 'http://tts.test/synthesize'  # endpoint now defaults to '' (5b); set it so we test the timeout path, not the fail-open
 
 with patch('urllib.request.urlopen', side_effect=Exception('timeout')):
     result = bridge.synthesize_speech('Hello world')
@@ -2950,6 +2967,7 @@ import sys, os, tempfile
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch, MagicMock, call
 import bridge
+bridge.TTS_ENDPOINT = 'http://tts.test/synthesize'  # endpoint now defaults to '' (5b); chunked routing needs a '/synthesize' base
 
 # Save original
 orig_threshold = bridge.TTS_CHUNKED_THRESHOLD
@@ -2997,6 +3015,7 @@ import bridge
 bridge.BOT_TOKEN = 'fake'
 bridge.admin_chat_id = 12345
 bridge.state['tts_enabled'] = True  # enable auto-TTS gate (defaults off)
+bridge.TTS_ENDPOINT = 'http://127.0.0.1:1/synthesize'  # endpoint now defaults to '' (5b); set it so the gate's endpoint check passes
 
 voice_sent = []
 text_sent = []
@@ -3071,6 +3090,55 @@ print('OK')
     fi
 }
 
+# v1.3.5 Task 5b — voice endpoints must default to empty (no hardcoded private IP).
+test_stt_tts_endpoints_default_empty() {
+    info "Testing STT/TTS endpoints default to empty (no hardcoded private IP)..."
+    if env -u STT_ENDPOINT -u TTS_ENDPOINT TELEGRAM_BOT_TOKEN=dummy \
+        python3 -c 'import sys, os; sys.path.insert(0, os.getcwd()); import bridge; sys.exit(0 if bridge.STT_ENDPOINT == "" and bridge.TTS_ENDPOINT == "" else 1)' 2>/dev/null; then
+        success "STT/TTS endpoints default to empty string (voice off by default)"
+    else
+        fail "STT/TTS endpoints do not default to empty (hardcoded IP still present?)"
+    fi
+}
+
+# v1.3.5 Task 5c — auto-TTS stays OFF when the tts_enabled key is absent, i.e. the
+# read default must agree with DEFAULT_STATE (False), not the stale True.
+test_auto_tts_off_when_key_absent() {
+    info "Testing auto-TTS stays OFF when the tts_enabled key is absent from state..."
+    if python3 -c "
+import sys, os, time
+sys.path.insert(0, os.getcwd())
+from unittest.mock import patch
+import bridge
+
+bridge.BOT_TOKEN = 'fake'
+bridge.admin_chat_id = 12345
+# Force the endpoint check to pass so the ONLY remaining gate is the tts_enabled
+# lookup (after 5b the default endpoint is '', which would otherwise mask this
+# test by short-circuiting 'TTS_ENDPOINT and ...').
+bridge.TTS_ENDPOINT = 'http://127.0.0.1:1/synthesize'
+# The contradiction under test: DEFAULT_STATE has tts_enabled=False, but the read
+# defaulted to True. Remove the key so the read's default alone decides.
+bridge.state.pop('tts_enabled', None)
+
+def mock_telegram_api(method, data):
+    return {'ok': True, 'result': {'message_id': 1}}
+
+with patch.object(bridge, 'send_voice', return_value=True), \
+     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api), \
+     patch.object(bridge, 'synthesize_speech', return_value='/tmp/voice.ogg') as mock_tts:
+    bridge.send_response_to_telegram('testworker', 'A plain answer.', 12345)
+    time.sleep(0.3)
+
+assert not mock_tts.called, 'auto-TTS fired with tts_enabled key absent (read default != DEFAULT_STATE)'
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "Auto-TTS off when tts_enabled key absent (read default aligns with DEFAULT_STATE)"
+    else
+        fail "Auto-TTS fired with tts_enabled key absent (default contradiction)"
+    fi
+}
+
 test_auto_tts_skips_long_messages() {
     info "Testing auto-TTS skips messages >1000 chars and splits paragraphs..."
     if python3 -c "
@@ -3082,6 +3150,7 @@ import bridge
 bridge.BOT_TOKEN = 'fake'
 bridge.admin_chat_id = 12345
 bridge.state['tts_enabled'] = True
+bridge.TTS_ENDPOINT = 'http://127.0.0.1:1/synthesize'  # endpoint now defaults to '' (5b); set it so the gate's endpoint check passes
 
 tts_calls = []
 
@@ -3170,6 +3239,7 @@ import bridge
 
 bridge.BOT_TOKEN = 'fake'
 bridge.admin_chat_id = 12345
+bridge.TTS_ENDPOINT = 'http://127.0.0.1:1/synthesize'  # endpoint now defaults to '' (5b); set it so the re-enable half can fire
 bridge.state['tts_enabled'] = True
 
 # Test /voice off disables TTS
@@ -12118,6 +12188,9 @@ run_unit_tests() {
     run_test test_speak_tag_custom_text
     run_test test_auto_tts_skips_long_messages
     run_test test_auto_tts_failure_still_sends_text
+    # v1.3.5 Task 5b/5c — voice endpoint defaults + tts_enabled key-absent default
+    run_test test_stt_tts_endpoints_default_empty
+    run_test test_auto_tts_off_when_key_absent
     run_test test_voice_toggle_command
     # Unit tests - Transcript Viewer
     log ""

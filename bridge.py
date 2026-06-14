@@ -94,8 +94,10 @@ PERSISTENCE_NOTE = "They'll stay on your team."
 # Voice mode: STT (speech-to-text) and TTS (text-to-speech) endpoints
 # STT: transcribe incoming voice messages so workers can read them
 # TTS: generate voice from worker text responses (explicit [[speak]] tag)
-STT_ENDPOINT = os.environ.get("STT_ENDPOINT", "http://100.126.187.125:10110/transcribe")
-TTS_ENDPOINT = os.environ.get("TTS_ENDPOINT", "http://100.126.187.125:10111/synthesize")
+# Default empty so voice is OFF unless explicitly configured — no hardcoded private
+# IP. transcribe_voice/synthesize_speech fail-open on "" (they `if not *_ENDPOINT: return`).
+STT_ENDPOINT = os.environ.get("STT_ENDPOINT", "")
+TTS_ENDPOINT = os.environ.get("TTS_ENDPOINT", "")
 TTS_VOICE = os.environ.get("TTS_VOICE", "Serena")
 STT_TIMEOUT = int(os.environ.get("STT_TIMEOUT", "10"))  # seconds, fail-open
 TTS_TIMEOUT = int(os.environ.get("TTS_TIMEOUT", "60"))  # seconds, TTS runs in background thread
@@ -4655,7 +4657,7 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
 
     # Auto-TTS: synthesize voice for every response when enabled (/voice on|off)
     # Use explicit [[speak:text]] if provided, otherwise use the clean response text
-    if speak_text is None and TTS_ENDPOINT and state.get("tts_enabled", True):
+    if speak_text is None and TTS_ENDPOINT and state.get("tts_enabled", False):
         speak_text = clean_text  # raw text before HTML conversion
 
     clean_text = markdown_to_telegram_html(clean_text)
