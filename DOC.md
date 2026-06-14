@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 1.1.0
+> Version: 1.2.0
 
 ## Current Philosophy (Summary)
 
@@ -46,7 +46,8 @@ Traditional approach:          This approach:
 
 ## Naming Convention: `claude-<name>`
 
-User says `/hire backend` → tmux session `claude-backend`
+Opening a 話題 (topic) → a tmux session under the `claude-` prefix
+(per-node: `claude-<node>-<name>`).
 
 This prefix pattern enables:
 - **Auto-discovery**: `tmux list-sessions | grep ^claude-` finds all managed sessions
@@ -55,17 +56,13 @@ This prefix pattern enables:
 
 ## RAM State: Ephemeral by Design
 
-```python
-state = {
-    "active": "backend",      # Which session receives bare messages
-    "pending_registration": None
-}
-```
+Per-session runtime status (liveness, pending request, topic binding) is held in
+RAM and rebuilt from tmux on startup. There is no `active`/focus state — one 話題
+is one session, so addressing is simply "which topic you type in" (v1.0.0+).
 
 This state is:
 - Derived on demand from tmux
 - Never persisted to disk
-- Authoritative only for "active" selection (user preference)
 
 ## Per-Session Files: Minimal Coordination
 
@@ -87,15 +84,15 @@ Why files instead of IPC?
 ## Message Routing: Simple Rules
 
 ```
-Input                    → Routes to
-─────────────────────────────────────
-/hire backend            → creates claude-backend, sets active
-/focus frontend          → sets active = frontend
-@backend do something    → claude-backend (one-off, focus unchanged)
-fix the bug              → active session (currently frontend)
+Input                              → Routes to
+──────────────────────────────────────────────────
+new 話題 (first message = trigger)  → folder picker → spawns the session
+message in an existing 話題          → that 話題's session
 ```
 
-`@name` mentions route messages without changing focus. Use `/focus <name>` to switch.
+Routing = which 話題 you type in. There is no focus/active state and no `@name`
+mentions — one 話題 is one session (v1.0.0+). The first message in a new topic is
+a trigger only: it surfaces the folder picker and is never forwarded to the session.
 
 ## Feedback Philosophy
 
@@ -180,78 +177,17 @@ The bridge is now organized around small, explicit classes:
 - **TelegramAPI**: wraps all Telegram API calls (sendMessage/sendPhoto/sendDocument/etc.).
 - **CommandRouter**: all `/command` handlers and message routing; delegates to `WorkerManager` + `TelegramAPI`.
 
-Interactive vs non-interactive detection is backend-driven (`backend.is_interactive`), not hardcoded to a specific backend.
+Claude is the only backend (v1.0.0+) — the multi-backend (codex/gemini/opencode)
+and non-interactive worker plumbing was deleted.
 
-## Inter-Worker Messaging (Decentralized Discovery)
+## Inter-Worker Messaging — removed (v1.0.0)
 
-**Status:** Available (tmux send-keys + named pipes)
-
-**Design philosophy:** Bridge provides discovery only; workers communicate directly using the provided protocol. The bridge does NOT route messages between workers - it only tells workers how to reach each other. This means:
-- **No manager visibility:** Private worker-to-worker conversations stay private
-- **Direct P2P communication:** Workers talk to each other without bridge involvement
-- **Protocol flexibility:** Each worker advertises how to reach it (tmux, pipe, etc.)
-
-**Current state:**
-- **tmux backends:** Workers use `echo 'message' | tmux load-buffer - && tmux paste-buffer -r -t claude-<node>-<worker> && tmux send-keys -t claude-<node>-<worker> Enter`
-- **All backends:** Each worker gets a named pipe at `/tmp/claudecode-telegram/<node>/<worker>/in.pipe`
-  - Node name derived from `TMUX_PREFIX` (`claude-test-` → `test`, `claude-` → `default`)
-
-**Discovery endpoint:**
-
-```
-GET /workers
-```
-
-Response:
-```json
-{
-  "workers": [
-    {
-      "name": "alice",
-      "protocol": "tmux",
-      "address": "claude-prod-alice",
-      "send_example": "echo 'your message here' | tmux load-buffer - && tmux paste-buffer -r -t claude-prod-alice && tmux send-keys -t claude-prod-alice Enter"
-    },
-    {
-      "name": "bob",
-      "protocol": "pipe",
-      "address": "/tmp/claudecode-telegram/<node>/bob/in.pipe",
-      "send_example": "echo 'your message here' > /tmp/claudecode-telegram/<node>/bob/in.pipe"
-    }
-  ]
-}
-```
-
-**Protocol types:**
-
-| Protocol | Address Format | How to Send | Backends |
-|----------|---------------|-------------|------|
-| `tmux` | Session name | `echo "msg" \| tmux load-buffer - && tmux paste-buffer -r -t <address> && tmux send-keys -t <address> Enter` | tmux only |
-| `pipe` | Named pipe path | `echo "message" > <address>` | All backends |
-
-**Recommended: Named pipes as unified protocol**
-
-Named pipes (FIFOs) work across all backends:
-```bash
-# Bridge creates on worker startup
-mkfifo /tmp/claudecode-telegram/<node>/<worker>/in.pipe
-
-# Worker A sends to Worker B
-echo "Hey bob, can you review PR #42?" > /tmp/claudecode-telegram/<node>/bob/in.pipe
-
-# Worker B reads (poll or inotifywait)
-cat /tmp/claudecode-telegram/<node>/<worker>/in.pipe
-```
-
-**Why this design:**
-- Workers collaborate without manager overhead
-- Standard Unix mechanism, no custom protocol
-- Works consistently across tmux and exec backends
-- Bridge stays simple - just discovery, no message routing
-
-**Tests:**
-- `test_worker_pipe_creation_on_startup` - pipes created on worker startup
-- `test_worker_to_worker_pipe` - end-to-end worker communication via pipe
+Worker-to-worker messaging (the `/workers` discovery endpoint with `pipe`/`tmux`
+`send_example`s, named pipes at `/tmp/.../in.pipe`, and SSH-wrapped peer sends) was
+part of the multi-worker era and was **deleted in v1.0.0**; the last named-pipe
+helpers were removed in v1.1.0. In the topic-only model there are no peers to
+message — each 話題 is an isolated session that talks only to its Telegram topic.
+See the v1.0.0 / v1.1.0 changelog entries below.
 
 ---
 
@@ -339,6 +275,35 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.2.0 - Fail-loudly exit + doc/test drift sweep
+
+A follow-up review of the v1.1.0 branch (18-agent deep read + adversarial verify)
+confirmed no critical/high regressions; this release closes the low/advisory items it
+surfaced.
+
+**Fix (fail-loudly):** when the watchdog detects the detached bridge has died, the
+supervisor's `cleanup_and_exit` now exits non-zero (it was masked to `0` by the EXIT
+trap) — so systemd/CI/`&&` callers can finally see a dead bridge. An intentional stop
+(Ctrl+C) and a bare host teardown (supervisor exits, leaves the bridge running) still
+exit `0`. Covered by a new behavioral test (`test_bridge_death_exits_nonzero`) that
+runs the real `cleanup_and_exit` body in isolation and asserts the actual exit code.
+
+**Docs:** CLAUDE.md's 07:47 launch lesson now documents the `setsid`/`nohup` split and
+qualifies the "PPID must be 1" check (true only on the setsid/Linux path; on the macOS
+nohup path PPID is the supervisor until it exits, and nohup masks only SIGHUP). DOC.md's
+body sections (Naming, RAM State, Message Routing) were rewritten to the topic-only
+model and the dead "Inter-Worker Messaging" section was retired to a historical note.
+TEST.md's drift-prone ~320-line inventory (wrong count, deleted tests) was replaced with
+a live-suite pointer, and stale `/hire`//`team`//`focus`/`@mention` references removed. A
+leftover teleport comment in `hooks/checkin-on-start.sh` was corrected. CLAUDE.md's
+Version Management now flags the `uv.lock` version bump (the gate doesn't check it, and
+v1.0.0 forgot it) and notes ruff (E,F) is the only gating linter (the IDE's Pyright type
+diagnostics are non-gating noise).
+
+**Cosmetic:** removed the unreachable non-TOPIC `else` branch in `_build_welcome` (it
+advertised removed ssh peer messaging) and the empty/mislabeling teleport banners in
+test.sh. Also gitignored the entire `.codegraph/` (local CodeGraph index).
 
 ### v1.1.0 - The deferred cleanup pass + launch/voice hardening
 

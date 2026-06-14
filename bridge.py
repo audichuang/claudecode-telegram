@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code <-> Telegram Bridge - Multi-Session Control Panel"""
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 import os
 import json
@@ -4161,32 +4161,19 @@ class WorkerManager:
 
     def _build_welcome(self, name: str, backend_obj) -> str:
         """Build welcome/instructions message for a worker."""
-        if TOPIC_MODE:
-            # Topic-native: one 話題 = one dedicated session, so drop the
-            # multi-worker framing (/workers discovery, name prefixing,
-            # worker-to-worker messaging).
-            welcome = (
-                "You are connected to Telegram via claudecode-telegram. This 話題 (topic) is your "
-                "dedicated session: the manager's messages arrive as prompts and your replies go "
-                "straight back into this topic. "
-                "RECEIVING FILES: Manager-sent files (images, PDFs, documents) appear as local paths you can read directly. "
-                "SENDING FILES: Use [[image:/path/to/photo.png|caption]] for images (jpg/png/webp/bmp) and animations (gif/mp4), or [[file:/path/to/file|caption]] for documents, video (mp4/mov/avi — shows player), audio (mp3/m4a/flac — shows player), and voice (ogg/opus — voice bubble). "
-                "WORKING DIRECTORY: the manager switches your project folder from Telegram with /cd <path> (reloads CLAUDE.md). "
-                f"REFRESH INSTRUCTIONS: run `curl -s $BRIDGE_URL/checkin?name={name}` to re-read these instructions anytime. "
-                "Messages from the manager arrive as prompts — there is NO polling endpoint."
-            )
-        else:
-            welcome = (
-                "You are connected to Telegram via claudecode-telegram bridge. "
-                "RECEIVING FILES: Manager sends files (images, PDFs, documents) — they appear as local paths you can read directly. "
-                "SENDING FILES: Use [[image:/path/to/photo.png|caption]] for images (jpg/png/webp/bmp) and animations (gif/mp4), or [[file:/path/to/file|caption]] for documents, video (mp4/mov/avi — shows player), audio (mp3/m4a/flac — shows player), and voice (ogg/opus — voice bubble). "
-                f"MESSAGING WORKERS: Run `curl -s \"$BRIDGE_URL/workers?from={name}\"` to discover other workers — returns JSON with a `send_example` field containing ready-to-use send commands wrapped correctly for your machine (auto-adds ssh when a peer lives elsewhere). Always call /workers?from={name} before messaging, never guess addresses. "
-                f"NAME PREFIX: Always prefix your name in messages (e.g., '{name}: your message'). "
-                f"REFRESH INSTRUCTIONS: Run `curl -s $BRIDGE_URL/checkin?name={name}` to re-read these instructions anytime. "
-                f"WORKING DIRECTORY: To switch project directory (reloads CLAUDE.md), run `curl -s \"$BRIDGE_URL/checkin?name={name}&cwd=/path/to/project\"`. "
-                "BRIDGE API: Available endpoints: GET /workers, GET /checkin. Messages from manager arrive as prompts — there is NO polling endpoint. "
-                "WARNING: Do NOT output worker messages normally — they go to Telegram. Use the send commands from /workers instead."
-            )
+        # Topic-native: one 話題 = one dedicated session, so there is no
+        # multi-worker framing (/workers discovery, name prefixing,
+        # worker-to-worker messaging). TOPIC_MODE is always True (v1.0.0+).
+        welcome = (
+            "You are connected to Telegram via claudecode-telegram. This 話題 (topic) is your "
+            "dedicated session: the manager's messages arrive as prompts and your replies go "
+            "straight back into this topic. "
+            "RECEIVING FILES: Manager-sent files (images, PDFs, documents) appear as local paths you can read directly. "
+            "SENDING FILES: Use [[image:/path/to/photo.png|caption]] for images (jpg/png/webp/bmp) and animations (gif/mp4), or [[file:/path/to/file|caption]] for documents, video (mp4/mov/avi — shows player), audio (mp3/m4a/flac — shows player), and voice (ogg/opus — voice bubble). "
+            "WORKING DIRECTORY: the manager switches your project folder from Telegram with /cd <path> (reloads CLAUDE.md). "
+            f"REFRESH INSTRUCTIONS: run `curl -s $BRIDGE_URL/checkin?name={name}` to re-read these instructions anytime. "
+            "Messages from the manager arrive as prompts — there is NO polling endpoint."
+        )
         if SANDBOX_ENABLED:
             welcome += " Running in sandbox mode (Docker container)."
 

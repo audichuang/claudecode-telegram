@@ -8797,17 +8797,6 @@ print('OK')
     fi
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Teleport SSH Foundation Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-
-
-
-
-
-
 test_project_slug() {
     info "Testing _project_slug converts paths to Claude session slugs..."
 
@@ -9123,26 +9112,6 @@ print('OK')
     fi
 }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 1: host=None parameter tests (teleport remote dispatch)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 2: Call site host= propagation tests (teleport)
-# ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Node-derived config tests
@@ -12855,9 +12824,9 @@ run_unit_tests() {
     run_test test_bridge_url_ignores_stale_localhost
     run_test test_bridge_url_ignores_stale_127
     run_test test_bridge_url_honors_remote
-    # Unit tests - Git-Based Teleport Sync
+    # Unit tests - Alert cooldown / session-id scan
     log ""
-    log "── Git Sync Tests (Unit) ───────────────────────────────────────────────"
+    log "── Alert / Session-ID Scan Tests (Unit) ────────────────────────────────"
     run_test test_resolved_alert_cooldown
     run_test test_scan_latest_session_id_local
     run_test test_get_claude_session_id_authoritative_overrides_stale

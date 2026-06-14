@@ -57,5 +57,5 @@ else
 fi
 
 # Curl with timeout; print to stdout for Claude context injection
-# 10s timeout: teleported workers reach bridge over Tailscale (~4-5s RTT)
+# 10s timeout: generous margin for the local bridge round-trip
 curl -s --max-time 10 "$CHECKIN_URL" 2>/dev/null || true

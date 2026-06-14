@@ -32,6 +32,10 @@ When making changes that result in a new version:
    VERSION = "x.y.z"
    ```
 
+   Also bump `uv.lock`'s own `[[package]] version` (~line 7) — the gate below does
+   NOT check it, and v1.0.0 forgot it (it sat stale at 0.32.0). Verify the three
+   with `.claude/skills/bridge-ops/scripts/check-versions.sh`.
+
 2. **Update `DOC.md`** with:
    - New version number in header
    - Changelog entry describing:
@@ -66,6 +70,8 @@ The project is **uv-managed**. `pyproject.toml` declares deps (`markdown-it-py` 
   once at node startup — the lock stays read-only, so concurrent multi-node starts never
   race to rewrite it. `test.sh` syncs and prepends `.venv/bin` automatically.
 - **Lint:** `uv run ruff check .` (config in `pyproject.toml`: `select = E,F`, py312).
+  ruff (E,F) is the ONLY gating linter — the IDE's Pyright type diagnostics
+  (pre-existing str/Path & None→int noise in bridge.py) are not gating; don't chase them.
 
 ## Key Files
 
@@ -247,14 +253,25 @@ When that host went away (terminal closed / session shell reclaimed), the whole
 process group got SIGHUP/SIGKILL, which Python dies from **silently** (no handler
 can run for SIGKILL; SIGHUP's default action prints nothing).
 
-**Rule:** ALWAYS launch the bridge fully detached so no host teardown can reach it:
+**Rule:** ALWAYS launch the bridge fully detached so no host teardown can reach it.
+`cmd_run` does this portably — `setsid` on Linux, `nohup` fallback on macOS (which
+ships no `setsid`) — both with `</dev/null`:
 ```bash
-setsid bash -c '... exec ./.venv/bin/python -u bridge.py >> "$NODE/bridge.log" 2>&1' \
-  </dev/null >/dev/null 2>&1 &
+if command -v setsid >/dev/null 2>&1; then
+    setsid bash -c '... exec ./.venv/bin/python -u bridge.py >> "$NODE/bridge.log" 2>&1' \
+      </dev/null >/dev/null 2>&1 &
+else
+    nohup  bash -c '... exec ./.venv/bin/python -u bridge.py >> "$NODE/bridge.log" 2>&1' \
+      </dev/null >/dev/null 2>&1 &
+fi
 ```
-Verify afterwards: the bridge's PPID must be 1. Every setsid-launched restart since
-leaves a clean `Received SIGTERM` banner on shutdown — the silent-death mode is
-extinct unless someone launches it attached again.
+Verify afterwards: on the **setsid/Linux** path the bridge's PPID is 1 immediately
+(new session leader, reparented to init). On the **nohup/macOS** path PPID is the
+supervisor until it exits, so verify detachment via SIGHUP-immunity / a new session
+rather than PPID alone. Caveat: `nohup` only masks SIGHUP, not a group-wide SIGKILL,
+so on macOS prefer launching from a non-foreground context. Every detached restart
+since leaves a clean `Received SIGTERM` banner on shutdown — the silent-death mode
+is extinct unless someone launches it attached again.
 
 **Verifying a restart:** don't trust `curl` — the OLD bridge's graceful shutdown
 sends notifications over the network and holds the port for tens of seconds, so
