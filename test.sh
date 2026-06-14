@@ -122,6 +122,14 @@ count_matching_tests() {
         while read -r test_name; do
             [[ -n "$test_name" ]] && candidate_tests+=("$test_name")
         done < <(collect_run_tests "run_integration_tests")
+        # Mock-Telegram DEFAULT-mode tests (sourced from tests/mock_tests.sh) run
+        # inside the integration path but live in their own run_mock_tests runner,
+        # so scrape them here too (non-fast modes only).
+        if declare -f run_mock_tests >/dev/null 2>&1; then
+            while read -r test_name; do
+                [[ -n "$test_name" ]] && candidate_tests+=("$test_name")
+            done < <(collect_run_tests "run_mock_tests")
+        fi
     fi
 
     if [[ "$mode" == "full" ]]; then
@@ -13281,8 +13289,22 @@ run_integration_tests() {
     # Integration tests (bridge needed)
     log ""
     log "── Integration Tests ───────────────────────────────────────────────────"
+    # Start the recording Mock-Telegram server BEFORE the bridge so the bridge
+    # launch inherits TELEGRAM_API_BASE + MOCK_TG_ACTIVE (test_bridge_starts wires
+    # them into the launch env). This makes delivery/threading/reactions/media
+    # observable at the real wire boundary in DEFAULT mode (e2e-hardening).
+    if command -v start_mock_telegram >/dev/null 2>&1; then
+        start_mock_telegram || true
+    fi
     run_test test_bridge_starts || exit 1
     sleep 0.3
+
+    # Mock-Telegram DEFAULT-mode tests (SEAM-02/03/07/08/09/10 + new). They assert
+    # at the recorded wire boundary, never the bridge log. Only run when the mock
+    # actually came up (MOCK_TG_ACTIVE=1) and the runner was sourced.
+    if [[ "${MOCK_TG_ACTIVE:-}" == "1" ]] && command -v run_mock_tests >/dev/null 2>&1; then
+        run_mock_tests
+    fi
 
     # HTTP endpoint tests
     log ""
@@ -13475,5 +13497,15 @@ main() {
 
     [[ $failed -eq 0 ]] && exit 0 || exit 1
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wire in the e2e-hardening test files (sourced LAST, after every helper AND the
+# run_e2e_tests stub above, so e2e_tests.sh's run_e2e_tests + spawn_real_claude
+# override the stubs and mock_tests.sh's run_mock_tests becomes available).
+# Both files are self-contained and never redefine test.sh's own helpers.
+# ─────────────────────────────────────────────────────────────────────────────
+for f in "$SCRIPT_DIR"/tests/mock_tests.sh "$SCRIPT_DIR"/tests/e2e_tests.sh; do
+    [[ -f "$f" ]] && source "$f"
+done
 
 main "$@"
