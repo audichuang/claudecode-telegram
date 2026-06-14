@@ -665,7 +665,7 @@ cmd_run() {
     # SIGHUP, whose EXIT trap still fires in bash — must NOT take the bridge down;
     # surviving host teardown is the whole point of detaching it (the 07:47
     # lesson). Only an INTENTIONAL stop (Ctrl+C / stop / kill) tears it down.
-    local _intentional_stop=0 _bridge_dead=0
+    local _intentional_stop=0 _bridge_dead=0 _exit_code=0
     on_stop_signal() { _intentional_stop=1; exit 0; }
     cleanup_and_exit() {
         stop_poll_fallback
@@ -677,15 +677,18 @@ cmd_run() {
             [[ -n "${node_dir:-}" ]] && rm -f "$node_dir/bridge.pid" "$node_dir/port" "$node_dir/bot_id" "$node_dir/bot_username"
         elif [[ "$_bridge_dead" == 1 ]]; then
             # The bridge already died (watchdog detected it). Clear its now-stale
-            # pid files so `status` and a later `run` don't trip over a dead pid.
+            # pid files so `status` and a later `run` don't trip over a dead pid,
+            # and fail loudly — a dead bridge is a failure, not a clean stop, so
+            # systemd/CI/`&&` callers must see a non-zero exit.
             [[ -n "${node_dir:-}" ]] && rm -f "$node_dir/bridge.pid" "$node_dir/port" "$node_dir/bot_id" "$node_dir/bot_username"
+            _exit_code=1
         else
             log ""
             log "Supervisor exiting — leaving the detached bridge for node '${node:-unknown}' running."
         fi
         [[ -n "${pid_file:-}" ]] && rm -f "$pid_file"
         [[ -n "${node_dir:-}" ]] && rm -f "$node_dir/tunnel.pid" "$node_dir/tunnel.log" "$node_dir/tunnel_url"
-        exit 0
+        exit "${_exit_code:-0}"
     }
     trap on_stop_signal INT TERM
     trap cleanup_and_exit EXIT

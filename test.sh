@@ -12658,6 +12658,63 @@ test_cmd_run_launches_bridge_detached() {
     fi
 }
 
+# Fail-loudly guard (e310008): when the watchdog detects the detached bridge has
+# died, the supervisor's cleanup MUST exit non-zero — a dead bridge is a failure,
+# not a clean stop (so systemd/CI/`&&` chains can see it). An intentional stop
+# (Ctrl+C) and a bare host teardown (supervisor exits, leaves the bridge running)
+# must still exit 0. This runs the REAL cleanup_and_exit body in isolation with
+# stubbed deps, so it asserts the actual exit code — behavior, not source text.
+test_bridge_death_exits_nonzero() {
+    log "Test: bridge-death cleanup exits non-zero (fail-loudly); intentional/teardown exit 0"
+    local script="$SCRIPT_DIR/claudecode-telegram.sh"
+    local fn
+    fn=$(awk '/cleanup_and_exit\(\)/{f=1} f{print} f&&/^    }$/{exit}' "$script")
+    if [[ -z "$fn" ]]; then
+        fail "could not extract cleanup_and_exit from $script"
+        return
+    fi
+
+    # $1 = _intentional_stop, $2 = _bridge_dead -> echoes the real exit code.
+    _run_cleanup() {
+        local tmp; tmp="$(mktemp)"
+        {
+            printf '%s\n' 'set +e'
+            printf '%s\n' 'stop_poll_fallback() { :; }'
+            printf '%s\n' 'log() { :; }'
+            printf '%s\n' 'node="t"; tunnel_pid=""; bridge_pid=""; node_dir=""; pid_file=""'
+            printf '%s\n' "_intentional_stop=$1; _bridge_dead=$2"
+            printf '%s\n' "$fn"
+            printf '%s\n' 'cleanup_and_exit'
+        } > "$tmp"
+        bash "$tmp" >/dev/null 2>&1
+        local rc=$?
+        rm -f "$tmp"
+        echo "$rc"
+    }
+
+    local rc_dead rc_intentional rc_teardown
+    rc_dead=$(_run_cleanup 0 1)
+    rc_intentional=$(_run_cleanup 1 0)
+    rc_teardown=$(_run_cleanup 0 0)
+    unset -f _run_cleanup
+
+    if [[ "$rc_dead" -ne 0 ]]; then
+        success "bridge-death cleanup exits non-zero ($rc_dead) — fail-loudly"
+    else
+        fail "bridge-death cleanup exits 0 — a dead bridge is silently reported as success"
+    fi
+    if [[ "$rc_intentional" -eq 0 ]]; then
+        success "intentional-stop cleanup exits 0 (Ctrl+C is a clean stop)"
+    else
+        fail "intentional-stop cleanup exits non-zero ($rc_intentional) — Ctrl+C should be clean"
+    fi
+    if [[ "$rc_teardown" -eq 0 ]]; then
+        success "host-teardown cleanup exits 0 (leaving the bridge running is not a failure)"
+    else
+        fail "host-teardown cleanup exits non-zero ($rc_teardown) — leaving the bridge running is not a failure"
+    fi
+}
+
 # "Never hardcode" guard: STT/TTS endpoints must default to empty (voice disabled
 # until explicitly configured), not to a private Tailscale IP baked into source.
 test_voice_endpoints_not_hardcoded() {
@@ -12785,11 +12842,12 @@ run_unit_tests() {
     run_test test_activity_detects_plan_approval
     run_test test_watchdog_waiting_input_state
     run_test test_progress_shows_activity
-    # Unit tests - Teleport SSH Foundation
+    # Unit tests - Launch / detach / voice / bind
     log ""
-    log "── Teleport SSH Foundation Tests (Unit) ────────────────────────────────"
+    log "── Launch / Detach / Voice / Bind Tests (Unit) ─────────────────────────"
     run_test test_project_slug
     run_test test_cmd_run_launches_bridge_detached
+    run_test test_bridge_death_exits_nonzero
     run_test test_voice_endpoints_not_hardcoded
     run_test test_bridge_public_url_auto_detect
     run_test test_bridge_public_url_auto_bind
