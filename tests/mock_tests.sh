@@ -98,6 +98,69 @@ PY
     printf '%s\n' "$bin"
 }
 
+# Build a fake-claude that REPLIES to every manager message via the REAL Stop hook.
+# On each non-empty stdin line it writes a minimal transcript jsonl and runs
+# hooks/send-to-telegram.sh with {"transcript_path":...} on stdin; the reply text
+# is <marker> when the incoming line contains <marker> (the user's message), else a
+# plain "ack" (the bridge's auto-sent onboarding instructions). Replying to EVERY
+# message is load-bearing: the onboarding sets the bridge's `pending` state, and only
+# a /response clears it — without acking the onboarding the bridge would queue (never
+# deliver) the user's marker message. The stub runs INSIDE the bridge-spawned pane so
+# $TMUX_PANE + the tmux session env are present and the hook resolves the session.
+#
+# The bridge launches `claude --dangerously-skip-permissions`; a bare python copy
+# would die on that unknown option, so `claude` is a thin wrapper that IGNORES "$@"
+# and execs a python copy named `claudebin` (basename CONTAINS "claude", so
+# is_process_running()'s `"claude" in pane_current_command` holds). Echoes the wrapper
+# path. Args: <dir> <marker>
+_mock_hooking_fake_claude_bin() {
+    local dir="$1" marker="$2"
+    local wrapper="$dir/claude"        # what the bridge execs (PATH-resolved)
+    local realbin="$dir/claudebin"     # python interpreter copy; comm contains "claude"
+    local stub="$dir/claude_hook_stub.py"
+    mkdir -p "$dir"
+    # Remove any stale copies first: a prior run leaves these mode 0555 (no write),
+    # so a plain `cp`/`>` redirect would silently FAIL to overwrite and we'd reuse
+    # the old binary (a bare python copy that dies on `claude --dangerously-...`).
+    rm -f "$wrapper" "$realbin" "$stub" 2>/dev/null || true
+    cp "$(readlink -f "$(command -v python3)")" "$realbin" 2>/dev/null || cp "$(command -v python3)" "$realbin"
+    chmod +x "$realbin"
+    printf '#!/bin/sh\nexec "%s" "%s"\n' "$realbin" "$stub" > "$wrapper"
+    chmod +x "$wrapper"
+    # Unquoted heredoc so $marker / $SCRIPT_DIR interpolate; the stub has no other $.
+    cat > "$stub" <<PY
+import json, os, subprocess, sys, tempfile
+MARKER = "$marker"
+HOOK = "$SCRIPT_DIR/hooks/send-to-telegram.sh"
+def prompt():
+    sys.stdout.write("❯ \n"); sys.stdout.flush()   # keep tmux_prompt_empty() satisfied
+prompt()
+while True:
+    line = sys.stdin.readline()                     # readline (NOT 'for line in' — that buffers)
+    if line == "":                                  # EOF (pane killed) -> exit cleanly
+        break
+    if line.strip():
+        # Reply to EVERY message so the bridge's pending state clears; only the
+        # line carrying MARKER (the user's message) replies with MARKER.
+        reply = MARKER if MARKER in line else "ack"
+        # Compact jsonl ONLY: the hook greps literal "type":"user" / "type":"assistant"
+        # with no spaces around the colon (separators=(",",":") guarantees that).
+        tdir = tempfile.mkdtemp(prefix="fakeclaude-")
+        tpath = os.path.join(tdir, "fakesession.jsonl")
+        user = {"type":"user","message":{"role":"user","content":[{"type":"text","text":"trigger"}]}}
+        asst = {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":reply}]}}
+        with open(tpath, "w") as f:
+            f.write(json.dumps(user, separators=(",",":")) + "\n")
+            f.write(json.dumps(asst, separators=(",",":")) + "\n")
+        payload = json.dumps({"transcript_path": tpath})
+        # Run the REAL Stop hook synchronously (capture output so it never pollutes
+        # the pane and break tmux_prompt_empty); it forwards the reply to /response.
+        subprocess.run(["bash", HOOK], input=payload.encode(), capture_output=True)
+    prompt()
+PY
+    printf '%s\n' "$wrapper"
+}
+
 # Spawn a REGISTERED, ONLINE topic session for <name>/<thread_id> bound to
 # <chat_id>: a tmux session under $TEST_TMUX_PREFIX running the fake claude
 # (online=true, prompt empty=true) + the chat_id/message_thread_id meta files.
@@ -644,6 +707,166 @@ test_mock_no_real_telegram_egress() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Task 8 P1 — DEFAULT-mode full happy-path with a LIVE pane (no real Claude Code).
+# Drives the REAL bridge path: forum trigger -> folder-picker callback ->
+# open_topic_session -> create_session -> live tmux pane running a deterministic
+# fake-claude -> inbound topic message -> fake-claude runs the REAL Stop hook ->
+# POST /response -> mock records sendMessage(marker, BOUND thread). This is the
+# single test that walks 建話題->選資料夾->誕生->訊息->回覆 with a live pane below
+# E2E=1. Needs its OWN bridge+mock (fakebin on PATH + TOPIC_ROOT, neither of which
+# the suite bridge provides). Red-proof: bind the callback to a different thread
+# than the one asserted -> the reply carries the wrong thread -> RED.
+# ─────────────────────────────────────────────────────────────────────────────
+test_topic_happy_path_real_pane_fakeclaude() {
+    info "HAPPY-PATH: real pane fake-claude emits a marker via the REAL Stop hook into the bound thread"
+    if ! command -v tmux >/dev/null 2>&1; then
+        success "HAPPY-PATH: skipped (no tmux available on this box)"
+        return 0
+    fi
+
+    local tid=3103 sname="t3103"
+    local marker="HAPPY-3103-$RANDOM$RANDOM"
+    local fbdir="$TEST_NODE_DIR/hookfakebin_$tid"
+    local troot="$TEST_NODE_DIR/topicroot_$tid"
+    # FULLY isolate from the suite bridge: a DEDICATED sessions dir AND a tmux
+    # prefix the suite prefix ("claude-test-") can't glob-match — otherwise the two
+    # bridges share session state / the suite watchdog adopts our pane (the known
+    # orphan-workers cross-contamination). is_online keys on the pane COMMAND
+    # (claudebin), not the session name, so a distinct prefix is safe.
+    local hp_prefix="hpt-${TEST_NODE}-"
+    local hp_sess="$TEST_NODE_DIR/sessions_hp"
+    local hp_port=$((PORT + 7)) hp_mock=$((MOCKPORT + 7))
+    local hp_blog="$TEST_NODE_DIR/bridge_hp.log" hp_mlog="$TEST_NODE_DIR/mock_hp.log"
+    local hp_bpid="" hp_mpid="" bin
+    bin="$(_mock_hooking_fake_claude_bin "$fbdir" "$marker")"
+    mkdir -p "$troot" "$hp_sess"
+    # The bridge's /response handler needs markdown-it-py (a uv dep) — bare python3
+    # lacks it and 500s. Use the repo venv interpreter, fall back to python3.
+    local PYBIN="$SCRIPT_DIR/.venv/bin/python"
+    [[ -x "$PYBIN" ]] || PYBIN=python3
+
+    # Localize PORT/MOCKPORT so the existing helpers (send_topic_message /
+    # _mock_webhook / mock_*) target our dedicated pair via bash dynamic scope;
+    # auto-restored when this function returns.
+    local PORT="$hp_port" MOCKPORT="$hp_mock"
+
+    _hp_teardown() {
+        [[ -n "$hp_bpid" ]] && kill "$hp_bpid" 2>/dev/null || true
+        [[ -n "$hp_mpid" ]] && kill "$hp_mpid" 2>/dev/null || true
+        tmux kill-session -t "${hp_prefix}${sname}" 2>/dev/null || true
+        rm -rf "$hp_sess" 2>/dev/null || true
+    }
+
+    # Free our dedicated ports if a crashed prior run left an owner (PID-scoped to
+    # THOSE ports only — never pkill). Makes re-runs robust against port collision.
+    local _stale
+    _stale=$(lsof -ti :"$hp_mock" 2>/dev/null || true); [[ -n "$_stale" ]] && kill -9 $_stale 2>/dev/null || true
+    _stale=$(lsof -ti :"$hp_port" 2>/dev/null || true); [[ -n "$_stale" ]] && kill -9 $_stale 2>/dev/null || true
+
+    # 1) Dedicated mock Telegram on its own port (argparse: --port/--record).
+    python3 "$SCRIPT_DIR/tests/mock_telegram.py" \
+        --port "$hp_mock" \
+        --record "$TEST_NODE_DIR/telegram_calls_hp.jsonl" > "$hp_mlog" 2>&1 &
+    hp_mpid=$!
+    if ! wait_for_port "$hp_mock"; then fail "HAPPY-PATH: mock did not start on $hp_mock"; _hp_teardown; return; fi
+
+    # 2) Dedicated bridge: fakebin first on PATH (so shutil.which + the pane both
+    #    resolve `claude` to our fake), TOPIC_ROOT pinned, BRIDGE_URL -> itself.
+    TELEGRAM_BOT_TOKEN="${MOCK_BOT_TOKEN:-mock-token}" \
+    PORT="$hp_port" \
+    NODE_NAME="$TEST_NODE" \
+    SESSIONS_DIR="$hp_sess" \
+    TMUX_PREFIX="$hp_prefix" \
+    ADMIN_CHAT_ID="$CHAT_ID" \
+    TEAM_DIR="$TEST_TEAM_DIR" \
+    TOPIC_ROOT="$troot" \
+    TELEGRAM_API_BASE="http://127.0.0.1:$hp_mock" \
+    BRIDGE_URL="http://localhost:$hp_port" \
+    PATH="$fbdir:$PATH" \
+    "$PYBIN" -u "$SCRIPT_DIR/bridge.py" > "$hp_blog" 2>&1 &
+    hp_bpid=$!
+    if ! wait_for_port "$hp_port"; then fail "HAPPY-PATH: bridge did not start on $hp_port"; _hp_teardown; return; fi
+
+    mock_reset
+
+    # 3) Forum trigger (first message = pure trigger) -> folder picker.
+    send_topic_message "$CHAT_ID" "$tid" "trigger" >/dev/null
+
+    # 4) Tap the picker as ADMIN. An unregistered token falls back to TOPIC_ROOT,
+    #    so the session deterministically opens in $troot.
+    _mock_webhook '{
+        "update_id": 310301,
+        "callback_query": {"id": "hpcbq", "data": "use:hpdeadbeef",
+            "from": {"id": '"$CHAT_ID"'},
+            "message": {"message_id": 31031, "message_thread_id": '"$tid"',
+                "chat": {"id": '"$CHAT_ID"', "type": "supergroup", "is_forum": true}}}}' >/dev/null
+
+    # 5) Win the launch window: the bridge's launch line re-exports the tmux SESSION
+    #    env (eval "$(tmux show-environment -s)"), whose PATH otherwise points at the
+    #    real claude. Set it BEFORE the launch — the bridge first waits for the fish
+    #    pane to settle (seconds), so polling for the session and setting PATH wins
+    #    the window deterministically. Without this, `exec claude` finds the real
+    #    binary and the session never comes online with our stub.
+    local i=0 set_path=1
+    while [[ $i -lt 60 ]]; do
+        if tmux has-session -t "${hp_prefix}${sname}" 2>/dev/null; then
+            tmux set-environment -t "${hp_prefix}${sname}" PATH "$fbdir:$PATH"
+            set_path=0; break
+        fi
+        sleep 0.05; i=$((i + 1))
+    done
+    if [[ $set_path -ne 0 ]]; then fail "HAPPY-PATH: session never appeared to pin PATH"; _hp_teardown; return; fi
+
+    # 6) Poll the pane born + the fake `claude` (claudebin) exec'd (NO fixed sleep).
+    i=0; local born=1
+    while [[ $i -lt 120 ]]; do
+        case "$(tmux display-message -t "${hp_prefix}${sname}" -p '#{pane_current_command}' 2>/dev/null)" in
+            *claude*) born=0; break ;;
+        esac
+        sleep 0.1; i=$((i + 1))
+    done
+    if [[ $born -ne 0 ]]; then fail "HAPPY-PATH: fake-claude pane never came online"; _hp_teardown; return; fi
+
+    # 7) Poll the chat_id binding (save_topic_meta) — the hook hard-requires it.
+    i=0; local bound=1
+    while [[ $i -lt 50 ]]; do
+        [[ -f "$hp_sess/$sname/chat_id" ]] && { bound=0; break; }
+        sleep 0.1; i=$((i + 1))
+    done
+    if [[ $bound -ne 0 ]]; then fail "HAPPY-PATH: chat_id binding never written"; _hp_teardown; return; fi
+
+    # 8) The bridge auto-sends its onboarding instructions to the new pane; the stub
+    #    replies "ack", which clears the bridge's `pending` state. Wait for that ack
+    #    round-trip BEFORE sending the user message, else the user message is queued
+    #    (never delivered) while pending is set.
+    i=0; local acked=1
+    while [[ $i -lt 120 ]]; do
+        mock_assert_sendmessage "$tid" "ack" && { acked=0; break; }
+        sleep 0.1; i=$((i + 1))
+    done
+    if [[ $acked -ne 0 ]]; then fail "HAPPY-PATH: onboarding round-trip (ack) never completed — pane/hook not wired"; _hp_teardown; return; fi
+
+    # 9) Real user topic message (its text IS the marker) -> route_message delivers
+    #    'manager: <marker>' to the pane -> the fake-claude replies <marker> via the
+    #    REAL Stop hook -> /response -> bound-thread sendMessage.
+    send_topic_message "$CHAT_ID" "$tid" "$marker" >/dev/null
+
+    # 10) Poll the mock for sendMessage(marker) in the BOUND thread (async hook chain).
+    i=0; local got=1
+    while [[ $i -lt 120 ]]; do
+        mock_assert_sendmessage "$tid" "$marker" && { got=0; break; }
+        sleep 0.1; i=$((i + 1))
+    done
+
+    if [[ $got -eq 0 ]] && mock_assert_thread_absent "$marker" 9999; then
+        success "HAPPY-PATH: user message round-tripped through the real Stop hook into bound thread $tid (absent from decoy 9999)"
+    else
+        fail "HAPPY-PATH: marker did not land in bound thread $tid via the real hook chain"
+    fi
+    _hp_teardown
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Runner — every test, in seam order. Sourced into test.sh's DEFAULT/integration
 # branch; run_test is defined in test.sh and available when this file is sourced.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -687,4 +910,6 @@ run_mock_tests() {
     run_test test_mock_multichunk_reply_ordering
     run_test test_mock_session_cleanup_after_close
     run_test test_mock_no_real_telegram_egress
+    # Task 8 P1 — full happy-path with a live pane (fake-claude + real Stop hook)
+    run_test test_topic_happy_path_real_pane_fakeclaude
 }
