@@ -714,6 +714,11 @@ just forum groups.
 
 **New feature: optional voice mode for the bridge.**
 
+> **v1.3.5 update:** the endpoints and timeouts in this (historical) entry were the
+> ORIGINAL private-Mac-Mini defaults. As of v1.3.5, `STT_ENDPOINT`/`TTS_ENDPOINT`
+> default to EMPTY (voice OFF unless explicitly configured — no hardcoded private IP),
+> and `STT_TIMEOUT`/`TTS_TIMEOUT` default to 10s/60s. See the v1.3.5 changelog above.
+
 **STT (incoming voice → text):**
 - Manager voice messages are auto-transcribed via Cohere Transcribe API (Mac Mini :10110)
 - Transcript included in worker prompt: `Manager sent voice message (auto-transcribed, 5s): Transcript: ... Audio: /path`
@@ -730,7 +735,7 @@ just forum groups.
 - `STT_ENDPOINT` — STT API URL (default: **empty** as of v1.3.5 — voice STT is OFF unless explicitly set; no hardcoded private IP. Pre-v1.3.5 this defaulted to a Cohere endpoint on a private Mac Mini.)
 - `TTS_ENDPOINT` — TTS API URL (default: **empty** as of v1.3.5 — voice TTS is OFF unless explicitly set. Pre-v1.3.5 this defaulted to a Qwen3 endpoint on a private Mac Mini.)
 - `TTS_VOICE` — voice preset (default: Serena)
-- `STT_TIMEOUT` / `TTS_TIMEOUT` — fail-open timeouts (5s / 30s)
+- `STT_TIMEOUT` / `TTS_TIMEOUT` — fail-open timeouts (10s / 60s as of v1.3.5; were 5s / 30s)
 
 **Architecture (Codex-reviewed):**
 - Thin provider functions (`transcribe_voice`, `synthesize_speech`) — no class hierarchy

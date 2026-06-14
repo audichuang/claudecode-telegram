@@ -9,8 +9,8 @@ Telegram, no secrets, no third-party deps.
 Usage:
     python3 tests/mock_telegram.py --port <P> --record <JSONL>
 
-Bridge wire shapes this server understands (verified against bridge.py on
-branch fix/v1.2.0-fail-loudly-polish):
+Bridge wire shapes this server understands (verified against bridge.py; forward-ported
+onto the topic-only main base in v1.3.5):
 
   * JSON POST to /bot<TOKEN>/<method>  (Content-Type: application/json)
       sendMessage, sendChatAction, setMessageReaction, editMessageText,
@@ -24,7 +24,10 @@ branch fix/v1.2.0-fail-loudly-polish):
       GET /file/bot<TOKEN>/<file_path>  (raw bytes)
 
 Each /bot<TOKEN>/<method> POST appends ONE record (to the --record JSONL and
-to an in-memory list). Records distinguish message_thread_id ABSENT vs present.
+to an in-memory list), EXCEPT getFile — it is a QUERY (the first leg of the
+two-step download) and is handled but NOT recorded; media tests assert the
+downloaded bytes in the inbox, not a getFile record. Records distinguish
+message_thread_id ABSENT vs present.
 
 Control / inspection endpoints (no bot token in path):
     GET  /_health     -> 200 {"ok": true}

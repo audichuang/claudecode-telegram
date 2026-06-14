@@ -605,8 +605,9 @@ mock_assert_reaction_arc() {
         ' >/dev/null
 }
 
-# Program the mock so the NEXT send targeting <thread_id> bounces with HTTP 400
-# "Bad Request: message thread not found" (drives the real _reap_dead_topic path).
+# Program the mock so EVERY send targeting <thread_id> bounces with HTTP 400
+# "Bad Request: message thread not found" (until /_reset; the fault is sticky, not
+# one-shot) — drives the real _reap_dead_topic path.
 mock_program_thread_not_found() {
     local thread_id="$1"
     curl -s -X POST "http://127.0.0.1:$MOCKPORT/_program" \
@@ -640,7 +641,7 @@ mock_assert_inbox_sha() {
     for f in "$inbox"/*; do
         [[ -e "$f" ]] || continue
         local got
-        got=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+        got=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}')
         [[ "$got" == "$sha256" ]] && return 0
     done
     return 1

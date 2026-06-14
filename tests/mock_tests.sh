@@ -432,7 +432,7 @@ test_mock_incoming_document_downloads_to_inbox() {
     local src="$TEST_NODE_DIR/mock_in_2701.bin"
     printf 'MOCK-INBOX-PAYLOAD-2701-%s' "$RANDOM$RANDOM" > "$src"
     local sha
-    sha=$(sha256sum "$src" 2>/dev/null | awk '{print $1}')
+    sha=$( { sha256sum "$src" 2>/dev/null || shasum -a 256 "$src" 2>/dev/null; } | awk '{print $1}')
     # Register EXACTLY ONE file so getFile's single-file shortcut resolves it.
     mock_register_file_bytes "documents/f2701.bin" "$src"
     local fsize
@@ -471,7 +471,7 @@ test_mock_incoming_photo_downloads_to_inbox() {
     local src="$TEST_NODE_DIR/mock_in_2706.png"
     printf '\211PNG\r\n\032\n-MOCK-INBOX-PHOTO-2706-%s' "$RANDOM$RANDOM" > "$src"
     local sha
-    sha=$(sha256sum "$src" 2>/dev/null | awk '{print $1}')
+    sha=$( { sha256sum "$src" 2>/dev/null || shasum -a 256 "$src" 2>/dev/null; } | awk '{print $1}')
     # Register EXACTLY ONE file so getFile's single-file shortcut resolves it.
     mock_register_file_bytes "photos/p2706.png" "$src"
     # photo array: a small thumb + the large original (larger declared file_size),
