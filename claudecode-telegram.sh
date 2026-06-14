@@ -239,7 +239,7 @@ resolve_target_node() {
                 [[ -n "$node" ]] || continue
                 log "  $i) $node"
                 node_array+=("$node")
-                ((i++))
+                ((++i))
             done <<< "$running_nodes"
             log "  a) all"
 
@@ -382,7 +382,7 @@ wait_for_tunnel_url() {
     while [[ -z "$url" && $attempts -lt $timeout ]]; do
         sleep 1
         url=$(grep -o 'https://[^[:space:]]*\.trycloudflare\.com' "$log_file" 2>/dev/null | grep -v 'api\.trycloudflare\.com' | head -1 || true)
-        ((attempts++))
+        ((++attempts))
     done
     echo "$url"
 }
@@ -418,7 +418,7 @@ restart_tunnel_with_retry() {
 
         # Failed, kill the process and retry
         kill "$tunnel_pid" 2>/dev/null || true
-        ((attempt++))
+        ((++attempt))
         ((backoff *= 2))  # Exponential backoff: 5, 10, 20...
     done
 
@@ -623,10 +623,7 @@ cmd_run() {
         else
             error "Webhook setup failed (DNS may still be propagating)"
             hint "Retry manually: ./claudecode-telegram.sh webhook $tunnel_url"
-            # Cleanup before exit
-            [[ -n "$bridge_pid" ]] && kill "$bridge_pid" 2>/dev/null
-            [[ -n "$tunnel_pid" ]] && kill "$tunnel_pid" 2>/dev/null
-            rm -f "$node_dir/bridge.pid" "$node_dir/tunnel.pid" "$node_dir/pid"
+            _webhook_fail_cleanup   # cleanup before exit
             exit 1
         fi
     fi
@@ -792,6 +789,15 @@ cmd_stop() {
     fi
 }
 
+# Best-effort cleanup when webhook setup fails in cmd_run. Extracted from the
+# inline cleanup so it is unit-testable; reads cmd_run's locals
+# (bridge_pid/tunnel_pid/node_dir) via dynamic scope.
+_webhook_fail_cleanup() {
+    [[ -n "${bridge_pid:-}" ]] && kill "$bridge_pid" 2>/dev/null || true
+    [[ -n "${tunnel_pid:-}" ]] && kill "$tunnel_pid" 2>/dev/null || true
+    rm -f "$node_dir/bridge.pid" "$node_dir/tunnel.pid" "$node_dir/pid"
+}
+
 stop_single_node() {
     local node="$1"
     local node_dir pid_file tmux_prefix
@@ -807,7 +813,7 @@ stop_single_node() {
         local main_pid
         main_pid=$(cat "$pid_file")
         if kill "$main_pid" 2>/dev/null; then
-            ((killed++))
+            ((++killed))
             success "Main process stopped (PID $main_pid)"
             rm -f "$pid_file"
             sleep 1
@@ -819,7 +825,7 @@ stop_single_node() {
         local bridge_pid
         bridge_pid=$(cat "$node_dir/bridge.pid")
         if kill "$bridge_pid" 2>/dev/null; then
-            ((killed++))
+            ((++killed))
             success "Bridge stopped"
         fi
         rm -f "$node_dir/bridge.pid"
@@ -830,7 +836,7 @@ stop_single_node() {
         local tunnel_pid
         tunnel_pid=$(cat "$node_dir/tunnel.pid")
         if kill "$tunnel_pid" 2>/dev/null; then
-            ((killed++))
+            ((++killed))
             success "Tunnel stopped"
         fi
         rm -f "$node_dir/tunnel.pid" "$node_dir/tunnel.log" "$node_dir/tunnel_url"
@@ -842,7 +848,7 @@ stop_single_node() {
     if [[ -n "$sessions" ]]; then
         while IFS= read -r session; do
             if tmux kill-session -t "$session" 2>/dev/null; then
-                ((killed++))
+                ((++killed))
                 success "Killed tmux session '$session'"
             fi
         done <<< "$sessions"
@@ -882,7 +888,7 @@ cmd_clean() {
             [[ -d "$session_dir" ]] || continue
             if [[ -f "${session_dir}chat_id" ]]; then
                 rm -f "${session_dir}chat_id"
-                ((cleaned++))
+                ((++cleaned))
             fi
         done
     fi

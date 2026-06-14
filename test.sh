@@ -11937,6 +11937,120 @@ run_unit_tests() {
     run_test test_poll_forwarder_idempotent
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.3.5 Task 1 — set -e suite-killer regression tests (C3 / N1 / C6)
+#
+# Methodology note: a `set -e` arithmetic/`&&` abort only reproduces when errexit
+# is ARMED in a FRESH PROCESS. run_test dispatches each test as `testfn || fail`,
+# which SUSPENDS errexit for the whole test-function extent — and that suspension
+# propagates even into in-process `( )` AND `$( )` subshells, overriding an inner
+# `set -e`, so an in-process subshell can NEVER reproduce the abort (verified
+# empirically). Therefore C3/N1 drive a real CLI SUBPROCESS and C6 sources the
+# launcher in a separate `bash -c` PROCESS — each a fresh, fully-armed errexit,
+# fully isolated so the abort can never crash the harness.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Write claudecode-telegram.sh WITHOUT its final `main "$@"` line to a temp file
+# and echo the path, so a separate process can source its functions without
+# running main. Caller removes the temp file.
+launcher_lib_path() {
+    local _tmp; _tmp="$(mktemp)"
+    sed '/^main "\$@"$/d' "$SCRIPT_DIR/claudecode-telegram.sh" > "$_tmp"
+    echo "$_tmp"
+}
+
+test_stop_single_node_reaches_end_after_first_kill() {
+    local temp_home node nd mainpid bridgepid sess out ok has_tmux
+    has_tmux=0; command -v tmux >/dev/null 2>&1 && has_tmux=1
+    temp_home=$(mktemp -d)
+    node="stopt$$"
+    nd="$temp_home/.claude/telegram/nodes/$node"
+    mkdir -p "$nd"
+    sleep 300 & mainpid=$!
+    sleep 300 & bridgepid=$!
+    echo "$mainpid"   > "$nd/pid"
+    echo "$bridgepid" > "$nd/bridge.pid"
+    echo x > "$nd/port"; echo x > "$nd/bot_id"; echo x > "$nd/bot_username"
+    sess="claude-${node}-victim"
+    [[ "$has_tmux" -eq 1 ]] && tmux new-session -d -s "$sess" "/bin/sh -c 'sleep 300'" 2>/dev/null || true
+
+    # CLI subprocess: its own `set -e` is armed, so the buggy `((killed++))` aborts
+    # stop_single_node after the FIRST kill on the unpatched base.
+    out=$(HOME="$temp_home" CLAUDE_DIR="$temp_home/.claude" \
+          ./claudecode-telegram.sh --node "$node" stop 2>&1) || true
+
+    ok=1
+    # These two signals need NO tmux: on the unpatched base stop aborts at the
+    # first ((killed++)) — before the final marker rm and the "stopped" success.
+    if [[ -e "$nd/port" ]]; then ok=0; info "  port marker not removed (aborted before final rm)"; fi
+    if ! grep -q "stopped" <<<"$out"; then ok=0; info "  'Node ... stopped' line missing (aborted before function end)"; fi
+    # tmux-session reaping is an EXTRA signal, only checkable when tmux exists.
+    if [[ "$has_tmux" -eq 1 ]] && tmux has-session -t "$sess" 2>/dev/null; then ok=0; info "  tmux session survived (aborted before tmux-kill block)"; fi
+
+    kill "$mainpid" "$bridgepid" 2>/dev/null || true
+    wait "$mainpid" "$bridgepid" 2>/dev/null || true
+    [[ "$has_tmux" -eq 1 ]] && tmux kill-session -t "$sess" 2>/dev/null || true
+    rm -rf "$temp_home"
+
+    if [[ "$ok" -eq 1 ]]; then
+        success "stop_single_node reaches end after first kill (C3)"
+    else
+        fail "stop_single_node aborts mid-function after first kill (C3)"
+    fi
+}
+
+test_clean_removes_all_chat_id_files() {
+    local temp_home node sd out left
+    temp_home=$(mktemp -d)
+    node="cleant$$"
+    sd="$temp_home/.claude/telegram/nodes/$node/sessions"
+    mkdir -p "$sd/sessA" "$sd/sessB" "$sd/sessC"
+    echo 111 > "$sd/sessA/chat_id"
+    echo 222 > "$sd/sessB/chat_id"
+    echo 333 > "$sd/sessC/chat_id"
+
+    out=$(HOME="$temp_home" CLAUDE_DIR="$temp_home/.claude" \
+          ./claudecode-telegram.sh --node "$node" clean 2>&1) || true
+    left=$(find "$sd" -name chat_id 2>/dev/null | wc -l | tr -d ' ')
+    rm -rf "$temp_home"
+
+    if [[ "$left" -eq 0 ]] && grep -q "cleaned" <<<"$out"; then
+        success "clean removes all chat_id files (N1)"
+    else
+        fail "clean aborts after first chat_id removal (N1): $left chat_id file(s) left"
+    fi
+}
+
+test_webhook_failure_cleanup_removes_pidfiles() {
+    local d dp lib outf left reached
+    d=$(mktemp -d); lib=$(launcher_lib_path); outf=$(mktemp)
+    : > "$d/bridge.pid"; : > "$d/tunnel.pid"; : > "$d/pid"
+    # A numeric PID above any real pid_max → kill reliably fails with ESRCH, with
+    # no spawn/reap pid-reuse race. (Linux default pid_max is ~4.2M.)
+    dp=2147483647
+
+    # Separate bash process = fresh, fully-armed errexit (the parent test fn's
+    # errexit is suspended by run_test's `|| fail`). The launcher's own
+    # `set -euo pipefail` arms it; the buggy cleanup aborts on the failed kill
+    # BEFORE the rm, so REACHED_END is absent and the pid files survive.
+    bash -c '
+        source "$1"
+        node_dir="$2"; bridge_pid="$3"; tunnel_pid="$3"
+        _webhook_fail_cleanup
+        echo REACHED_END
+    ' _ "$lib" "$d" "$dp" >"$outf" 2>&1 || true
+
+    left=$(ls "$d"/bridge.pid "$d"/tunnel.pid "$d"/pid 2>/dev/null | wc -l | tr -d ' ')
+    reached=no; grep -q REACHED_END "$outf" && reached=yes
+    rm -rf "$d" "$lib" "$outf"
+
+    if [[ "$left" -eq 0 && "$reached" == "yes" ]]; then
+        success "webhook-fail cleanup removes pid files when kill fails (C6)"
+    else
+        fail "webhook-fail cleanup aborts before rm when kill fails (C6): $left pid file(s) left, reached=$reached"
+    fi
+}
+
 run_cli_tests() {
     # CLI tests (no bridge needed)
     log ""
@@ -11954,6 +12068,12 @@ run_cli_tests() {
     run_test test_cli_webhook_info
     run_test test_cli_webhook_commands
     run_test test_cli_hook_test_no_chat
+    # v1.3.5 Task 1 — set -e suite-killer regressions (C3 / N1 / C6)
+    log ""
+    log "── set -e suite-killer regression Tests ────────────────────────────────"
+    run_test test_stop_single_node_reaches_end_after_first_kill
+    run_test test_clean_removes_all_chat_id_files
+    run_test test_webhook_failure_cleanup_removes_pidfiles
 }
 
 run_integration_tests() {
