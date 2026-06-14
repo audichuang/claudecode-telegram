@@ -50,6 +50,7 @@ class ReuseAddrServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 
 # Node-derived config: NODE_NAME drives defaults for PORT, TMUX_PREFIX, SESSIONS_DIR.
 # Explicit env vars always override. No NODE_NAME = original defaults.
@@ -77,7 +78,10 @@ if NODE_NAME and not os.environ.get("TMUX_PREFIX"):
 else:
     TMUX_PREFIX = os.environ.get("TMUX_PREFIX", "claude-")  # tmux session prefix for isolation
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude"))
-CLAUDE_SETTINGS_FILE = Path(os.environ.get("CLAUDE_SETTINGS_FILE", CLAUDE_DIR / "settings.json"))
+# When set, spawned `claude` sessions are pinned to this settings file via
+# `--settings <path>` (lets the E2E harness pin the Stop hook for CI hermeticity).
+# Unset (default) leaves the spawn command byte-identical to production.
+CLAUDE_SETTINGS_FILE_SPAWN = os.environ.get("CLAUDE_SETTINGS_FILE_SPAWN", "")
 
 
 # BRIDGE_URL: hook callback target. Localhost URLs are always derived from PORT to
@@ -208,6 +212,8 @@ def build_claude_start_cmd(resume_id: str = "") -> str:
     if resume_id:
         cmd.extend(["--resume", resume_id])
     cmd.append("--dangerously-skip-permissions")
+    if CLAUDE_SETTINGS_FILE_SPAWN:
+        cmd.extend(["--settings", CLAUDE_SETTINGS_FILE_SPAWN])
     return " ".join(shlex.quote(part) for part in cmd)
 
 
@@ -860,7 +866,7 @@ class TelegramAPI:
         if not self.token:
             return None
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{self.token}/{method}",
+            f"{TELEGRAM_API_BASE}/bot{self.token}/{method}",
             data=json.dumps(data).encode(),
             headers={"Content-Type": "application/json"}
         )
@@ -967,7 +973,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendPhoto",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -1018,7 +1024,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendAnimation",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendAnimation",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -1069,7 +1075,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendDocument",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -1115,7 +1121,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/{api_method}",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/{api_method}",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -1182,7 +1188,7 @@ class TelegramTransport(MessageTransport):
             return None
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/getFile",
                 data=json.dumps({"file_id": file_id}).encode(),
                 headers={"Content-Type": "application/json"}
             )
@@ -1203,7 +1209,7 @@ class TelegramTransport(MessageTransport):
         if file_size > MAX_FILE_SIZE:
             print(f"File too large: {file_size} > {MAX_FILE_SIZE}")
             return None
-        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        download_url = f"{TELEGRAM_API_BASE}/file/bot{BOT_TOKEN}/{file_path}"
         inbox = ensure_inbox_dir(session_name)
         ext = Path(file_path).suffix or ""
         local_filename = f"{uuid.uuid4().hex}{ext}"
