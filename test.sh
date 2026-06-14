@@ -570,6 +570,18 @@ mock_assert_silence() {
         >/dev/null
 }
 
+# Assert the mock recorded ZERO calls of <method> — used for methods whose
+# payload carries no chat_id (e.g. answerCallbackQuery is just {callback_query_id}),
+# so mock_assert_silence's chat_id filter cannot see them. Returns red if any
+# record's .method equals <method>.
+mock_assert_no_method() {
+    local method="$1"
+    curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+        | jq -e --arg m "$method" \
+            'all(.[]; .method != $m)' \
+        >/dev/null
+}
+
 # Assert the mock recorded a setMessageReaction arc for <chat_id>/<message_id>
 # that, IN ORDER, contains each of the given emoji. Each emoji must appear in a
 # recorded reaction whose .raw.message_id matches, in non-decreasing record

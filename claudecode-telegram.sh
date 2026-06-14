@@ -851,7 +851,12 @@ cmd_stop() {
 _webhook_fail_cleanup() {
     [[ -n "${bridge_pid:-}" ]] && kill "$bridge_pid" 2>/dev/null || true
     [[ -n "${tunnel_pid:-}" ]] && kill "$tunnel_pid" 2>/dev/null || true
-    rm -f "$node_dir/bridge.pid" "$node_dir/tunnel.pid" "$node_dir/pid"
+    # Align with the bridge-fail-to-start cleanup (cmd_run) so a failed launch
+    # leaves no stale start artifacts for `status`/a later `run` to trip over.
+    # bot_id/bot_username are written just before webhook setup, so clear them too.
+    rm -f "$node_dir/bridge.pid" "$node_dir/port" "$node_dir/tunnel.pid" \
+          "$node_dir/tunnel.log" "$node_dir/tunnel_url" \
+          "$node_dir/bot_id" "$node_dir/bot_username" "$node_dir/pid"
 }
 
 stop_single_node() {

@@ -90,7 +90,15 @@ def _parse_multipart(body: bytes, boundary: str) -> tuple[dict, dict | None]:
     delim = b"--" + boundary.encode()
     # Split on the boundary; first chunk is the preamble, last is the closing "--".
     for part in body.split(delim):
-        part = part.strip(b"\r\n")
+        # Strip EXACTLY one framing CRLF from each end — the \r\n that follows
+        # the boundary and the \r\n that precedes the next one. A greedy
+        # strip(b"\r\n") would also eat trailing newlines belonging to the
+        # payload itself, corrupting the recorded file_size/file_sha256 for any
+        # file legitimately ending in a newline (markdown/text/source).
+        if part.startswith(b"\r\n"):
+            part = part[2:]
+        if part.endswith(b"\r\n"):
+            part = part[:-2]
         if not part or part == b"--":
             continue
         header_blob, _, payload = part.partition(b"\r\n\r\n")

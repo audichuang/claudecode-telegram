@@ -324,6 +324,10 @@ Every change ships with a falsifiable (RED-before / GREEN-after) test.
   authoritative token, never the request body/query.
 - **(Task 8) Full happy-path e2e** — one DEFAULT-mode test walks 建話題→folder-pick→born→message
   →reply with a LIVE pane and a deterministic fake-claude that replies through the REAL Stop hook.
+- **(PR-review routing) Topic-only** — the PR-comment handlers no longer parse `@mention`s to route
+  a reply into a Claude session; that was the last vestige of the deleted multi-worker addressing
+  model. PR comments are surfaced topic-only (regression: `test_pr_comment_does_not_route_to_session`).
+  `parse_at_mentions` is retained (defined + tested) but has no production caller.
 
 ### v1.1.3 - Test hardening wave 2 + in-place restart readiness gate
 

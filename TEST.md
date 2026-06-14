@@ -84,7 +84,7 @@ As of v1.3.5:
 
 | Scope | Count |
 |-------|-------|
-| Test functions defined in `test.sh` | 286 |
+| Test functions defined in `test.sh` | 287 |
 | FAST invocations (`run_unit_tests` + `run_cli_tests`) | 244 |
 | Default invocations | + ~25 mock-harness tests from `tests/mock_tests.sh` |
 | FULL invocations | default + `test_with_tunnel` |

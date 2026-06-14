@@ -352,8 +352,12 @@ test_mock_nonadmin_callback_tap_silent() {
             "message": {"message_id": 2903, "message_thread_id": 2903,
                 "chat": {"id": '"$intruder_chat"', "type": "supergroup", "is_forum": true}}}}' >/dev/null
     sleep 0.4
-    # No answerCallbackQuery / browse / open for the intruder chat, and no session.
-    if mock_assert_silence "$intruder_chat" && [[ ! -d "$TEST_SESSION_DIR/t2903" ]]; then
+    # No chat-addressed send/reaction (mock_assert_silence), no answerCallbackQuery
+    # (which carries no chat_id, so it needs the method-level check — catches a
+    # regression to answer-then-reject), and no session created for the intruder.
+    if mock_assert_silence "$intruder_chat" \
+        && mock_assert_no_method "answerCallbackQuery" \
+        && [[ ! -d "$TEST_SESSION_DIR/t2903" ]]; then
         success "SEAM-09: non-admin callback tap is silent and created no session"
     else
         fail "SEAM-09: non-admin callback tap leaked a call or created a session"
@@ -460,20 +464,30 @@ test_mock_incoming_document_downloads_to_inbox() {
 
 # T4e gap-filler: an incoming PHOTO ARRAY round-trips getFile(largest)+download
 # into the inbox. bridge.py picks max(photo, key=file_size) then downloads
-# (bridge.py:5137) — a distinct branch from the document case. The mock's
-# single-registered-file getFile shortcut serves the bytes regardless of which
-# file_id the bridge resolves, so registering one file is enough. (Replaces the
+# (bridge.py:5137) — a distinct branch from the document case. (Replaces the
 # real-Telegram test_incoming_image_e2e that is skipped under MOCK_TG_ACTIVE.)
+#
+# Sensitivity: we register TWO files keyed by the thumb/large file_ids with
+# DISTINCT bytes (not the single-file shortcut), so getFile resolves whichever
+# file_id the bridge actually passed. The inbox sha must match the LARGE bytes —
+# if the bridge regressed to selecting the thumb, the thumb bytes would land and
+# this test goes red. Make-it-red proof: change bridge.py:5137 max(...) to
+# min(...) and the sha assertion fails.
 test_mock_incoming_photo_downloads_to_inbox() {
     info "SEAM-07: an incoming photo array round-trips getFile(largest)+download into the inbox"
     mock_reset
     _mock_spawn_idle_session "t2706" "$CHAT_ID" 2706
-    local src="$TEST_NODE_DIR/mock_in_2706.png"
-    printf '\211PNG\r\n\032\n-MOCK-INBOX-PHOTO-2706-%s' "$RANDOM$RANDOM" > "$src"
-    local sha
-    sha=$( { sha256sum "$src" 2>/dev/null || shasum -a 256 "$src" 2>/dev/null; } | awk '{print $1}')
-    # Register EXACTLY ONE file so getFile's single-file shortcut resolves it.
-    mock_register_file_bytes "photos/p2706.png" "$src"
+    # Distinct payloads for thumb vs large so the resolved file_id is observable.
+    local thumb="$TEST_NODE_DIR/mock_in_2706_thumb.png"
+    local large="$TEST_NODE_DIR/mock_in_2706_large.png"
+    printf '\211PNG\r\n\032\n-MOCK-THUMB-2706-%s' "$RANDOM$RANDOM" > "$thumb"
+    printf '\211PNG\r\n\032\n-MOCK-LARGE-2706-%s' "$RANDOM$RANDOM" > "$large"
+    local sha_large
+    sha_large=$( { sha256sum "$large" 2>/dev/null || shasum -a 256 "$large" 2>/dev/null; } | awk '{print $1}')
+    # Register each file UNDER ITS file_id so getFile's file_id-keyed lookup
+    # (mock_telegram.py: `elif file_id in registered`) serves the matching bytes.
+    mock_register_file_bytes "THUMB2706" "$thumb"
+    mock_register_file_bytes "LARGE2706" "$large"
     # photo array: a small thumb + the large original (larger declared file_size),
     # so the bridge's max(photo, key=file_size) selects the large one.
     _mock_webhook '{
@@ -487,14 +501,14 @@ test_mock_incoming_photo_downloads_to_inbox() {
             ]}}' >/dev/null
     local i=0 ok=1
     while [[ $i -lt 30 ]]; do
-        if mock_assert_inbox_sha "t2706" "$sha"; then ok=0; break; fi
+        if mock_assert_inbox_sha "t2706" "$sha_large"; then ok=0; break; fi
         sleep 0.1; i=$((i + 1))
     done
     _mock_kill_session "t2706"
     if [[ $ok -eq 0 ]]; then
-        success "SEAM-07: incoming photo (largest) downloaded to inbox; sha256 matches"
+        success "SEAM-07: incoming photo (LARGE, not thumb) downloaded to inbox; sha256 matches"
     else
-        fail "SEAM-07: incoming photo did not reach the inbox with matching sha"
+        fail "SEAM-07: incoming photo did not reach the inbox with the LARGE bytes' sha"
     fi
 }
 
