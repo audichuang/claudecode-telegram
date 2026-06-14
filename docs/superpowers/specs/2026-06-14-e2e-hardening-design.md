@@ -115,3 +115,37 @@ curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
 8. **Delete dead `test_direct_mode_*`** (salvage `check_claude_available`).
 9. **E2E mode skeleton:** 4th branch + `run_e2e_tests` + `check_claude_available` gate + count scrape; ship optional `--settings` pin.
 10. **E2E cornerstone (SEAM-01/06):** `test_e2e_real_claude_marker_roundtrip` with `TMUX_FALLBACK=0`. Then SEAM-04/05 and the L3 isolation/reaction tests.
+
+## 8. Codex Review Fixes (MANDATORY — verified against live source; apply to every applicable test)
+
+> Independent GPT-5.5 (Codex) adversarial review flagged 6 false-greens + 4 flakiness risks + 5 missed scenarios. These are binding on all per-seam authors.
+
+**As-built foundation facts (use these exact contracts):**
+- Seed a bound topic session with two files only: `SESSIONS_DIR/<name>/chat_id` (plain int) and `SESSIONS_DIR/<name>/message_thread_id` (plain int). `POST /response {session,text}` resolves the chat from the `chat_id` file — the session does NOT need to be in the RAM worker map (no tmux/spawn needed for delivery-only tests).
+- The bridge HTML-wraps replies as `<b>{name}:</b>\n{text}` → assert **substring containment**, never equality.
+- Bridge boot emits a `setMyCommands` record; folder-picker/typing/callback also emit traffic → **filter by `method=="sendMessage"`**, never "any call happened".
+- `mock_assert_inbox_sha` looks under `/tmp/claudecode-telegram/test/<session>/inbox/` (node `test` from `claude-test-`).
+- bridge.py grew +6 lines; re-grep before trusting any absolute line number in §0.
+
+**Assertion specificity (every mock test):** call `mock_reset` at the TOP; assert the ATOMIC tuple (`method==sendMessage` AND `message_thread_id==tid` AND `text contains marker`). Distinguish absent vs explicit-0 vs correct tid — tmain reply ⇒ the `message_thread_id` KEY is ABSENT (`mock_assert_thread_absent <marker>` with no tid).
+
+**SEAM-08 reap:** the bounce must be a **real HTTP 400** (mock already returns 400, not 200+`ok:false` — urllib drives different paths). Drive the REAL `_reap_dead_topic` via `send_response_to_telegram` and assert the real session is **gone** (`wait_for_session_gone`), not that a stub ran. Add a tmain-never-reaped guard.
+
+**SEAM-09 admin gate:** the non-admin update must have BOTH `from.id` AND `chat.id` ≠ admin (the gate rejects only when both differ). Assert `mock_assert_silence` (zero sendMessage AND zero setMessageReaction). ALSO add a non-admin **callback tap** test (separate gate in `handle_callback`): a non-admin folder-pick must not create/browse a session.
+
+**E2E harness (`spawn_real_claude`) — all MANDATORY:**
+1. Drive the REAL path: `forum_topic_created` webhook → folder-picker **`callback_query`** (`use:<path>`) → bridge `create_session` real tmux spawn. Do NOT call `open_topic_session`/`create_session` directly and do NOT spawn `claude` yourself — LINK2/LINK3/LINK4 must traverse the real bridge.
+2. `TMUX_FALLBACK=0` must reach the **hook's own process env**: after spawn, `tmux set-environment -t <session> TMUX_FALLBACK 0` (bash/bridge env does NOT propagate to the hook). This forces a green to come only from real jsonl extraction, not capture-pane fallback.
+3. Settings pin is **REQUIRED for E2E** (not optional): launch the bridge with `CLAUDE_SETTINGS_FILE_SPAWN=<settings.json pinning Stop → repo hooks/send-to-telegram.sh>` so the spawned claude loads the REPO hook, not the operator's global.
+4. Turn-completion signal = **poll for mock-recorded delivery** (`/_recorded` shows a sendMessage with the marker), NEVER pending-file absence (the hook removes `pending` + exits 0 even when extraction finds no text).
+5. Marker prompt: "Reply with exactly this token and nothing else: TESTMARKER-<nonce>"; assert text **CONTAINS** the marker (claude may add text); unique nonce per test.
+6. Readiness polling keys off claude actually answering a probe (marker roundtrip), not generic pane text (avoid misreading a login/rate-limit screen as ready).
+
+**SEAM-04 contradiction RESOLVED:** prod spawns with `--dangerously-skip-permissions`, so the trust dialog never appears on the prod path. MAIN SEAM-04 test = "real claude spawns and is genuinely alive in the picked cwd" (claude writes/reads a file in cwd or echoes a pwd marker) on the prod path. The trust-dialog auto-answer (`bridge.py ~4255`) is DEFENSIVE code; test it (if at all) as a clearly-labeled, **non-blocking** separate test that spawns WITHOUT `--dangerously-skip-permissions` in a fresh untrusted tmpdir. Do not claim the prod path exercises it.
+
+**SEAM-05:** prove the claude PROCESS is alive (marker roundtrip), not the bash pane (`tmux has-session` passes on dead-claude/live-shell).
+
+**New scenarios to ADD (were unseamed):**
+- **Multi-chunk reply ordering** (DEFAULT): a >4096-char `/response` text splits into multiple sendMessage; assert each chunk recorded in order with `reply_to_message_id` chaining to the prior chunk's returned (incrementing) `message_id`.
+- **Session cleanup after `forum_topic_closed`** (DEFAULT/E2E): after close, the session is removed so a reopened topic creates a FRESH session (no zombie re-attach).
+- **Webhook-registration egress**: confirm the bridge issues no startup call to real Telegram when `TELEGRAM_API_BASE` points at the mock.
