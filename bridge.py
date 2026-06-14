@@ -6449,15 +6449,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-        # Route to workers via @mentions
-        targets, _ = command_router.parse_at_mentions(comment_body)
-        if targets:
-            worker_msg = (
-                f"manager: PR #{pr_num} review comment\n\n"
-                f"{comment_body}"
-            )
-            for t in targets:
-                send_to_session(t, worker_msg)
+        # Topic-only model (v1.0.0+): addressing is the Telegram forum 話題 you type
+        # in — NOT a name/@mention. A PR-review-page comment is not inside a topic, so
+        # an `@name` in it must NOT be routed into a session (that legacy @mention
+        # protocol would bypass topic addressing). The comment is posted to GitHub and
+        # mirrored to Telegram above; routing to a worker is intentionally not done here.
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -6647,15 +6643,11 @@ class Handler(BaseHTTPRequestHandler):
             )
             transport.send_text(admin_chat_id, tg_text)
 
-        # Route to workers via @mentions (same rule as Telegram messages)
-        targets, _ = command_router.parse_at_mentions(comment_body)
-        if targets:
-            worker_msg = (
-                f"manager: PR #{pr_num} review comment on {path}:{line}\n\n"
-                f"{comment_body}"
-            )
-            for t in targets:
-                send_to_session(t, worker_msg)
+        # Topic-only model (v1.0.0+): addressing is the Telegram forum 話題, NOT an
+        # @mention. A PR-review-page comment is not inside a topic, so an `@name` in it
+        # must NOT be routed into a session (the legacy @mention protocol would bypass
+        # topic addressing). The comment is posted to GitHub + mirrored to Telegram
+        # above; routing to a worker is intentionally not done here.
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

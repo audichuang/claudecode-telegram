@@ -12367,6 +12367,59 @@ finally:
     fi
 }
 
+test_pr_comment_does_not_route_to_session() {
+    info "Testing PR-review comments never route @mentions into a session (topic-only model)..."
+
+    if python3 -c "
+import io, json, time
+import bridge
+import urllib.request as _ur
+_ur.urlopen = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('blocked'))
+
+# A command_router stub that WOULD yield a worker target — proves the handlers do
+# not act on it (pre-fix they routed to it; post-fix they ignore @mentions entirely).
+class _Router:
+    def parse_at_mentions(self, text):
+        return (['t123'], text)
+bridge.command_router = _Router()
+
+sent = []
+bridge.send_to_session = lambda name, msg, *a, **k: (sent.append(name), True)[1]
+
+def fake_run(cmd, *a, **k):
+    class R: pass
+    r=R(); r.returncode=0; r.stdout=''; r.stderr=''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.admin_chat_id = None   # skip transport.send_text in handle_pr_comment
+bridge.PR_REVIEW_TOKENS.clear()
+tok = 'TESTTOKEN'
+bridge.PR_REVIEW_TOKENS[tok] = {'pr_num': 5, 'owner': 'o', 'repo': 'r', 'expires_at': time.time()+300}
+
+class FakeHandler:
+    def __init__(self): self.status=None; self.headers={}; self.wfile=io.BytesIO()
+    def send_response(self,c): self.status=c
+    def send_header(self,k,v): self.headers[k]=v
+    def end_headers(self): pass
+
+# General (non-inline) PR comment carrying an @mention.
+gbody = json.dumps({'token': tok, 'body': '@t123 please look at this'}).encode()
+bridge.Handler.handle_pr_general_comment(FakeHandler(), gbody)
+# Inline PR comment carrying an @mention.
+ibody = json.dumps({'token': tok, 'body': '@t123 fix here', 'path': 'src/x.py',
+                    'line': 10, 'side': 'RIGHT', 'head_sha': 'abc123'}).encode()
+bridge.Handler.handle_pr_comment(FakeHandler(), ibody)
+
+assert not sent, 'PR-review comment routed @mention into session(s): ' + str(sent)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "PR-review comments do not route @mentions into a session"
+    else
+        fail "PR-review comment routed an @mention into a session (topic-only model violated)"
+    fi
+}
+
 # ============================================================
 # TEST RUNNERS
 # ============================================================
@@ -12627,6 +12680,7 @@ run_unit_tests() {
     run_test test_pr_general_comment_uses_token_owner_repo_not_body
     run_test test_pr_file_content_uses_token_owner_repo_not_query
     run_test test_pr_review_cli_honors_out_flag
+    run_test test_pr_comment_does_not_route_to_session
     # Unit tests - Transcript Index (transcript-index.py)
     log ""
     log "── Transcript Index Tests (Unit) ───────────────────────────────────────"
