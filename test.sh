@@ -12325,6 +12325,47 @@ print('OK')
     fi
 }
 
+test_pr_review_cli_honors_out_flag() {
+    info "Testing pr-review.py main() honors --out and accepts --no-serve (argparse executes for real)..."
+
+    if python3 -c "
+import importlib.util, os, sys, tempfile
+
+# isolate the sqlite cache so we never touch the real /tmp/pr-review-cache.db
+os.environ['PR_CACHE_DB'] = tempfile.mktemp(suffix='.db')
+spec = importlib.util.spec_from_file_location('pr_review_mod', 'pr-review.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+# stub out all network: fetch returns the 6-tuple main() unpacks; html is a sentinel
+mod.fetch_pr_cached = lambda *a, **k: ({}, [], [], [], [], {})
+mod.generate_html = lambda *a, **k: '<html>SENTINEL-OUT-FLAG</html>'
+
+out = tempfile.mktemp(suffix='.html')
+default_path = '/tmp/pr-review-5.html'
+had_default = os.path.exists(default_path)
+try:
+    # exactly the argv bridge.py builds: positional URL + --no-serve + --out
+    sys.argv = ['pr-review.py', 'https://github.com/o/r/pull/5', '--no-serve', '--out', out]
+    mod.main()
+    assert os.path.exists(out), 'main() did not write to the --out path (flag ignored?)'
+    assert 'SENTINEL-OUT-FLAG' in open(out).read(), 'wrong content written to --out path'
+    print('OK')
+finally:
+    for p in (out, os.environ['PR_CACHE_DB']):
+        try: os.remove(p)
+        except OSError: pass
+    # only clean the default path if WE created it (do not clobber a real cache)
+    if not had_default:
+        try: os.remove(default_path)
+        except OSError: pass
+" 2>/dev/null | grep -q "OK"; then
+        success "pr-review.py main() honors --out and accepts --no-serve"
+    else
+        fail "pr-review.py --out/--no-serve not honored by argparse"
+    fi
+}
+
 # ============================================================
 # TEST RUNNERS
 # ============================================================
@@ -12584,6 +12625,7 @@ run_unit_tests() {
     run_test test_pr_merge_uses_token_owner_repo_not_body
     run_test test_pr_general_comment_uses_token_owner_repo_not_body
     run_test test_pr_file_content_uses_token_owner_repo_not_query
+    run_test test_pr_review_cli_honors_out_flag
     # Unit tests - Transcript Index (transcript-index.py)
     log ""
     log "── Transcript Index Tests (Unit) ───────────────────────────────────────"
