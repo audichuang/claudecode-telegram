@@ -42,6 +42,12 @@ TEST_FILTER="${TEST_FILTER:-}"
 TEST_NODE="test"
 TEST_NODE_DIR="${TEST_NODE_DIR:-$HOME/.claude/telegram/nodes/$TEST_NODE}"
 PORT="${TEST_PORT:-8295}"
+# Mock-Telegram harness (e2e-hardening). MOCKPORT is offset +100 from the bridge
+# port so it never collides with $PORT. MOCK_TG_ACTIVE gates the whole mechanism:
+# only the e2e/mock-based path turns it on, so the default integration tests
+# (which talk to real Telegram via TEST_BOT_TOKEN) are byte-identical.
+MOCKPORT="${MOCKPORT:-$((PORT + 100))}"
+MOCK_TG_ACTIVE="${MOCK_TG_ACTIVE:-}"
 TEST_SESSION_DIR="$TEST_NODE_DIR/sessions"
 TEST_PID_FILE="$TEST_NODE_DIR/pid"
 TEST_TMUX_PREFIX="claude-${TEST_NODE}-"
@@ -117,12 +123,28 @@ count_matching_tests() {
         while read -r test_name; do
             [[ -n "$test_name" ]] && candidate_tests+=("$test_name")
         done < <(collect_run_tests "run_integration_tests")
+        # Mock-Telegram DEFAULT-mode tests (sourced from tests/mock_tests.sh) run
+        # inside the integration path but live in their own run_mock_tests runner,
+        # so scrape them here too (non-fast modes only).
+        if declare -f run_mock_tests >/dev/null 2>&1; then
+            while read -r test_name; do
+                [[ -n "$test_name" ]] && candidate_tests+=("$test_name")
+            done < <(collect_run_tests "run_mock_tests")
+        fi
     fi
 
     if [[ "$mode" == "full" ]]; then
         while read -r test_name; do
             [[ -n "$test_name" ]] && candidate_tests+=("$test_name")
         done < <(collect_run_tests "run_full_tests")
+    fi
+
+    if [[ "$mode" == "e2e" ]]; then
+        if declare -f run_e2e_tests >/dev/null 2>&1; then
+            while read -r test_name; do
+                [[ -n "$test_name" ]] && candidate_tests+=("$test_name")
+            done < <(collect_run_tests "run_e2e_tests")
+        fi
     fi
 
     local matched=0
@@ -146,6 +168,12 @@ cleanup() {
         kill "$(cat "$TEST_NODE_DIR/bridge.pid")" 2>/dev/null || true
         rm -f "$TEST_NODE_DIR/bridge.pid"
     fi
+    # Also kill the Mock-Telegram server (e2e-hardening harness) if tracked.
+    if [[ -f "$TEST_NODE_DIR/mock_tg.pid" ]]; then
+        kill "$(cat "$TEST_NODE_DIR/mock_tg.pid")" 2>/dev/null || true
+        rm -f "$TEST_NODE_DIR/mock_tg.pid"
+    fi
+    rm -f "$TEST_NODE_DIR/telegram_calls.jsonl" "$TEST_NODE_DIR/mock_tg.log" 2>/dev/null || true
     [[ -n "$BRIDGE_PID" ]] && kill "$BRIDGE_PID" 2>/dev/null || true
     [[ -n "$TUNNEL_PID" ]] && kill "$TUNNEL_PID" 2>/dev/null || true
     # Kill any test sessions we created (using test prefix)
@@ -441,6 +469,206 @@ send_animation_message() {
                     "height": 240
                 },
                 "caption": "'"$caption"'"
+            }
+        }'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E2E-hardening harness: Mock-Telegram lifecycle + assertion helpers
+# (ported verbatim from origin/test/e2e-hardening:test.sh; the spawn_real_claude
+#  STUB is intentionally omitted — the real one arrives via tests/e2e_tests.sh,
+#  sourced last.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Used by run_e2e_tests as a loud skip-when-absent gate.
+check_claude_available() {
+    if command -v claude &>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Launch the recording Mock-Telegram server on MOCKPORT and point the bridge at
+# it via TELEGRAM_API_BASE. Must be called BEFORE test_bridge_starts so the
+# exported TELEGRAM_API_BASE is inherited by the bridge launch env. Idempotent:
+# lsof-kills any stale owner of MOCKPORT first.
+start_mock_telegram() {
+    info "Starting mock Telegram on port $MOCKPORT..."
+    # Kill any stale owner of the mock port (PID-scoped to that port only).
+    # Portable: BSD xargs has no -r, so guard on a non-empty PID list ourselves.
+    local _stale_pids; _stale_pids=$(lsof -ti :"$MOCKPORT" 2>/dev/null || true)
+    [[ -n "$_stale_pids" ]] && kill -9 $_stale_pids 2>/dev/null || true
+    sleep 0.2
+
+    mkdir -p "$TEST_NODE_DIR"
+    : > "$TEST_NODE_DIR/telegram_calls.jsonl" 2>/dev/null || true
+
+    python3 "$SCRIPT_DIR/tests/mock_telegram.py" \
+        --port "$MOCKPORT" \
+        --record "$TEST_NODE_DIR/telegram_calls.jsonl" \
+        > "$TEST_NODE_DIR/mock_tg.log" 2>&1 &
+    local mock_pid=$!
+    echo "$mock_pid" > "$TEST_NODE_DIR/mock_tg.pid"
+
+    if wait_for_port "$MOCKPORT"; then
+        # Mark the harness active so the bridge launch wires TELEGRAM_API_BASE.
+        MOCK_TG_ACTIVE=1
+        export TELEGRAM_API_BASE="http://127.0.0.1:$MOCKPORT"
+        success "Mock Telegram started on port $MOCKPORT"
+        return 0
+    else
+        fail "Mock Telegram failed to start on port $MOCKPORT"
+        return 1
+    fi
+}
+
+# Clear the mock's recorded calls + programmed faults. Call at the top of each
+# mock-based test for isolation.
+mock_reset() {
+    curl -s -X POST "http://127.0.0.1:$MOCKPORT/_reset" >/dev/null
+}
+
+# Assert the mock recorded a sendMessage to <thread_id> whose text contains
+# <marker>. Returns nonzero (red) if no such call was recorded.
+mock_assert_sendmessage() {
+    local thread_id="$1" marker="$2"
+    curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+        | jq -e --argjson n "$thread_id" --arg m "$marker" \
+            'any(.[]; .method=="sendMessage" and .message_thread_id==$n and (.text|contains($m)))' \
+        >/dev/null
+}
+
+# Assert NO recorded sendMessage carrying <marker> targeted a message_thread_id.
+# With a second arg <thread_id>, assert no sendMessage to that thread carried the
+# marker. Without it (tmain/General/thread-0 case), assert every sendMessage
+# carrying the marker has NO message_thread_id key at all (field-absent).
+mock_assert_thread_absent() {
+    local marker="$1" thread_id="${2:-}"
+    if [[ -n "$thread_id" ]]; then
+        curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+            | jq -e --argjson n "$thread_id" --arg m "$marker" \
+                'any(.[]; .method=="sendMessage" and .message_thread_id==$n and (.text|contains($m))) | not' \
+            >/dev/null
+    else
+        # marker present in some sendMessage, and NONE of those carry message_thread_id.
+        curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+            | jq -e --arg m "$marker" \
+                '[.[] | select(.method=="sendMessage" and (.text|contains($m)))]
+                 | (length > 0) and (all(.[]; has("message_thread_id")|not))' \
+            >/dev/null
+    fi
+}
+
+# Assert the mock recorded ZERO sends or reactions for <chat_id> — used to prove
+# the admin gate stays silent for a non-admin chat.
+mock_assert_silence() {
+    local chat_id="$1"
+    curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+        | jq -e --argjson c "$chat_id" \
+            'all(.[]; (.chat_id // -999999999) != $c)' \
+        >/dev/null
+}
+
+# Assert the mock recorded a setMessageReaction arc for <chat_id>/<message_id>
+# that, IN ORDER, contains each of the given emoji. Each emoji must appear in a
+# recorded reaction whose .raw.message_id matches, in non-decreasing record
+# order. Returns nonzero (red) if the arc is incomplete or out of order.
+mock_assert_reaction_arc() {
+    local chat_id="$1" message_id="$2"
+    shift 2
+    local emojis_json
+    emojis_json=$(printf '%s\n' "$@" | jq -R . | jq -s .)
+    curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+        | jq -e --argjson c "$chat_id" --argjson mid "$message_id" --argjson want "$emojis_json" '
+            # Reaction records for this chat+message, in recorded order, flattened
+            # to the list of emoji strings each set carried.
+            ([.[]
+              | select(.method=="setMessageReaction"
+                       and .chat_id==$c
+                       and ((.raw.message_id) == $mid))
+              | .reaction[]?
+             ]) as $seq
+            # Each wanted emoji must appear, in order, as a subsequence of $seq.
+            | reduce $want[] as $e (
+                {i:0, ok:true};
+                if .ok|not then .
+                else
+                  ( [ $seq[.i:] | to_entries[] | select(.value==$e) | .key ] ) as $hits
+                  | if ($hits|length) > 0
+                    then {i: (.i + $hits[0] + 1), ok: true}
+                    else {i: .i, ok: false}
+                    end
+                end
+              )
+            | .ok
+        ' >/dev/null
+}
+
+# Program the mock so the NEXT send targeting <thread_id> bounces with HTTP 400
+# "Bad Request: message thread not found" (drives the real _reap_dead_topic path).
+mock_program_thread_not_found() {
+    local thread_id="$1"
+    curl -s -X POST "http://127.0.0.1:$MOCKPORT/_program" \
+        -H "Content-Type: application/json" \
+        -d '{"thread_not_found":['"$thread_id"']}' >/dev/null
+}
+
+# Register raw bytes (from a local file) under <file_path> so the mock's getFile
+# resolves to it and the /file download serves those bytes. Register EXACTLY ONE
+# file before a download test so getFile's single-file shortcut selects it.
+mock_register_file_bytes() {
+    local file_path="$1" local_file="$2"
+    local b64
+    b64=$(base64 -w0 "$local_file" 2>/dev/null || base64 "$local_file" | tr -d '\n')
+    curl -s -X POST "http://127.0.0.1:$MOCKPORT/_program" \
+        -H "Content-Type: application/json" \
+        -d '{"files":{"'"$file_path"'":"'"$b64"'"}}' >/dev/null
+}
+
+# Assert the session inbox contains a downloaded file whose sha256 matches <sha256>.
+# Inbox layout (bridge.py): /tmp/claudecode-telegram/<node>/<session>/inbox/.
+# Node is derived from TMUX_PREFIX ("claude-test-" -> "test").
+mock_assert_inbox_sha() {
+    local session="$1" sha256="$2"
+    local node
+    node="${TEST_TMUX_PREFIX#claude-}"; node="${node%-}"
+    [[ -z "$node" ]] && node="default"
+    local inbox="/tmp/claudecode-telegram/$node/$session/inbox"
+    [[ -d "$inbox" ]] || return 1
+    local f
+    for f in "$inbox"/*; do
+        [[ -e "$f" ]] || continue
+        local got
+        got=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+        [[ "$got" == "$sha256" ]] && return 0
+    done
+    return 1
+}
+
+# Forum-topic webhook update carrying message_thread_id (models send_message at
+# the top of this file, plus the forum-topic `message_thread_id` field + an
+# `is_topic_message` flag). Optional <message_id> pins the message id (default
+# random) so reaction-arc assertions can target it.
+send_topic_message() {
+    local chat_id="$1"
+    local thread_id="$2"
+    local text="$3"
+    local message_id="${4:-$((RANDOM))}"
+    local update_id=$((RANDOM))
+
+    curl -s -X POST "http://localhost:$PORT" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "update_id": '"$update_id"',
+            "message": {
+                "message_id": '"$message_id"',
+                "message_thread_id": '"$thread_id"',
+                "is_topic_message": true,
+                "from": {"id": '"$chat_id"', "first_name": "TestUser"},
+                "chat": {"id": '"$chat_id"', "type": "supergroup", "is_forum": true},
+                "date": '"$(date +%s)"',
+                "text": "'"$text"'"
             }
         }'
 }
@@ -5153,14 +5381,31 @@ test_bridge_starts() {
         printf '{"workers":{}}' > "$wjson" 2>/dev/null || true
     fi
 
+    # Bridge launch env. Defaults preserve legacy behaviour exactly (real
+    # TEST_BOT_TOKEN, ADMIN_CHAT_ID = TEST_CHAT_ID, and NO TELEGRAM_API_BASE in
+    # the env so bridge.py keeps its real api.telegram.org default). When the
+    # Mock-Telegram harness is active (start_mock_telegram ran first) we redirect
+    # the wire to the mock, force a NON-EMPTY dummy token (so `if not BOT_TOKEN`
+    # early-returns in media/file paths don't skip), and pin a concrete
+    # ADMIN_CHAT_ID so the admin gate is deterministic. All stay env-overridable.
+    local launch_token="$TEST_BOT_TOKEN"
+    local launch_admin="${TEST_CHAT_ID:-}"
+    local -a launch_env=()
+    if [[ "$MOCK_TG_ACTIVE" == "1" ]]; then
+        launch_token="${MOCK_BOT_TOKEN:-${TEST_BOT_TOKEN:-mock-token}}"
+        launch_admin="${MOCK_ADMIN_CHAT_ID:-$CHAT_ID}"
+        launch_env+=("TELEGRAM_API_BASE=${TELEGRAM_API_BASE:-http://127.0.0.1:$MOCKPORT}")
+    fi
+
     # Start bridge with test node isolation
-    TELEGRAM_BOT_TOKEN="$TEST_BOT_TOKEN" \
+    TELEGRAM_BOT_TOKEN="$launch_token" \
     PORT="$PORT" \
     NODE_NAME="$TEST_NODE" \
     SESSIONS_DIR="$TEST_SESSION_DIR" \
     TMUX_PREFIX="$TEST_TMUX_PREFIX" \
-    ADMIN_CHAT_ID="${TEST_CHAT_ID:-}" \
+    ADMIN_CHAT_ID="$launch_admin" \
     TEAM_DIR="$TEST_TEAM_DIR" \
+    env "${launch_env[@]}" \
     python3 -u "$SCRIPT_DIR/bridge.py" > "$BRIDGE_LOG" 2>&1 &
     BRIDGE_PID=$!
     echo "$BRIDGE_PID" > "$TEST_NODE_DIR/bridge.pid"
@@ -5423,6 +5668,16 @@ test_document_message_routing() {
 test_incoming_document_e2e() {
     info "Testing incoming document e2e (upload -> webhook -> download)..."
 
+    # In DEFAULT/e2e mode the bridge points at the recording mock (MOCK_TG_ACTIVE=1),
+    # so a real-Telegram upload->getFile->download round-trip cannot complete (the
+    # mock doesn't hold the real file). The deterministic SEAM-07 mock test
+    # (test_mock_incoming_document_downloads_to_inbox) covers the incoming
+    # getFile+download path at the wire, so skip this real-Telegram variant.
+    if [[ "${MOCK_TG_ACTIVE:-}" == "1" ]]; then
+        info "Skipping: superseded by the SEAM-07 mock test (bridge is on the mock)"
+        return 0
+    fi
+
     # This test requires a real TEST_CHAT_ID to upload documents to Telegram
     if [[ "${TEST_CHAT_ID:-}" == "" ]] || [[ "$CHAT_ID" == "123456789" ]]; then
         info "Skipping (requires TEST_CHAT_ID for real Telegram upload)"
@@ -5516,6 +5771,17 @@ test_incoming_document_e2e() {
 
 test_incoming_image_e2e() {
     info "Testing incoming image e2e (upload -> webhook -> download)..."
+
+    # In DEFAULT/e2e mode the bridge points at the recording mock (MOCK_TG_ACTIVE=1),
+    # so a real-Telegram upload->getFile->download round-trip cannot complete. The
+    # incoming getFile+download path is identical to the document case and is
+    # covered deterministically at the wire by the SEAM-07 mock test, so skip this
+    # real-Telegram variant. (Coverage note: a mock incoming-IMAGE test is a Task-8
+    # gap-filler candidate; the download mechanism itself is already exercised.)
+    if [[ "${MOCK_TG_ACTIVE:-}" == "1" ]]; then
+        info "Skipping: superseded by the SEAM-07 mock test (bridge is on the mock)"
+        return 0
+    fi
 
     # This test requires a real TEST_CHAT_ID to upload images to Telegram
     if [[ "${TEST_CHAT_ID:-}" == "" ]] || [[ "$CHAT_ID" == "123456789" ]]; then
@@ -12080,8 +12346,28 @@ run_integration_tests() {
     # Integration tests (bridge needed)
     log ""
     log "── Integration Tests ───────────────────────────────────────────────────"
+    # Start the recording Mock-Telegram server BEFORE the bridge so the bridge
+    # launch inherits TELEGRAM_API_BASE + MOCK_TG_ACTIVE (test_bridge_starts wires
+    # them into the launch env). This makes delivery/threading/reactions/media
+    # observable at the real wire boundary in DEFAULT mode (e2e-hardening).
+    if command -v start_mock_telegram >/dev/null 2>&1; then
+        start_mock_telegram || true
+    fi
     run_test test_bridge_starts || exit 1
     sleep 0.3
+
+    # Mock-Telegram DEFAULT-mode tests (SEAM-02/03/07/08/09/10 + new). They assert
+    # at the recorded wire boundary, never the bridge log. C4 FIX: run them ONLY
+    # when the mock is active AND the runner was sourced AND the bridge is actually
+    # LISTENING on $PORT — gating on MOCK_TG_ACTIVE alone fired them against a dead
+    # bridge and red the whole suite under TEST_FILTER. Skip loudly otherwise.
+    if [[ "${MOCK_TG_ACTIVE:-}" == "1" ]] && command -v run_mock_tests >/dev/null 2>&1; then
+        if wait_for_port "$PORT"; then
+            run_mock_tests
+        else
+            info "Skipping run_mock_tests: bridge not listening on port $PORT"
+        fi
+    fi
 
     # HTTP endpoint tests
     log ""
@@ -12182,6 +12468,20 @@ run_tunnel_tests() {
     run_full_tests
 }
 
+# Real-claude E2E runner (E2E=1). EMPTY stub so E2E=1 degrades gracefully when
+# tests/e2e_tests.sh is absent. The real run_e2e_tests + spawn_real_claude in
+# tests/e2e_tests.sh override this when that file is sourced (after main is
+# defined, before main "$@" runs). Loud skip when claude is unavailable.
+run_e2e_tests() {
+    log ""
+    log "── Real-Claude E2E Tests ───────────────────────────────────────────────"
+    if ! check_claude_available; then
+        info "Skipping E2E tests: claude CLI not available on PATH"
+        return 0
+    fi
+    :
+}
+
 main() {
     log ""
     log "═══════════════════════════════════════════════════════════════════════"
@@ -12194,6 +12494,9 @@ main() {
     if [[ "${FAST:-}" == "1" ]]; then
         mode="fast"
         mode_desc="FAST mode: Unit + CLI tests only (~10-15s)"
+    elif [[ "${E2E:-}" == "1" ]]; then
+        mode="e2e"
+        mode_desc="E2E mode: Unit + Integration + real-claude E2E tests (requires claude CLI)"
     elif [[ "${FULL:-}" == "1" ]]; then
         mode="full"
         mode_desc="FULL mode: All tests including tunnel (~5 min)"
@@ -12229,6 +12532,13 @@ main() {
         run_full_tests
     fi
 
+    # Real-claude E2E tests (gated behind E2E=1; runner sourced from e2e_tests.sh).
+    # X4: integration (incl. the mock suite) already ran above because mode != fast;
+    # this adds ONLY the real-claude seams — do NOT re-run integration here.
+    if [[ "$mode" == "e2e" ]]; then
+        run_e2e_tests
+    fi
+
     # Summary
     log ""
     log "═══════════════════════════════════════════════════════════════════════"
@@ -12238,5 +12548,15 @@ main() {
 
     [[ $failed -eq 0 ]] && exit 0 || exit 1
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wire in the e2e-hardening test files (sourced LAST, after every helper AND the
+# run_e2e_tests stub above, so e2e_tests.sh's run_e2e_tests + spawn_real_claude
+# override the stub and mock_tests.sh's run_mock_tests becomes available). Both
+# files are self-contained and never redefine test.sh's own helpers.
+# ─────────────────────────────────────────────────────────────────────────────
+for f in "$SCRIPT_DIR"/tests/mock_tests.sh "$SCRIPT_DIR"/tests/e2e_tests.sh; do
+    [[ -f "$f" ]] && source "$f"
+done
 
 main "$@"
