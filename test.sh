@@ -11968,6 +11968,105 @@ test_restart_node_env_propagation() {
     rm -rf "$tmphome"
 }
 
+# Guards the 07:47 silent-death regression: cmd_run MUST launch the bridge
+# setsid-detached (so a closing terminal/session can never SIGHUP it), capture
+# the real detached pid (not $! of the setsid wrapper), and must NOT kill that
+# detached bridge on an unintended teardown — only on an intentional stop.
+test_cmd_run_launches_bridge_detached() {
+    log "Test: cmd_run launches the bridge setsid-detached (07:47 silent-death guard)"
+    local script="$SCRIPT_DIR/claudecode-telegram.sh"
+    local body
+    body=$(awk '/^cmd_run\(\)/{f=1} f{print} f&&/^}$/{exit}' "$script")
+
+    # 1. Bridge launched fully detached (</dev/null), portably: setsid on Linux
+    #    with a nohup fallback for macOS (which has no setsid). Match the COMMAND
+    #    shapes ('setsid bash -c' / 'nohup bash -c' / 'echo \$\$ >'), not bare words
+    #    — bare 'setsid'/'nohup' also appear in the comments and would false-pass.
+    if grep -qF 'setsid bash -c' <<<"$body" && grep -qF 'nohup bash -c' <<<"$body" \
+        && grep -qF '</dev/null' <<<"$body" && grep -qF 'echo \$\$ >' <<<"$body"; then
+        success "cmd_run detaches the bridge portably (setsid/nohup bash -c + </dev/null + child records own pid)"
+    else
+        fail "cmd_run launch is not portably detached (need setsid bash -c + nohup fallback + </dev/null + echo \$\$) — 07:47 silent-death / macOS risk"
+    fi
+
+    # 2. Real pid comes from the detached child, not \$! (which is the setsid wrapper):
+    #    no 'bridge_pid=\$!', and a readback loop that cat's bridge.pid + kill -0 checks it.
+    if grep -qE 'bridge_pid=\$!' <<<"$body"; then
+        fail "cmd_run captures \$! (the setsid wrapper), not the real detached bridge pid"
+    elif grep -qF 'cat "$node_dir/bridge.pid"' <<<"$body" && grep -qF 'kill -0 "$bridge_pid"' <<<"$body"; then
+        success "cmd_run reads the real bridge pid back from bridge.pid (no reliance on \$!)"
+    else
+        fail "cmd_run has no pid-readback loop — \$! is the setsid wrapper, not the bridge pid"
+    fi
+
+    # 3. Cleanup must guard the bridge kill behind an intentional-stop flag, so a
+    #    closing terminal (HUP -> EXIT trap) does not take the detached bridge down.
+    local cleanup_body
+    cleanup_body=$(awk '/cleanup_and_exit\(\)/{f=1} f{print} f&&/^    }$/{exit}' "$script")
+    if grep -qE '_intentional_stop|intentional' <<<"$cleanup_body"; then
+        success "cleanup guards the bridge kill behind an intentional-stop flag"
+    else
+        fail "cleanup kills the bridge unconditionally — a HUP would take the detached bridge down too"
+    fi
+}
+
+# Fail-loudly guard (e310008): when the watchdog detects the detached bridge has
+# died, the supervisor's cleanup MUST exit non-zero — a dead bridge is a failure,
+# not a clean stop (so systemd/CI/`&&` chains can see it). An intentional stop
+# (Ctrl+C) and a bare host teardown (supervisor exits, leaves the bridge running)
+# must still exit 0. This runs the REAL cleanup_and_exit body in isolation with
+# stubbed deps, so it asserts the actual exit code — behavior, not source text.
+test_bridge_death_exits_nonzero() {
+    log "Test: bridge-death cleanup exits non-zero (fail-loudly); intentional/teardown exit 0"
+    local script="$SCRIPT_DIR/claudecode-telegram.sh"
+    local fn
+    fn=$(awk '/cleanup_and_exit\(\)/{f=1} f{print} f&&/^    }$/{exit}' "$script")
+    if [[ -z "$fn" ]]; then
+        fail "could not extract cleanup_and_exit from $script"
+        return
+    fi
+
+    # $1 = _intentional_stop, $2 = _bridge_dead -> echoes the real exit code.
+    _run_cleanup() {
+        local tmp; tmp="$(mktemp)"
+        {
+            printf '%s\n' 'set +e'
+            printf '%s\n' 'stop_poll_fallback() { :; }'
+            printf '%s\n' 'log() { :; }'
+            printf '%s\n' 'node="t"; tunnel_pid=""; bridge_pid=""; node_dir=""; pid_file=""'
+            printf '%s\n' "_intentional_stop=$1; _bridge_dead=$2"
+            printf '%s\n' "$fn"
+            printf '%s\n' 'cleanup_and_exit'
+        } > "$tmp"
+        bash "$tmp" >/dev/null 2>&1
+        local rc=$?
+        rm -f "$tmp"
+        echo "$rc"
+    }
+
+    local rc_dead rc_intentional rc_teardown
+    rc_dead=$(_run_cleanup 0 1)
+    rc_intentional=$(_run_cleanup 1 0)
+    rc_teardown=$(_run_cleanup 0 0)
+    unset -f _run_cleanup
+
+    if [[ "$rc_dead" -ne 0 ]]; then
+        success "bridge-death cleanup exits non-zero ($rc_dead) — fail-loudly"
+    else
+        fail "bridge-death cleanup exits 0 — a dead bridge is silently reported as success"
+    fi
+    if [[ "$rc_intentional" -eq 0 ]]; then
+        success "intentional-stop cleanup exits 0 (Ctrl+C is a clean stop)"
+    else
+        fail "intentional-stop cleanup exits non-zero ($rc_intentional) — Ctrl+C should be clean"
+    fi
+    if [[ "$rc_teardown" -eq 0 ]]; then
+        success "host-teardown cleanup exits 0 (leaving the bridge running is not a failure)"
+    else
+        fail "host-teardown cleanup exits non-zero ($rc_teardown) — leaving the bridge running is not a failure"
+    fi
+}
+
 # ============================================================
 # TEST RUNNERS
 # ============================================================
@@ -12075,6 +12174,11 @@ run_unit_tests() {
     run_test test_activity_detects_interactive_prompt
     run_test test_activity_detects_plan_approval
     run_test test_watchdog_waiting_input_state
+    # Unit tests - Launch / Detach hardening (v1.3.5 Task 5a)
+    log ""
+    log "── Launch / Detach Tests (Unit) ────────────────────────────────────────"
+    run_test test_cmd_run_launches_bridge_detached
+    run_test test_bridge_death_exits_nonzero
     # Unit tests - Bridge public URL
     log ""
     log "── Bridge Public URL Tests (Unit) ──────────────────────────────────────"
