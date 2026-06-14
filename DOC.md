@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 1.2.0
+> Version: 1.3.0
 
 ## Current Philosophy (Summary)
 
@@ -275,6 +275,44 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.3.0 - End-to-end test hardening (mock-Telegram + real-claude harness)
+
+A 2026-06-14 audit (20-agent workflow over all 303 tests, adversarially verified) found the
+suite had **zero true end-to-end tests**: real `claude` never ran, the Stop hook was always
+curl-simulated, and Telegram delivery was structurally un-falsifiable (a fake-chat-id API
+error was graded as success). An independent GPT-5.5/Codex review of the fix design flagged 6
+false-greens + 4 flakiness risks + 5 missed scenarios, all folded in. This release closes all
+ten seams — each new test has an explicit RED criterion (proven to fail when the feature breaks).
+
+**Two-axis architecture** (design: `docs/superpowers/specs/2026-06-14-e2e-hardening-design.md`):
+- **(A) Recording Mock-Telegram server** (`tests/mock_telegram.py`, stdlib only): the bridge is
+  pointed at a localhost server via the new `TELEGRAM_API_BASE` seam, which records every
+  outbound call (sendMessage / setMessageReaction / sendChatAction / multipart media / getFile)
+  with full payload incl `message_thread_id` (absent-vs-present preserved), serves
+  `/file/bot<token>/<path>` bytes, and returns a programmable real HTTP-400 "thread not found"
+  for the reap path. This makes delivery, threading, cross-topic isolation, admin-gate silence,
+  the reaction arc, and media download/upload **falsifiable in DEFAULT mode** with no real claude
+  and no secrets (`tests/mock_tests.sh`, 20 tests). Assertions read the recorded wire, never the
+  bridge's self-reported log line.
+- **(B) Real-claude E2E mode** (`E2E=1`, gated by `check_claude_available`): `tests/e2e_tests.sh`
+  (5 tests) spawns a **real `claude`** through the real path (forum-topic webhook → folder-picker
+  callback → tmux spawn), sends a deterministic marker prompt, and lets the **real Stop hook** fire
+  (`TMUX_FALLBACK=0` forces real transcript extraction). True L3 for type→answer roundtrip,
+  spawn-in-cwd liveness, claude-process-alive, and two-topic isolation.
+
+**Production seams (additive, default byte-identical to prod):**
+- `TELEGRAM_API_BASE` (env, default `https://api.telegram.org`) routes all 7 hardcoded Telegram
+  URL sites (JSON api + 5 media/multipart + getFile + the distinct `/file/bot…` download path)
+  through one overridable base.
+- `CLAUDE_SETTINGS_FILE_SPAWN` (env, repurposed from the dead `CLAUDE_SETTINGS_FILE` constant):
+  when set, `build_claude_start_cmd` appends `--settings <path>`, letting E2E pin the spawned
+  session's Stop hook to the repo hook for hermeticity.
+
+**Verification:** DEFAULT suite 20/20 new mock tests green; E2E 5/5 green with a real claude turn
+(marker delivered into the right thread via the real Stop hook); an external RED demo proved the
+SEAM-02 test fails on broken delivery and passes on working delivery. The dead, never-registered
+`test_direct_mode_*` block (the embodiment of the SEAM-01 false-green) was removed.
 
 ### v1.2.0 - Fail-loudly exit + doc/test drift sweep
 

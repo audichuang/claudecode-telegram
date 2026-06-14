@@ -2,13 +2,14 @@
 
 ## Test Modes
 
-The test suite supports three modes:
+The test suite supports four modes:
 
 | Mode | Command | Time |
 |------|---------|------|
 | **FAST** | `FAST=1 ./test.sh` | ~10-15s |
 | **Default** | `./test.sh` | ~2-3 min |
 | **FULL** | `FULL=1 ./test.sh` | ~5 min |
+| **E2E** | `E2E=1 ./test.sh` | ~1-2 min (spawns real `claude`) |
 
 For workflow rules (when to run which mode), see `CLAUDE.md`.
 
@@ -27,7 +28,7 @@ For workflow rules (when to run which mode), see `CLAUDE.md`.
 - Concurrency helpers (locks)
 - Hook install/uninstall
 
-**Default mode** (bridge running locally):
+**Default mode** (bridge running locally + recording Mock-Telegram server):
 - Everything in FAST mode, plus:
 - Bridge startup and health check
 - All Telegram commands (/cd, /close, /memory, /quota, /voice, /settings, /rewind, /pr)
@@ -37,6 +38,27 @@ For workflow rules (when to run which mode), see `CLAUDE.md`.
 - Image/document handling
 - /response and /notify endpoints
 - Persistence files
+- **Falsifiable wire-boundary tests (`tests/mock_tests.sh`, 20 tests):** the bridge is
+  pointed at a localhost Mock-Telegram server (`tests/mock_telegram.py`) via
+  `TELEGRAM_API_BASE`, which **records every outbound call** (sendMessage / reaction /
+  typing / multipart media / getFile). Delivery, threading (`message_thread_id`),
+  cross-topic isolation, admin-gate silence, the reaction arc, media download/upload,
+  and dead-topic reaping (real HTTP-400 bounce) are asserted at the **recorded wire**,
+  never the bridge's self-reported log line — so a broken feature turns the suite red.
+
+**E2E mode** (real `claude` + Mock-Telegram; gated, opt-in):
+- `tests/e2e_tests.sh` (5 tests) spawns a **real `claude`** session in a tmpdir through
+  the real path (forum-topic webhook → folder-picker callback → tmux spawn), sends a
+  deterministic marker prompt, lets the **real Stop hook** fire (`TMUX_FALLBACK=0` forces
+  real transcript extraction, not the capture-pane fallback), and asserts the marker lands
+  in the right thread at the mock. Covers: real type→answer roundtrip (SEAM-01/06),
+  spawn-in-cwd liveness (SEAM-04), claude-process-alive ≠ pane-alive (SEAM-05), and
+  two-topic isolation (SEAM-03 L3).
+- Each test calls `check_claude_available` and **skips loudly** (never silent-passes) when
+  `claude` is absent; a turn timeout is a **hard failure**. Real turns spend quota
+  (~4s/turn) and need a logged-in `claude`, so E2E is excluded from FAST/Default/FULL and
+  opt-in only (run before a push/release). Isolation: bridge points at the mock with a
+  dummy token + placeholder admin chat, so **no real Telegram traffic** is produced.
 
 **FULL mode**:
 - Everything in Default mode, plus:
@@ -46,14 +68,19 @@ For workflow rules (when to run which mode), see `CLAUDE.md`.
 ## Test Pyramid
 
 ```
-        /\
-       /  \  FULL: Tunnel + Webhook
-      /----\
-     /      \ Default: Bridge + Commands
-    /--------\
-   /          \ FAST: Unit + CLI
-  /-----------\
+         /\
+        /  \   E2E: real claude → real Stop hook → mock (true L3)
+       /----\
+      /      \  FULL: Tunnel + Webhook
+     /--------\
+    /          \ Default: Bridge + Commands + Mock-Telegram wire tests
+   /------------\
+  /              \ FAST: Unit + CLI
+ /----------------\
 ```
+
+> **The two-axis e2e-hardening architecture** (design: `docs/superpowers/specs/2026-06-14-e2e-hardening-design.md`):
+> (A) the Mock-Telegram server makes delivery/threading/reactions/silence/media **falsifiable in Default mode** with no real claude and no secrets; (B) the gated `E2E=1` mode adds **agent-driven true-L3 confidence** (a real claude turn drives the whole chain). Every new test has an explicit RED criterion — proven to fail when the feature breaks.
 
 Workflow guidance lives in `CLAUDE.md`.
 
@@ -201,29 +228,33 @@ run_unit_tests() {
 }
 ```
 
-## Missing Tests (To Be Implemented)
+## E2E Coverage (the 10 seams)
 
-This section tracks tests that should be added to ensure mode parity and complete coverage.
+A 2026-06-14 audit found the suite had **zero true end-to-end tests**: real `claude` never
+ran, the Stop hook was always curl-simulated, and Telegram delivery was un-falsifiable (a
+fake-chat-id API error counted as success). The e2e-hardening work closed all ten seams —
+each with an explicit RED criterion (proven to fail when the feature breaks):
 
-### Critical (Mode Parity)
+| Seam | What was a false-green | Now closed by | Mode |
+|------|-----------------------|---------------|------|
+| SEAM-01 | real claude never runs | `test_e2e_real_claude_marker_roundtrip` | E2E |
+| SEAM-02 | fake-chat-id API error graded as success | `test_mock_response_delivers_real_sendmessage` (+ embedded RED guard) | Default |
+| SEAM-03 | thread targeting only via spy call-args | `test_mock_reply_lands_in_correct_thread`, `test_mock_two_topics_no_crosstalk`, `test_e2e_two_real_topics_isolated` | Default + E2E |
+| SEAM-04 | spawn-in-cwd asserted as command strings | `test_e2e_spawn_runs_claude_in_cwd` | E2E |
+| SEAM-05 | bash-pane liveness ≠ claude liveness | `test_e2e_claude_actually_alive_not_just_pane` | E2E |
+| SEAM-06 | Stop-hook contract never run e2e | `test_e2e_real_claude_marker_roundtrip` (`TMUX_FALLBACK=0`) | E2E |
+| SEAM-07 | media→claude only as stubbed args | `test_mock_incoming_document_downloads_to_inbox`, `test_mock_outgoing_voice_multipart_recorded` | Default |
+| SEAM-08 | close/reap glue L1-stubbed | `test_mock_bounce_reaps_topic_session` (real HTTP-400), `test_mock_tmain_never_reaped` | Default |
+| SEAM-09 | admin gate = "a stub wasn't called" | `test_mock_nonadmin_message_is_silent`, `test_mock_nonadmin_callback_tap_silent` | Default |
+| SEAM-10 | reaction arc = spy call-counts | `test_mock_reaction_arc_recorded` | Default |
 
-All critical mode parity tests are now implemented. ✅
+Plus new scenarios: multi-chunk reply ordering with `reply_to` chaining, fresh-session-after-close
+(no zombie re-attach), and a no-real-Telegram-egress guard.
 
-### Important (No Test)
+## Still Out of Scope (genuine gaps, low priority)
 
-These features have no tests in either mode and should be tested:
-
-| Feature | Description |
-|---------|-------------|
-| Multipart response chaining behavior | Reply chain for multipart messages (reply_to_message_id) |
-
-### Nice to Have
-
-Lower priority tests for edge cases and robustness:
-
-| Feature | Description |
-|---------|-------------|
-| Direct worker crash recovery | Worker process crash detection and cleanup |
-| Concurrent pipe writes | Multiple workers writing to same pipe simultaneously |
-| Pipe permissions | Named pipe has correct permissions (0o600) |
-| Path traversal protection | Prevent `../` in worker names for inbox paths |
+| Feature | Why deferred |
+|---------|--------------|
+| Trust-dialog auto-answer on the real path | Prod always spawns with `--dangerously-skip-permissions`, so the dialog never appears; the defensive branch is acknowledged non-blocking in `test_e2e_trust_dialog_auto_answered` |
+| Path-traversal hardening of the folder picker | `_norm_under_root` clamps under `TOPIC_ROOT`; covered at L1 (`test_topic_cd_rejects_bad_path`) but not fuzzed |
+| E2E in CI | Real turns need a logged-in `claude` + quota; E2E is local/pre-push only |
