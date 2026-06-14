@@ -36,6 +36,9 @@ class ReuseAddrServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+# Telegram Bot API base. Overridable (e.g. a mock server in tests); `.rstrip("/")`
+# keeps prod behaviour byte-identical when the env var is unset.
+TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 
 # Node-derived config: NODE_NAME drives defaults for PORT, TMUX_PREFIX, SESSIONS_DIR.
 # Explicit env vars always override. No NODE_NAME = original defaults.
@@ -788,7 +791,7 @@ class TelegramAPI:
         if not self.token:
             return None
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{self.token}/{method}",
+            f"{TELEGRAM_API_BASE}/bot{self.token}/{method}",
             data=json.dumps(data).encode(),
             headers={"Content-Type": "application/json"}
         )
@@ -895,7 +898,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendPhoto",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -946,7 +949,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendAnimation",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendAnimation",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -997,7 +1000,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendDocument",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -1043,7 +1046,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/{api_method}",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/{api_method}",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -1110,7 +1113,7 @@ class TelegramTransport(MessageTransport):
             return None
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/getFile",
                 data=json.dumps({"file_id": file_id}).encode(),
                 headers={"Content-Type": "application/json"}
             )
@@ -1131,7 +1134,7 @@ class TelegramTransport(MessageTransport):
         if file_size > MAX_FILE_SIZE:
             print(f"File too large: {file_size} > {MAX_FILE_SIZE}")
             return None
-        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        download_url = f"{TELEGRAM_API_BASE}/file/bot{BOT_TOKEN}/{file_path}"
         inbox = ensure_inbox_dir(session_name)
         ext = Path(file_path).suffix or ""
         local_filename = f"{uuid.uuid4().hex}{ext}"
