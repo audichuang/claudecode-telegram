@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 1.3.0
+> Version: 1.3.1
 
 ## Current Philosophy (Summary)
 
@@ -275,6 +275,14 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.3.1 - Drop the dead forge `/register` test
+
+Removed `test_forge_register_endpoint` (3 assertions) and its registration — the `forge`
+`/register` endpoint was deleted in v1.0.0 (the multi-worker era), so the test had been a
+pre-existing red in the Default suite, asserting a 200 on an endpoint that now returns the
+generic 404. The Default suite's only remaining failures are the two known environment-bound
+ones (`/hire`-spawn can't create a live worker on a headless box). Mock suite stays 20/20.
 
 ### v1.3.0 - End-to-end test hardening (mock-Telegram + real-claude harness)
 

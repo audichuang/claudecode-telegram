@@ -11630,47 +11630,6 @@ print('OK')
     fi
 }
 
-test_forge_register_endpoint() {
-    info "Testing POST /register returns 200..."
-
-    local http_code response
-
-    # Basic registration
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:$PORT/register" \
-        -H "Content-Type: application/json" \
-        -d '{"Name":"testworker","Host":"vps","Version":"1.0.0","Tools":{"tmux":"3.4"}}')
-    if [[ "$http_code" == "200" ]]; then
-        success "POST /register returns 200"
-    else
-        fail "POST /register should return 200, got $http_code"
-    fi
-
-    # Verify response is JSON with ok=true
-    response=$(curl -s -X POST "http://localhost:$PORT/register" \
-        -H "Content-Type: application/json" \
-        -d '{"Name":"testworker","Host":"vps","Version":"1.0.0"}')
-    if echo "$response" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-assert d.get('ok') == True, f'expected ok=true, got {d}'
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        success "POST /register returns {ok: true}"
-    else
-        fail "POST /register should return ok=true: $response"
-    fi
-
-    # Empty body should still return 200 (graceful)
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:$PORT/register" \
-        -H "Content-Type: application/json" \
-        -d '{}')
-    if [[ "$http_code" == "200" ]]; then
-        success "POST /register handles empty body gracefully"
-    else
-        fail "POST /register empty body should return 200, got $http_code"
-    fi
-}
-
 # Guards the 07:47 silent-death regression: cmd_run MUST launch the bridge
 # setsid-detached (so a closing terminal/session can never SIGHUP it), capture
 # the real detached pid (not $! of the setsid wrapper), and must NOT kill that
@@ -12142,7 +12101,6 @@ run_integration_tests() {
     run_test test_unknown_post_returns_404
     run_test test_known_endpoints_unchanged
     run_test test_webhook_root_still_works
-    run_test test_forge_register_endpoint
     # Admin tests
     log ""
     log "── Admin Tests ─────────────────────────────────────────────────────────"
