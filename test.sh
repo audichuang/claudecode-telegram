@@ -42,6 +42,12 @@ TEST_FILTER="${TEST_FILTER:-}"
 TEST_NODE="test"
 TEST_NODE_DIR="${TEST_NODE_DIR:-$HOME/.claude/telegram/nodes/$TEST_NODE}"
 PORT="${TEST_PORT:-8295}"
+# Mock-Telegram harness (e2e-hardening). MOCKPORT is offset +100 from the bridge
+# port so it never collides with $PORT. MOCK_TG_ACTIVE gates the whole mechanism:
+# only the e2e/mock-based path turns it on, so the default integration tests
+# (which talk to real Telegram via TEST_BOT_TOKEN) are byte-identical.
+MOCKPORT="${MOCKPORT:-$((PORT + 100))}"
+MOCK_TG_ACTIVE="${MOCK_TG_ACTIVE:-}"
 TEST_SESSION_DIR="$TEST_NODE_DIR/sessions"
 TEST_PID_FILE="$TEST_NODE_DIR/pid"
 TEST_TMUX_PREFIX="claude-${TEST_NODE}-"
@@ -117,12 +123,28 @@ count_matching_tests() {
         while read -r test_name; do
             [[ -n "$test_name" ]] && candidate_tests+=("$test_name")
         done < <(collect_run_tests "run_integration_tests")
+        # Mock-Telegram DEFAULT-mode tests (sourced from tests/mock_tests.sh) run
+        # inside the integration path but live in their own run_mock_tests runner,
+        # so scrape them here too (non-fast modes only).
+        if declare -f run_mock_tests >/dev/null 2>&1; then
+            while read -r test_name; do
+                [[ -n "$test_name" ]] && candidate_tests+=("$test_name")
+            done < <(collect_run_tests "run_mock_tests")
+        fi
     fi
 
     if [[ "$mode" == "full" ]]; then
         while read -r test_name; do
             [[ -n "$test_name" ]] && candidate_tests+=("$test_name")
         done < <(collect_run_tests "run_full_tests")
+    fi
+
+    if [[ "$mode" == "e2e" ]]; then
+        if declare -f run_e2e_tests >/dev/null 2>&1; then
+            while read -r test_name; do
+                [[ -n "$test_name" ]] && candidate_tests+=("$test_name")
+            done < <(collect_run_tests "run_e2e_tests")
+        fi
     fi
 
     local matched=0
@@ -146,6 +168,12 @@ cleanup() {
         kill "$(cat "$TEST_NODE_DIR/bridge.pid")" 2>/dev/null || true
         rm -f "$TEST_NODE_DIR/bridge.pid"
     fi
+    # Also kill the Mock-Telegram server (e2e-hardening harness) if tracked.
+    if [[ -f "$TEST_NODE_DIR/mock_tg.pid" ]]; then
+        kill "$(cat "$TEST_NODE_DIR/mock_tg.pid")" 2>/dev/null || true
+        rm -f "$TEST_NODE_DIR/mock_tg.pid"
+    fi
+    rm -f "$TEST_NODE_DIR/telegram_calls.jsonl" "$TEST_NODE_DIR/mock_tg.log" 2>/dev/null || true
     [[ -n "$BRIDGE_PID" ]] && kill "$BRIDGE_PID" 2>/dev/null || true
     [[ -n "$TUNNEL_PID" ]] && kill "$TUNNEL_PID" 2>/dev/null || true
     # Kill any test sessions we created (using test prefix)
@@ -441,6 +469,219 @@ send_animation_message() {
                     "height": 240
                 },
                 "caption": "'"$caption"'"
+            }
+        }'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E2E-hardening harness: Mock-Telegram lifecycle + assertion helpers
+# (ported verbatim from origin/test/e2e-hardening:test.sh; the spawn_real_claude
+#  STUB is intentionally omitted — the real one arrives via tests/e2e_tests.sh,
+#  sourced last.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Used by run_e2e_tests as a loud skip-when-absent gate.
+check_claude_available() {
+    if command -v claude &>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Launch the recording Mock-Telegram server on MOCKPORT and point the bridge at
+# it via TELEGRAM_API_BASE. Must be called BEFORE test_bridge_starts so the
+# exported TELEGRAM_API_BASE is inherited by the bridge launch env. Idempotent:
+# lsof-kills any stale owner of MOCKPORT first.
+start_mock_telegram() {
+    info "Starting mock Telegram on port $MOCKPORT..."
+    # Kill any stale owner of the mock port (PID-scoped to that port only).
+    # Portable: BSD xargs has no -r, so guard on a non-empty PID list ourselves.
+    local _stale_pids; _stale_pids=$(lsof -ti :"$MOCKPORT" 2>/dev/null || true)
+    [[ -n "$_stale_pids" ]] && kill -9 $_stale_pids 2>/dev/null || true
+    sleep 0.2
+
+    mkdir -p "$TEST_NODE_DIR"
+    : > "$TEST_NODE_DIR/telegram_calls.jsonl" 2>/dev/null || true
+
+    python3 "$SCRIPT_DIR/tests/mock_telegram.py" \
+        --port "$MOCKPORT" \
+        --record "$TEST_NODE_DIR/telegram_calls.jsonl" \
+        > "$TEST_NODE_DIR/mock_tg.log" 2>&1 &
+    local mock_pid=$!
+    echo "$mock_pid" > "$TEST_NODE_DIR/mock_tg.pid"
+
+    if wait_for_port "$MOCKPORT"; then
+        # Mark the harness active so the bridge launch wires TELEGRAM_API_BASE.
+        MOCK_TG_ACTIVE=1
+        export TELEGRAM_API_BASE="http://127.0.0.1:$MOCKPORT"
+        success "Mock Telegram started on port $MOCKPORT"
+        return 0
+    else
+        fail "Mock Telegram failed to start on port $MOCKPORT"
+        return 1
+    fi
+}
+
+# Clear the mock's recorded calls + programmed faults. Call at the top of each
+# mock-based test for isolation.
+mock_reset() {
+    curl -s -X POST "http://127.0.0.1:$MOCKPORT/_reset" >/dev/null
+}
+
+# Assert the mock recorded a sendMessage to <thread_id> whose text contains
+# <marker>. Returns nonzero (red) if no such call was recorded.
+mock_assert_sendmessage() {
+    local thread_id="$1" marker="$2"
+    curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+        | jq -e --argjson n "$thread_id" --arg m "$marker" \
+            'any(.[]; .method=="sendMessage" and .message_thread_id==$n and (.text|contains($m)))' \
+        >/dev/null
+}
+
+# Assert NO recorded sendMessage carrying <marker> targeted a message_thread_id.
+# With a second arg <thread_id>, assert no sendMessage to that thread carried the
+# marker. Without it (tmain/General/thread-0 case), assert every sendMessage
+# carrying the marker has NO message_thread_id key at all (field-absent).
+mock_assert_thread_absent() {
+    local marker="$1" thread_id="${2:-}"
+    if [[ -n "$thread_id" ]]; then
+        curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+            | jq -e --argjson n "$thread_id" --arg m "$marker" \
+                'any(.[]; .method=="sendMessage" and .message_thread_id==$n and (.text|contains($m))) | not' \
+            >/dev/null
+    else
+        # marker present in some sendMessage, and NONE of those carry message_thread_id.
+        curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+            | jq -e --arg m "$marker" \
+                '[.[] | select(.method=="sendMessage" and (.text|contains($m)))]
+                 | (length > 0) and (all(.[]; has("message_thread_id")|not))' \
+            >/dev/null
+    fi
+}
+
+# Assert the mock recorded ZERO sends or reactions for <chat_id> — used to prove
+# the admin gate stays silent for a non-admin chat.
+mock_assert_silence() {
+    local chat_id="$1"
+    curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+        | jq -e --argjson c "$chat_id" \
+            'all(.[]; (.chat_id // -999999999) != $c)' \
+        >/dev/null
+}
+
+# Assert the mock recorded ZERO calls of <method> — used for methods whose
+# payload carries no chat_id (e.g. answerCallbackQuery is just {callback_query_id}),
+# so mock_assert_silence's chat_id filter cannot see them. Returns red if any
+# record's .method equals <method>.
+mock_assert_no_method() {
+    local method="$1"
+    curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+        | jq -e --arg m "$method" \
+            'all(.[]; .method != $m)' \
+        >/dev/null
+}
+
+# Assert the mock recorded a setMessageReaction arc for <chat_id>/<message_id>
+# that, IN ORDER, contains each of the given emoji. Each emoji must appear in a
+# recorded reaction whose .raw.message_id matches, in non-decreasing record
+# order. Returns nonzero (red) if the arc is incomplete or out of order.
+mock_assert_reaction_arc() {
+    local chat_id="$1" message_id="$2"
+    shift 2
+    local emojis_json
+    emojis_json=$(printf '%s\n' "$@" | jq -R . | jq -s .)
+    curl -s "http://127.0.0.1:$MOCKPORT/_recorded" \
+        | jq -e --argjson c "$chat_id" --argjson mid "$message_id" --argjson want "$emojis_json" '
+            # Reaction records for this chat+message, in recorded order, flattened
+            # to the list of emoji strings each set carried.
+            ([.[]
+              | select(.method=="setMessageReaction"
+                       and .chat_id==$c
+                       and ((.raw.message_id) == $mid))
+              | .reaction[]?
+             ]) as $seq
+            # Each wanted emoji must appear, in order, as a subsequence of $seq.
+            | reduce $want[] as $e (
+                {i:0, ok:true};
+                if .ok|not then .
+                else
+                  ( [ $seq[.i:] | to_entries[] | select(.value==$e) | .key ] ) as $hits
+                  | if ($hits|length) > 0
+                    then {i: (.i + $hits[0] + 1), ok: true}
+                    else {i: .i, ok: false}
+                    end
+                end
+              )
+            | .ok
+        ' >/dev/null
+}
+
+# Program the mock so EVERY send targeting <thread_id> bounces with HTTP 400
+# "Bad Request: message thread not found" (until /_reset; the fault is sticky, not
+# one-shot) — drives the real _reap_dead_topic path.
+mock_program_thread_not_found() {
+    local thread_id="$1"
+    curl -s -X POST "http://127.0.0.1:$MOCKPORT/_program" \
+        -H "Content-Type: application/json" \
+        -d '{"thread_not_found":['"$thread_id"']}' >/dev/null
+}
+
+# Register raw bytes (from a local file) under <file_path> so the mock's getFile
+# resolves to it and the /file download serves those bytes. Register EXACTLY ONE
+# file before a download test so getFile's single-file shortcut selects it.
+mock_register_file_bytes() {
+    local file_path="$1" local_file="$2"
+    local b64
+    b64=$(base64 -w0 "$local_file" 2>/dev/null || base64 "$local_file" | tr -d '\n')
+    curl -s -X POST "http://127.0.0.1:$MOCKPORT/_program" \
+        -H "Content-Type: application/json" \
+        -d '{"files":{"'"$file_path"'":"'"$b64"'"}}' >/dev/null
+}
+
+# Assert the session inbox contains a downloaded file whose sha256 matches <sha256>.
+# Inbox layout (bridge.py): /tmp/claudecode-telegram/<node>/<session>/inbox/.
+# Node is derived from TMUX_PREFIX ("claude-test-" -> "test").
+mock_assert_inbox_sha() {
+    local session="$1" sha256="$2"
+    local node
+    node="${TEST_TMUX_PREFIX#claude-}"; node="${node%-}"
+    [[ -z "$node" ]] && node="default"
+    local inbox="/tmp/claudecode-telegram/$node/$session/inbox"
+    [[ -d "$inbox" ]] || return 1
+    local f
+    for f in "$inbox"/*; do
+        [[ -e "$f" ]] || continue
+        local got
+        got=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}')
+        [[ "$got" == "$sha256" ]] && return 0
+    done
+    return 1
+}
+
+# Forum-topic webhook update carrying message_thread_id (models send_message at
+# the top of this file, plus the forum-topic `message_thread_id` field + an
+# `is_topic_message` flag). Optional <message_id> pins the message id (default
+# random) so reaction-arc assertions can target it.
+send_topic_message() {
+    local chat_id="$1"
+    local thread_id="$2"
+    local text="$3"
+    local message_id="${4:-$((RANDOM))}"
+    local update_id=$((RANDOM))
+
+    curl -s -X POST "http://localhost:$PORT" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "update_id": '"$update_id"',
+            "message": {
+                "message_id": '"$message_id"',
+                "message_thread_id": '"$thread_id"',
+                "is_topic_message": true,
+                "from": {"id": '"$chat_id"', "first_name": "TestUser"},
+                "chat": {"id": '"$chat_id"', "type": "supergroup", "is_forum": true},
+                "date": '"$(date +%s)"',
+                "text": "'"$text"'"
             }
         }'
 }
@@ -2525,6 +2766,7 @@ import sys, os, json, tempfile
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch, MagicMock
 import bridge
+bridge.STT_ENDPOINT = 'http://stt.test/transcribe'  # endpoint now defaults to '' (5b); set it so transcribe_voice doesn't fail-open
 
 # Create a temp file to simulate audio
 tmp = tempfile.NamedTemporaryFile(suffix='.ogg', delete=False)
@@ -2554,18 +2796,24 @@ finally:
 test_transcribe_voice_timeout_returns_none() {
     info "Testing transcribe_voice returns None on timeout..."
     if python3 -c "
-import sys, os
+import sys, os, tempfile
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch
-import urllib.error
 import bridge
+bridge.STT_ENDPOINT = 'http://stt.test/transcribe'  # endpoint defaults to '' (5b); set it so we reach the timeout path
 
-# Simulate timeout
-with patch('urllib.request.urlopen', side_effect=Exception('timeout')):
-    result = bridge.transcribe_voice('/tmp/test.ogg')
-
-assert result is None, f'Expected None, got {result!r}'
-print('OK')
+# A real audio file is required, or transcribe_voice returns on the missing-file
+# early-return BEFORE urlopen — a false-green that never tests the timeout path.
+tmp = tempfile.NamedTemporaryFile(suffix='.ogg', delete=False)
+tmp.write(b'fake audio data'); tmp.close()
+try:
+    with patch('urllib.request.urlopen', side_effect=Exception('timeout')) as mock_url:
+        result = bridge.transcribe_voice(tmp.name)
+    mock_url.assert_called_once()  # prove we actually reached the network call
+    assert result is None, f'Expected None, got {result!r}'
+    print('OK')
+finally:
+    os.unlink(tmp.name)
 " 2>/dev/null | grep -q "OK"; then
         success "transcribe_voice returns None on timeout"
     else
@@ -2576,21 +2824,29 @@ print('OK')
 test_transcribe_voice_bad_json_returns_none() {
     info "Testing transcribe_voice returns None on bad JSON..."
     if python3 -c "
-import sys, os
+import sys, os, tempfile
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch, MagicMock
 import bridge
+bridge.STT_ENDPOINT = 'http://stt.test/transcribe'  # endpoint defaults to '' (5b); set it so we reach the bad-JSON path
 
 mock_response = MagicMock()
 mock_response.read.return_value = b'not json'
 mock_response.__enter__ = lambda s: s
 mock_response.__exit__ = MagicMock(return_value=False)
 
-with patch('urllib.request.urlopen', return_value=mock_response):
-    result = bridge.transcribe_voice('/tmp/test.ogg')
-
-assert result is None, f'Expected None, got {result!r}'
-print('OK')
+# Real file required, or transcribe_voice returns on the missing-file early-return
+# BEFORE urlopen — a false-green that never tests JSON-parse failure.
+tmp = tempfile.NamedTemporaryFile(suffix='.ogg', delete=False)
+tmp.write(b'fake audio data'); tmp.close()
+try:
+    with patch('urllib.request.urlopen', return_value=mock_response) as mock_url:
+        result = bridge.transcribe_voice(tmp.name)
+    mock_url.assert_called_once()  # prove we actually reached the JSON-parse path
+    assert result is None, f'Expected None, got {result!r}'
+    print('OK')
+finally:
+    os.unlink(tmp.name)
 " 2>/dev/null | grep -q "OK"; then
         success "transcribe_voice returns None on bad JSON"
     else
@@ -2666,6 +2922,7 @@ import sys, os, tempfile
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch, MagicMock
 import bridge
+bridge.TTS_ENDPOINT = 'http://tts.test/synthesize'  # endpoint now defaults to '' (5b); set it so synthesize_speech doesn't fail-open
 
 # Mock urllib to return audio bytes
 mock_response = MagicMock()
@@ -2702,6 +2959,7 @@ import sys, os
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch
 import bridge
+bridge.TTS_ENDPOINT = 'http://tts.test/synthesize'  # endpoint now defaults to '' (5b); set it so we test the timeout path, not the fail-open
 
 with patch('urllib.request.urlopen', side_effect=Exception('timeout')):
     result = bridge.synthesize_speech('Hello world')
@@ -2722,6 +2980,7 @@ import sys, os, tempfile
 sys.path.insert(0, os.getcwd())
 from unittest.mock import patch, MagicMock, call
 import bridge
+bridge.TTS_ENDPOINT = 'http://tts.test/synthesize'  # endpoint now defaults to '' (5b); chunked routing needs a '/synthesize' base
 
 # Save original
 orig_threshold = bridge.TTS_CHUNKED_THRESHOLD
@@ -2769,6 +3028,7 @@ import bridge
 bridge.BOT_TOKEN = 'fake'
 bridge.admin_chat_id = 12345
 bridge.state['tts_enabled'] = True  # enable auto-TTS gate (defaults off)
+bridge.TTS_ENDPOINT = 'http://127.0.0.1:1/synthesize'  # endpoint now defaults to '' (5b); set it so the gate's endpoint check passes
 
 voice_sent = []
 text_sent = []
@@ -2843,6 +3103,55 @@ print('OK')
     fi
 }
 
+# v1.3.5 Task 5b — voice endpoints must default to empty (no hardcoded private IP).
+test_stt_tts_endpoints_default_empty() {
+    info "Testing STT/TTS endpoints default to empty (no hardcoded private IP)..."
+    if env -u STT_ENDPOINT -u TTS_ENDPOINT TELEGRAM_BOT_TOKEN=dummy \
+        python3 -c 'import sys, os; sys.path.insert(0, os.getcwd()); import bridge; sys.exit(0 if bridge.STT_ENDPOINT == "" and bridge.TTS_ENDPOINT == "" else 1)' 2>/dev/null; then
+        success "STT/TTS endpoints default to empty string (voice off by default)"
+    else
+        fail "STT/TTS endpoints do not default to empty (hardcoded IP still present?)"
+    fi
+}
+
+# v1.3.5 Task 5c — auto-TTS stays OFF when the tts_enabled key is absent, i.e. the
+# read default must agree with DEFAULT_STATE (False), not the stale True.
+test_auto_tts_off_when_key_absent() {
+    info "Testing auto-TTS stays OFF when the tts_enabled key is absent from state..."
+    if python3 -c "
+import sys, os, time
+sys.path.insert(0, os.getcwd())
+from unittest.mock import patch
+import bridge
+
+bridge.BOT_TOKEN = 'fake'
+bridge.admin_chat_id = 12345
+# Force the endpoint check to pass so the ONLY remaining gate is the tts_enabled
+# lookup (after 5b the default endpoint is '', which would otherwise mask this
+# test by short-circuiting 'TTS_ENDPOINT and ...').
+bridge.TTS_ENDPOINT = 'http://127.0.0.1:1/synthesize'
+# The contradiction under test: DEFAULT_STATE has tts_enabled=False, but the read
+# defaulted to True. Remove the key so the read's default alone decides.
+bridge.state.pop('tts_enabled', None)
+
+def mock_telegram_api(method, data):
+    return {'ok': True, 'result': {'message_id': 1}}
+
+with patch.object(bridge, 'send_voice', return_value=True), \
+     patch.object(bridge, 'telegram_api', side_effect=mock_telegram_api), \
+     patch.object(bridge, 'synthesize_speech', return_value='/tmp/voice.ogg') as mock_tts:
+    bridge.send_response_to_telegram('testworker', 'A plain answer.', 12345)
+    time.sleep(0.3)
+
+assert not mock_tts.called, 'auto-TTS fired with tts_enabled key absent (read default != DEFAULT_STATE)'
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "Auto-TTS off when tts_enabled key absent (read default aligns with DEFAULT_STATE)"
+    else
+        fail "Auto-TTS fired with tts_enabled key absent (default contradiction)"
+    fi
+}
+
 test_auto_tts_skips_long_messages() {
     info "Testing auto-TTS skips messages >1000 chars and splits paragraphs..."
     if python3 -c "
@@ -2854,6 +3163,7 @@ import bridge
 bridge.BOT_TOKEN = 'fake'
 bridge.admin_chat_id = 12345
 bridge.state['tts_enabled'] = True
+bridge.TTS_ENDPOINT = 'http://127.0.0.1:1/synthesize'  # endpoint now defaults to '' (5b); set it so the gate's endpoint check passes
 
 tts_calls = []
 
@@ -2942,6 +3252,7 @@ import bridge
 
 bridge.BOT_TOKEN = 'fake'
 bridge.admin_chat_id = 12345
+bridge.TTS_ENDPOINT = 'http://127.0.0.1:1/synthesize'  # endpoint now defaults to '' (5b); set it so the re-enable half can fire
 bridge.state['tts_enabled'] = True
 
 # Test /voice off disables TTS
@@ -5153,14 +5464,31 @@ test_bridge_starts() {
         printf '{"workers":{}}' > "$wjson" 2>/dev/null || true
     fi
 
+    # Bridge launch env. Defaults preserve legacy behaviour exactly (real
+    # TEST_BOT_TOKEN, ADMIN_CHAT_ID = TEST_CHAT_ID, and NO TELEGRAM_API_BASE in
+    # the env so bridge.py keeps its real api.telegram.org default). When the
+    # Mock-Telegram harness is active (start_mock_telegram ran first) we redirect
+    # the wire to the mock, force a NON-EMPTY dummy token (so `if not BOT_TOKEN`
+    # early-returns in media/file paths don't skip), and pin a concrete
+    # ADMIN_CHAT_ID so the admin gate is deterministic. All stay env-overridable.
+    local launch_token="$TEST_BOT_TOKEN"
+    local launch_admin="${TEST_CHAT_ID:-}"
+    local -a launch_env=()
+    if [[ "$MOCK_TG_ACTIVE" == "1" ]]; then
+        launch_token="${MOCK_BOT_TOKEN:-${TEST_BOT_TOKEN:-mock-token}}"
+        launch_admin="${MOCK_ADMIN_CHAT_ID:-$CHAT_ID}"
+        launch_env+=("TELEGRAM_API_BASE=${TELEGRAM_API_BASE:-http://127.0.0.1:$MOCKPORT}")
+    fi
+
     # Start bridge with test node isolation
-    TELEGRAM_BOT_TOKEN="$TEST_BOT_TOKEN" \
+    TELEGRAM_BOT_TOKEN="$launch_token" \
     PORT="$PORT" \
     NODE_NAME="$TEST_NODE" \
     SESSIONS_DIR="$TEST_SESSION_DIR" \
     TMUX_PREFIX="$TEST_TMUX_PREFIX" \
-    ADMIN_CHAT_ID="${TEST_CHAT_ID:-}" \
+    ADMIN_CHAT_ID="$launch_admin" \
     TEAM_DIR="$TEST_TEAM_DIR" \
+    env "${launch_env[@]}" \
     python3 -u "$SCRIPT_DIR/bridge.py" > "$BRIDGE_LOG" 2>&1 &
     BRIDGE_PID=$!
     echo "$BRIDGE_PID" > "$TEST_NODE_DIR/bridge.pid"
@@ -5423,6 +5751,16 @@ test_document_message_routing() {
 test_incoming_document_e2e() {
     info "Testing incoming document e2e (upload -> webhook -> download)..."
 
+    # In DEFAULT/e2e mode the bridge points at the recording mock (MOCK_TG_ACTIVE=1),
+    # so a real-Telegram upload->getFile->download round-trip cannot complete (the
+    # mock doesn't hold the real file). The deterministic SEAM-07 mock test
+    # (test_mock_incoming_document_downloads_to_inbox) covers the incoming
+    # getFile+download path at the wire, so skip this real-Telegram variant.
+    if [[ "${MOCK_TG_ACTIVE:-}" == "1" ]]; then
+        info "Skipping: superseded by the SEAM-07 mock test (bridge is on the mock)"
+        return 0
+    fi
+
     # This test requires a real TEST_CHAT_ID to upload documents to Telegram
     if [[ "${TEST_CHAT_ID:-}" == "" ]] || [[ "$CHAT_ID" == "123456789" ]]; then
         info "Skipping (requires TEST_CHAT_ID for real Telegram upload)"
@@ -5516,6 +5854,17 @@ test_incoming_document_e2e() {
 
 test_incoming_image_e2e() {
     info "Testing incoming image e2e (upload -> webhook -> download)..."
+
+    # In DEFAULT/e2e mode the bridge points at the recording mock (MOCK_TG_ACTIVE=1),
+    # so a real-Telegram upload->getFile->download round-trip cannot complete. The
+    # incoming getFile+download path is identical to the document case and is
+    # covered deterministically at the wire by the SEAM-07 mock test, so skip this
+    # real-Telegram variant. (Coverage note: a mock incoming-IMAGE test is a Task-8
+    # gap-filler candidate; the download mechanism itself is already exercised.)
+    if [[ "${MOCK_TG_ACTIVE:-}" == "1" ]]; then
+        info "Skipping: superseded by the SEAM-07 mock test (bridge is on the mock)"
+        return 0
+    fi
 
     # This test requires a real TEST_CHAT_ID to upload images to Telegram
     if [[ "${TEST_CHAT_ID:-}" == "" ]] || [[ "$CHAT_ID" == "123456789" ]]; then
@@ -11632,6 +11981,457 @@ test_restart_node_env_propagation() {
     rm -rf "$tmphome"
 }
 
+# Guards the 07:47 silent-death regression: cmd_run MUST launch the bridge
+# setsid-detached (so a closing terminal/session can never SIGHUP it), capture
+# the real detached pid (not $! of the setsid wrapper), and must NOT kill that
+# detached bridge on an unintended teardown — only on an intentional stop.
+test_cmd_run_launches_bridge_detached() {
+    log "Test: cmd_run launches the bridge setsid-detached (07:47 silent-death guard)"
+    local script="$SCRIPT_DIR/claudecode-telegram.sh"
+    local body
+    body=$(awk '/^cmd_run\(\)/{f=1} f{print} f&&/^}$/{exit}' "$script")
+
+    # 1. Bridge launched fully detached (</dev/null), portably: setsid on Linux
+    #    with a nohup fallback for macOS (which has no setsid). Match the COMMAND
+    #    shapes ('setsid bash -c' / 'nohup bash -c' / 'echo \$\$ >'), not bare words
+    #    — bare 'setsid'/'nohup' also appear in the comments and would false-pass.
+    if grep -qF 'setsid bash -c' <<<"$body" && grep -qF 'nohup bash -c' <<<"$body" \
+        && grep -qF '</dev/null' <<<"$body" && grep -qF 'echo \$\$ >' <<<"$body"; then
+        success "cmd_run detaches the bridge portably (setsid/nohup bash -c + </dev/null + child records own pid)"
+    else
+        fail "cmd_run launch is not portably detached (need setsid bash -c + nohup fallback + </dev/null + echo \$\$) — 07:47 silent-death / macOS risk"
+    fi
+
+    # 2. Real pid comes from the detached child, not \$! (which is the setsid wrapper):
+    #    no 'bridge_pid=\$!', and a readback loop that cat's bridge.pid + kill -0 checks it.
+    if grep -qE 'bridge_pid=\$!' <<<"$body"; then
+        fail "cmd_run captures \$! (the setsid wrapper), not the real detached bridge pid"
+    elif grep -qF 'cat "$node_dir/bridge.pid"' <<<"$body" && grep -qF 'kill -0 "$bridge_pid"' <<<"$body"; then
+        success "cmd_run reads the real bridge pid back from bridge.pid (no reliance on \$!)"
+    else
+        fail "cmd_run has no pid-readback loop — \$! is the setsid wrapper, not the bridge pid"
+    fi
+
+    # 3. Cleanup must guard the bridge kill behind an intentional-stop flag, so a
+    #    closing terminal (HUP -> EXIT trap) does not take the detached bridge down.
+    local cleanup_body
+    cleanup_body=$(awk '/cleanup_and_exit\(\)/{f=1} f{print} f&&/^    }$/{exit}' "$script")
+    if grep -qE '_intentional_stop|intentional' <<<"$cleanup_body"; then
+        success "cleanup guards the bridge kill behind an intentional-stop flag"
+    else
+        fail "cleanup kills the bridge unconditionally — a HUP would take the detached bridge down too"
+    fi
+}
+
+# Fail-loudly guard (e310008): when the watchdog detects the detached bridge has
+# died, the supervisor's cleanup MUST exit non-zero — a dead bridge is a failure,
+# not a clean stop (so systemd/CI/`&&` chains can see it). An intentional stop
+# (Ctrl+C) and a bare host teardown (supervisor exits, leaves the bridge running)
+# must still exit 0. This runs the REAL cleanup_and_exit body in isolation with
+# stubbed deps, so it asserts the actual exit code — behavior, not source text.
+test_bridge_death_exits_nonzero() {
+    log "Test: bridge-death cleanup exits non-zero (fail-loudly); intentional/teardown exit 0"
+    local script="$SCRIPT_DIR/claudecode-telegram.sh"
+    local fn
+    fn=$(awk '/cleanup_and_exit\(\)/{f=1} f{print} f&&/^    }$/{exit}' "$script")
+    if [[ -z "$fn" ]]; then
+        fail "could not extract cleanup_and_exit from $script"
+        return
+    fi
+
+    # $1 = _intentional_stop, $2 = _bridge_dead -> echoes the real exit code.
+    _run_cleanup() {
+        local tmp; tmp="$(mktemp)"
+        {
+            printf '%s\n' 'set +e'
+            printf '%s\n' 'stop_poll_fallback() { :; }'
+            printf '%s\n' 'log() { :; }'
+            printf '%s\n' 'node="t"; tunnel_pid=""; bridge_pid=""; node_dir=""; pid_file=""'
+            printf '%s\n' "_intentional_stop=$1; _bridge_dead=$2"
+            printf '%s\n' "$fn"
+            printf '%s\n' 'cleanup_and_exit'
+        } > "$tmp"
+        bash "$tmp" >/dev/null 2>&1
+        local rc=$?
+        rm -f "$tmp"
+        echo "$rc"
+    }
+
+    local rc_dead rc_intentional rc_teardown
+    rc_dead=$(_run_cleanup 0 1)
+    rc_intentional=$(_run_cleanup 1 0)
+    rc_teardown=$(_run_cleanup 0 0)
+    unset -f _run_cleanup
+
+    if [[ "$rc_dead" -ne 0 ]]; then
+        success "bridge-death cleanup exits non-zero ($rc_dead) — fail-loudly"
+    else
+        fail "bridge-death cleanup exits 0 — a dead bridge is silently reported as success"
+    fi
+    if [[ "$rc_intentional" -eq 0 ]]; then
+        success "intentional-stop cleanup exits 0 (Ctrl+C is a clean stop)"
+    else
+        fail "intentional-stop cleanup exits non-zero ($rc_intentional) — Ctrl+C should be clean"
+    fi
+    if [[ "$rc_teardown" -eq 0 ]]; then
+        success "host-teardown cleanup exits 0 (leaving the bridge running is not a failure)"
+    else
+        fail "host-teardown cleanup exits non-zero ($rc_teardown) — leaving the bridge running is not a failure"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.3.5 Task 6 — PR review cross-repo cache + body-trusted owner/repo (C8)
+# ─────────────────────────────────────────────────────────────────────────────
+
+test_pr_cache_keyed_by_owner_repo_num() {
+    info "Testing PR review cache path is keyed by owner/repo/pr_num (no cross-repo collision)..."
+
+    if python3 -c "
+import io, os
+from urllib.parse import urlparse
+import bridge
+
+calls = []
+def fake_run(cmd, *a, **k):
+    out = None
+    if '--out' in cmd:
+        out = cmd[cmd.index('--out') + 1]
+    calls.append({'cmd': list(cmd), 'out': out})
+    if out:
+        with open(out, 'w') as f:
+            f.write('CONTENT-FOR ' + out)
+    class R: pass
+    r = R(); r.returncode = 0; r.stdout = ''; r.stderr = ''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.admin_chat_id = None
+bridge.BRIDGE_PUBLIC_URL = ''
+bridge.PR_REVIEW_TOKENS.clear()
+
+class FakeHandler:
+    def __init__(self):
+        self.status=None; self.headers={}; self.wfile=io.BytesIO(); self.replies=[]
+    def reply(self, chat_id, text, **kw): self.replies.append(text)
+    def send_response(self, c): self.status=c
+    def send_header(self, k, v): self.headers[k]=v
+    def end_headers(self): pass
+    def _send_html(self, data): self.status=200; self.wfile.write(data)
+
+written = []
+try:
+    h1 = FakeHandler()
+    bridge.CommandRouter.cmd_pr_review(h1, 'https://github.com/alpha/repoA/pull/5', 1)
+    h2 = FakeHandler()
+    bridge.CommandRouter.cmd_pr_review(h2, 'https://github.com/beta/repoB/pull/5', 1)
+    for c in calls:
+        if c['out']: written.append(c['out'])
+
+    assert calls[0]['out'] is not None, 'first /pr did not pass --out: ' + str(calls[0]['cmd'])
+    assert calls[1]['out'] is not None, 'second /pr did not pass --out: ' + str(calls[1]['cmd'])
+    assert calls[0]['out'] != calls[1]['out'], 'cross-repo cache collision (same path for two repos): ' + calls[0]['out']
+    assert 'alpha' in calls[0]['out'] and 'repoA' in calls[0]['out'], 'cache path missing owner/repo: ' + calls[0]['out']
+    # injectivity: legal owner/repo names must not alias through the '-' separator
+    assert bridge._pr_cache_path('alpha', 'repo-A', 5) != bridge._pr_cache_path('alpha-repo', 'A', 5), \
+        'legal owner/repo names still collide through hyphen separator'
+
+    tokens = list(bridge.PR_REVIEW_TOKENS.keys())
+    assert len(tokens) == 2, 'expected 2 tokens, got ' + str(len(tokens))
+    served = []
+    for tok in tokens:
+        hh = FakeHandler()
+        bridge.Handler.handle_pr_review_endpoint(hh, urlparse('/pr-review/5?token=' + tok))
+        served.append(hh.wfile.getvalue().decode('utf-8', 'replace'))
+    assert served[0] != served[1], 'endpoint served identical content for two repos (cache collision at serve time)'
+
+    # path-traversal: malicious owner/repo must be sanitized to a flat /tmp filename
+    p = bridge._pr_cache_path('ev/il', 'ot/../her', 9)
+    assert p.startswith('/tmp/pr-review-'), 'unexpected cache path: ' + p
+    assert '/' not in p[len('/tmp/'):], 'unsanitized slash in cache filename: ' + p
+
+    print('OK')
+finally:
+    for p in set(written):
+        try: os.remove(p)
+        except OSError: pass
+" 2>/dev/null | grep -q "OK"; then
+        success "PR review cache keyed by owner/repo/pr_num (no collision)"
+    else
+        fail "PR review cache collides across repos with same PR number"
+    fi
+}
+
+test_pr_comment_uses_token_owner_repo_not_body() {
+    info "Testing /pr-comment derives owner/repo from token, not request body..."
+
+    if python3 -c "
+import io, json, time
+import bridge
+import urllib.request as _ur
+_ur.urlopen = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('blocked'))
+
+calls = []
+def fake_run(cmd, *a, **k):
+    calls.append(list(cmd))
+    class R: pass
+    r=R(); r.returncode=0; r.stdout=''; r.stderr=''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.admin_chat_id = None
+bridge.PR_REVIEW_TOKENS.clear()
+tok = 'TESTTOKEN'
+bridge.PR_REVIEW_TOKENS[tok] = {'pr_num': 5, 'owner': 'realowner', 'repo': 'realrepo', 'expires_at': time.time()+300}
+
+class FakeHandler:
+    def __init__(self): self.status=None; self.headers={}; self.wfile=io.BytesIO()
+    def send_response(self,c): self.status=c
+    def send_header(self,k,v): self.headers[k]=v
+    def end_headers(self): pass
+
+body = json.dumps({'token': tok, 'owner': 'evil', 'repo': 'other', 'pr_num': 999,
+                   'path': 'src/x.py', 'line': 10, 'side': 'RIGHT',
+                   'body': 'looks good', 'head_sha': 'abc123'}).encode()
+h = FakeHandler()
+bridge.Handler.handle_pr_comment(h, body)
+assert h.status == 200, 'status=' + str(h.status)
+assert calls, 'no gh api call made'
+api_path = calls[0][2]
+assert api_path == 'repos/realowner/realrepo/pulls/5/comments', 'wrong repo target: ' + api_path
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/pr-comment uses token owner/repo (ignores body claim)"
+    else
+        fail "/pr-comment trusts body owner/repo (wrong-repo gh action)"
+    fi
+}
+
+test_pr_merge_uses_token_owner_repo_not_body() {
+    info "Testing /pr-merge derives owner/repo from token, not request body..."
+
+    if python3 -c "
+import io, json, time
+import bridge
+import urllib.request as _ur
+_ur.urlopen = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('blocked'))
+
+calls = []
+def fake_run(cmd, *a, **k):
+    calls.append(list(cmd))
+    class R: pass
+    r=R(); r.returncode=0; r.stdout=''; r.stderr=''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.admin_chat_id = None
+bridge.PR_REVIEW_TOKENS.clear()
+tok = 'TESTTOKEN'
+bridge.PR_REVIEW_TOKENS[tok] = {'pr_num': 5, 'owner': 'realowner', 'repo': 'realrepo', 'expires_at': time.time()+300}
+
+class FakeHandler:
+    def __init__(self): self.status=None; self.headers={}; self.wfile=io.BytesIO()
+    def send_response(self,c): self.status=c
+    def send_header(self,k,v): self.headers[k]=v
+    def end_headers(self): pass
+
+body = json.dumps({'token': tok, 'owner': 'evil', 'repo': 'other', 'pr_num': 999,
+                   'merge_method': 'squash'}).encode()
+h = FakeHandler()
+bridge.Handler.handle_pr_merge(h, body)
+assert h.status == 200, 'status=' + str(h.status)
+assert calls, 'no gh api call made'
+api_path = calls[0][2]
+assert api_path == 'repos/realowner/realrepo/pulls/5/merge', 'wrong repo target: ' + api_path
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/pr-merge uses token owner/repo (ignores body claim)"
+    else
+        fail "/pr-merge trusts body owner/repo (wrong-repo gh action)"
+    fi
+}
+
+test_pr_general_comment_uses_token_owner_repo_not_body() {
+    info "Testing /pr-general-comment derives owner/repo from token, not request body..."
+
+    if python3 -c "
+import io, json, time
+import bridge
+import urllib.request as _ur
+_ur.urlopen = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('blocked'))
+
+calls = []
+def fake_run(cmd, *a, **k):
+    calls.append(list(cmd))
+    class R: pass
+    r=R(); r.returncode=0; r.stdout=''; r.stderr=''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.admin_chat_id = None
+bridge.PR_REVIEW_TOKENS.clear()
+tok = 'TESTTOKEN'
+bridge.PR_REVIEW_TOKENS[tok] = {'pr_num': 5, 'owner': 'realowner', 'repo': 'realrepo', 'expires_at': time.time()+300}
+
+class FakeHandler:
+    def __init__(self): self.status=None; self.headers={}; self.wfile=io.BytesIO()
+    def send_response(self,c): self.status=c
+    def send_header(self,k,v): self.headers[k]=v
+    def end_headers(self): pass
+
+body = json.dumps({'token': tok, 'owner': 'evil', 'repo': 'other', 'pr_num': 999,
+                   'body': 'general comment'}).encode()
+h = FakeHandler()
+bridge.Handler.handle_pr_general_comment(h, body)
+assert h.status == 200, 'status=' + str(h.status)
+assert calls, 'no gh api call made'
+api_path = calls[0][2]
+assert api_path == 'repos/realowner/realrepo/issues/5/comments', 'wrong repo target: ' + api_path
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/pr-general-comment uses token owner/repo (ignores body claim)"
+    else
+        fail "/pr-general-comment trusts body owner/repo (wrong-repo gh action)"
+    fi
+}
+
+test_pr_file_content_uses_token_owner_repo_not_query() {
+    info "Testing /pr-file-content derives owner/repo from token, not query string..."
+
+    if python3 -c "
+import io, time, base64
+from urllib.parse import urlparse
+import bridge
+
+calls = []
+def fake_run(cmd, *a, **k):
+    calls.append(list(cmd))
+    class R: pass
+    r=R(); r.returncode=0
+    r.stdout = base64.b64encode(b'line1\nline2').decode()
+    r.stderr=''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.PR_REVIEW_TOKENS.clear()
+tok = 'TESTTOKEN'
+bridge.PR_REVIEW_TOKENS[tok] = {'pr_num': 5, 'owner': 'realowner', 'repo': 'realrepo', 'expires_at': time.time()+300}
+
+class FakeHandler:
+    def __init__(self): self.status=None; self.headers={}; self.wfile=io.BytesIO()
+    def send_response(self,c): self.status=c
+    def send_header(self,k,v): self.headers[k]=v
+    def end_headers(self): pass
+
+parsed = urlparse('/pr-file-content?token=' + tok + '&owner=evil&repo=other&path=src/x.py&ref=abc123')
+h = FakeHandler()
+bridge.Handler.handle_pr_file_content(h, parsed)
+assert h.status == 200, 'status=' + str(h.status)
+assert calls, 'no gh api call made'
+api_path = calls[0][2]
+assert api_path.startswith('repos/realowner/realrepo/contents/'), 'wrong repo target: ' + api_path
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/pr-file-content uses token owner/repo (ignores query claim)"
+    else
+        fail "/pr-file-content trusts query owner/repo (cross-repo file read)"
+    fi
+}
+
+test_pr_review_cli_honors_out_flag() {
+    info "Testing pr-review.py main() honors --out and accepts --no-serve (argparse executes for real)..."
+
+    if python3 -c "
+import importlib.util, os, sys, tempfile
+
+# isolate the sqlite cache so we never touch the real /tmp/pr-review-cache.db
+os.environ['PR_CACHE_DB'] = tempfile.mktemp(suffix='.db')
+spec = importlib.util.spec_from_file_location('pr_review_mod', 'pr-review.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+# stub out all network: fetch returns the 6-tuple main() unpacks; html is a sentinel
+mod.fetch_pr_cached = lambda *a, **k: ({}, [], [], [], [], {})
+mod.generate_html = lambda *a, **k: '<html>SENTINEL-OUT-FLAG</html>'
+
+out = tempfile.mktemp(suffix='.html')
+default_path = '/tmp/pr-review-5.html'
+had_default = os.path.exists(default_path)
+try:
+    # exactly the argv bridge.py builds: positional URL + --no-serve + --out
+    sys.argv = ['pr-review.py', 'https://github.com/o/r/pull/5', '--no-serve', '--out', out]
+    mod.main()
+    assert os.path.exists(out), 'main() did not write to the --out path (flag ignored?)'
+    assert 'SENTINEL-OUT-FLAG' in open(out).read(), 'wrong content written to --out path'
+    print('OK')
+finally:
+    for p in (out, os.environ['PR_CACHE_DB']):
+        try: os.remove(p)
+        except OSError: pass
+    # only clean the default path if WE created it (do not clobber a real cache)
+    if not had_default:
+        try: os.remove(default_path)
+        except OSError: pass
+" 2>/dev/null | grep -q "OK"; then
+        success "pr-review.py main() honors --out and accepts --no-serve"
+    else
+        fail "pr-review.py --out/--no-serve not honored by argparse"
+    fi
+}
+
+test_pr_comment_does_not_route_to_session() {
+    info "Testing PR-review comments never route @mentions into a session (topic-only model)..."
+
+    if python3 -c "
+import io, json, time
+import bridge
+import urllib.request as _ur
+_ur.urlopen = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('blocked'))
+
+# A command_router stub that WOULD yield a worker target — proves the handlers do
+# not act on it (pre-fix they routed to it; post-fix they ignore @mentions entirely).
+class _Router:
+    def parse_at_mentions(self, text):
+        return (['t123'], text)
+bridge.command_router = _Router()
+
+sent = []
+bridge.send_to_session = lambda name, msg, *a, **k: (sent.append(name), True)[1]
+
+def fake_run(cmd, *a, **k):
+    class R: pass
+    r=R(); r.returncode=0; r.stdout=''; r.stderr=''
+    return r
+bridge.subprocess.run = fake_run
+bridge.tmux_exists = lambda *a: False
+bridge.admin_chat_id = None   # skip transport.send_text in handle_pr_comment
+bridge.PR_REVIEW_TOKENS.clear()
+tok = 'TESTTOKEN'
+bridge.PR_REVIEW_TOKENS[tok] = {'pr_num': 5, 'owner': 'o', 'repo': 'r', 'expires_at': time.time()+300}
+
+class FakeHandler:
+    def __init__(self): self.status=None; self.headers={}; self.wfile=io.BytesIO()
+    def send_response(self,c): self.status=c
+    def send_header(self,k,v): self.headers[k]=v
+    def end_headers(self): pass
+
+# General (non-inline) PR comment carrying an @mention.
+gbody = json.dumps({'token': tok, 'body': '@t123 please look at this'}).encode()
+bridge.Handler.handle_pr_general_comment(FakeHandler(), gbody)
+# Inline PR comment carrying an @mention.
+ibody = json.dumps({'token': tok, 'body': '@t123 fix here', 'path': 'src/x.py',
+                    'line': 10, 'side': 'RIGHT', 'head_sha': 'abc123'}).encode()
+bridge.Handler.handle_pr_comment(FakeHandler(), ibody)
+
+assert not sent, 'PR-review comment routed @mention into session(s): ' + str(sent)
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "PR-review comments do not route @mentions into a session"
+    else
+        fail "PR-review comment routed an @mention into a session (topic-only model violated)"
+    fi
+}
+
 # ============================================================
 # TEST RUNNERS
 # ============================================================
@@ -11739,6 +12539,11 @@ run_unit_tests() {
     run_test test_activity_detects_interactive_prompt
     run_test test_activity_detects_plan_approval
     run_test test_watchdog_waiting_input_state
+    # Unit tests - Launch / Detach hardening (v1.3.5 Task 5a)
+    log ""
+    log "── Launch / Detach Tests (Unit) ────────────────────────────────────────"
+    run_test test_cmd_run_launches_bridge_detached
+    run_test test_bridge_death_exits_nonzero
     # Unit tests - Bridge public URL
     log ""
     log "── Bridge Public URL Tests (Unit) ──────────────────────────────────────"
@@ -11852,6 +12657,9 @@ run_unit_tests() {
     run_test test_speak_tag_custom_text
     run_test test_auto_tts_skips_long_messages
     run_test test_auto_tts_failure_still_sends_text
+    # v1.3.5 Task 5b/5c — voice endpoint defaults + tts_enabled key-absent default
+    run_test test_stt_tts_endpoints_default_empty
+    run_test test_auto_tts_off_when_key_absent
     run_test test_voice_toggle_command
     # Unit tests - Transcript Viewer
     log ""
@@ -11875,6 +12683,16 @@ run_unit_tests() {
     run_test test_transcript_prompts_filter
     run_test test_transcript_dynamic_avatars
     run_test test_transcript_sidebar_stats
+    # Unit tests - PR Review security (v1.3.5 Task 6 / C8)
+    log ""
+    log "── PR Review Security Tests (Unit) ─────────────────────────────────────"
+    run_test test_pr_cache_keyed_by_owner_repo_num
+    run_test test_pr_comment_uses_token_owner_repo_not_body
+    run_test test_pr_merge_uses_token_owner_repo_not_body
+    run_test test_pr_general_comment_uses_token_owner_repo_not_body
+    run_test test_pr_file_content_uses_token_owner_repo_not_query
+    run_test test_pr_review_cli_honors_out_flag
+    run_test test_pr_comment_does_not_route_to_session
     # Unit tests - Transcript Index (transcript-index.py)
     log ""
     log "── Transcript Index Tests (Unit) ───────────────────────────────────────"
@@ -11937,6 +12755,120 @@ run_unit_tests() {
     run_test test_poll_forwarder_idempotent
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.3.5 Task 1 — set -e suite-killer regression tests (C3 / N1 / C6)
+#
+# Methodology note: a `set -e` arithmetic/`&&` abort only reproduces when errexit
+# is ARMED in a FRESH PROCESS. run_test dispatches each test as `testfn || fail`,
+# which SUSPENDS errexit for the whole test-function extent — and that suspension
+# propagates even into in-process `( )` AND `$( )` subshells, overriding an inner
+# `set -e`, so an in-process subshell can NEVER reproduce the abort (verified
+# empirically). Therefore C3/N1 drive a real CLI SUBPROCESS and C6 sources the
+# launcher in a separate `bash -c` PROCESS — each a fresh, fully-armed errexit,
+# fully isolated so the abort can never crash the harness.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Write claudecode-telegram.sh WITHOUT its final `main "$@"` line to a temp file
+# and echo the path, so a separate process can source its functions without
+# running main. Caller removes the temp file.
+launcher_lib_path() {
+    local _tmp; _tmp="$(mktemp)"
+    sed '/^main "\$@"$/d' "$SCRIPT_DIR/claudecode-telegram.sh" > "$_tmp"
+    echo "$_tmp"
+}
+
+test_stop_single_node_reaches_end_after_first_kill() {
+    local temp_home node nd mainpid bridgepid sess out ok has_tmux
+    has_tmux=0; command -v tmux >/dev/null 2>&1 && has_tmux=1
+    temp_home=$(mktemp -d)
+    node="stopt$$"
+    nd="$temp_home/.claude/telegram/nodes/$node"
+    mkdir -p "$nd"
+    sleep 300 & mainpid=$!
+    sleep 300 & bridgepid=$!
+    echo "$mainpid"   > "$nd/pid"
+    echo "$bridgepid" > "$nd/bridge.pid"
+    echo x > "$nd/port"; echo x > "$nd/bot_id"; echo x > "$nd/bot_username"
+    sess="claude-${node}-victim"
+    [[ "$has_tmux" -eq 1 ]] && tmux new-session -d -s "$sess" "/bin/sh -c 'sleep 300'" 2>/dev/null || true
+
+    # CLI subprocess: its own `set -e` is armed, so the buggy `((killed++))` aborts
+    # stop_single_node after the FIRST kill on the unpatched base.
+    out=$(HOME="$temp_home" CLAUDE_DIR="$temp_home/.claude" \
+          ./claudecode-telegram.sh --node "$node" stop 2>&1) || true
+
+    ok=1
+    # These two signals need NO tmux: on the unpatched base stop aborts at the
+    # first ((killed++)) — before the final marker rm and the "stopped" success.
+    if [[ -e "$nd/port" ]]; then ok=0; info "  port marker not removed (aborted before final rm)"; fi
+    if ! grep -q "stopped" <<<"$out"; then ok=0; info "  'Node ... stopped' line missing (aborted before function end)"; fi
+    # tmux-session reaping is an EXTRA signal, only checkable when tmux exists.
+    if [[ "$has_tmux" -eq 1 ]] && tmux has-session -t "$sess" 2>/dev/null; then ok=0; info "  tmux session survived (aborted before tmux-kill block)"; fi
+
+    kill "$mainpid" "$bridgepid" 2>/dev/null || true
+    wait "$mainpid" "$bridgepid" 2>/dev/null || true
+    [[ "$has_tmux" -eq 1 ]] && tmux kill-session -t "$sess" 2>/dev/null || true
+    rm -rf "$temp_home"
+
+    if [[ "$ok" -eq 1 ]]; then
+        success "stop_single_node reaches end after first kill (C3)"
+    else
+        fail "stop_single_node aborts mid-function after first kill (C3)"
+    fi
+}
+
+test_clean_removes_all_chat_id_files() {
+    local temp_home node sd out left
+    temp_home=$(mktemp -d)
+    node="cleant$$"
+    sd="$temp_home/.claude/telegram/nodes/$node/sessions"
+    mkdir -p "$sd/sessA" "$sd/sessB" "$sd/sessC"
+    echo 111 > "$sd/sessA/chat_id"
+    echo 222 > "$sd/sessB/chat_id"
+    echo 333 > "$sd/sessC/chat_id"
+
+    out=$(HOME="$temp_home" CLAUDE_DIR="$temp_home/.claude" \
+          ./claudecode-telegram.sh --node "$node" clean 2>&1) || true
+    left=$(find "$sd" -name chat_id 2>/dev/null | wc -l | tr -d ' ')
+    rm -rf "$temp_home"
+
+    if [[ "$left" -eq 0 ]] && grep -q "cleaned" <<<"$out"; then
+        success "clean removes all chat_id files (N1)"
+    else
+        fail "clean aborts after first chat_id removal (N1): $left chat_id file(s) left"
+    fi
+}
+
+test_webhook_failure_cleanup_removes_pidfiles() {
+    local d dp lib outf left reached
+    d=$(mktemp -d); lib=$(launcher_lib_path); outf=$(mktemp)
+    : > "$d/bridge.pid"; : > "$d/tunnel.pid"; : > "$d/pid"
+    # A numeric PID above any real pid_max → kill reliably fails with ESRCH, with
+    # no spawn/reap pid-reuse race. (Linux default pid_max is ~4.2M.)
+    dp=2147483647
+
+    # Separate bash process = fresh, fully-armed errexit (the parent test fn's
+    # errexit is suspended by run_test's `|| fail`). The launcher's own
+    # `set -euo pipefail` arms it; the buggy cleanup aborts on the failed kill
+    # BEFORE the rm, so REACHED_END is absent and the pid files survive.
+    bash -c '
+        source "$1"
+        node_dir="$2"; bridge_pid="$3"; tunnel_pid="$3"
+        _webhook_fail_cleanup
+        echo REACHED_END
+    ' _ "$lib" "$d" "$dp" >"$outf" 2>&1 || true
+
+    left=$(ls "$d"/bridge.pid "$d"/tunnel.pid "$d"/pid 2>/dev/null | wc -l | tr -d ' ')
+    reached=no; grep -q REACHED_END "$outf" && reached=yes
+    rm -rf "$d" "$lib" "$outf"
+
+    if [[ "$left" -eq 0 && "$reached" == "yes" ]]; then
+        success "webhook-fail cleanup removes pid files when kill fails (C6)"
+    else
+        fail "webhook-fail cleanup aborts before rm when kill fails (C6): $left pid file(s) left, reached=$reached"
+    fi
+}
+
 run_cli_tests() {
     # CLI tests (no bridge needed)
     log ""
@@ -11954,14 +12886,40 @@ run_cli_tests() {
     run_test test_cli_webhook_info
     run_test test_cli_webhook_commands
     run_test test_cli_hook_test_no_chat
+    # v1.3.5 Task 1 — set -e suite-killer regressions (C3 / N1 / C6)
+    log ""
+    log "── set -e suite-killer regression Tests ────────────────────────────────"
+    run_test test_stop_single_node_reaches_end_after_first_kill
+    run_test test_clean_removes_all_chat_id_files
+    run_test test_webhook_failure_cleanup_removes_pidfiles
 }
 
 run_integration_tests() {
     # Integration tests (bridge needed)
     log ""
     log "── Integration Tests ───────────────────────────────────────────────────"
+    # Start the recording Mock-Telegram server BEFORE the bridge so the bridge
+    # launch inherits TELEGRAM_API_BASE + MOCK_TG_ACTIVE (test_bridge_starts wires
+    # them into the launch env). This makes delivery/threading/reactions/media
+    # observable at the real wire boundary in DEFAULT mode (e2e-hardening).
+    if command -v start_mock_telegram >/dev/null 2>&1; then
+        start_mock_telegram || true
+    fi
     run_test test_bridge_starts || exit 1
     sleep 0.3
+
+    # Mock-Telegram DEFAULT-mode tests (SEAM-02/03/07/08/09/10 + new). They assert
+    # at the recorded wire boundary, never the bridge log. C4 FIX: run them ONLY
+    # when the mock is active AND the runner was sourced AND the bridge is actually
+    # LISTENING on $PORT — gating on MOCK_TG_ACTIVE alone fired them against a dead
+    # bridge and red the whole suite under TEST_FILTER. Skip loudly otherwise.
+    if [[ "${MOCK_TG_ACTIVE:-}" == "1" ]] && command -v run_mock_tests >/dev/null 2>&1; then
+        if wait_for_port "$PORT"; then
+            run_mock_tests
+        else
+            info "Skipping run_mock_tests: bridge not listening on port $PORT"
+        fi
+    fi
 
     # HTTP endpoint tests
     log ""
@@ -12062,6 +13020,20 @@ run_tunnel_tests() {
     run_full_tests
 }
 
+# Real-claude E2E runner (E2E=1). EMPTY stub so E2E=1 degrades gracefully when
+# tests/e2e_tests.sh is absent. The real run_e2e_tests + spawn_real_claude in
+# tests/e2e_tests.sh override this when that file is sourced (after main is
+# defined, before main "$@" runs). Loud skip when claude is unavailable.
+run_e2e_tests() {
+    log ""
+    log "── Real-Claude E2E Tests ───────────────────────────────────────────────"
+    if ! check_claude_available; then
+        info "Skipping E2E tests: claude CLI not available on PATH"
+        return 0
+    fi
+    :
+}
+
 main() {
     log ""
     log "═══════════════════════════════════════════════════════════════════════"
@@ -12074,6 +13046,9 @@ main() {
     if [[ "${FAST:-}" == "1" ]]; then
         mode="fast"
         mode_desc="FAST mode: Unit + CLI tests only (~10-15s)"
+    elif [[ "${E2E:-}" == "1" ]]; then
+        mode="e2e"
+        mode_desc="E2E mode: Unit + Integration + real-claude E2E tests (requires claude CLI)"
     elif [[ "${FULL:-}" == "1" ]]; then
         mode="full"
         mode_desc="FULL mode: All tests including tunnel (~5 min)"
@@ -12109,6 +13084,13 @@ main() {
         run_full_tests
     fi
 
+    # Real-claude E2E tests (gated behind E2E=1; runner sourced from e2e_tests.sh).
+    # X4: integration (incl. the mock suite) already ran above because mode != fast;
+    # this adds ONLY the real-claude seams — do NOT re-run integration here.
+    if [[ "$mode" == "e2e" ]]; then
+        run_e2e_tests
+    fi
+
     # Summary
     log ""
     log "═══════════════════════════════════════════════════════════════════════"
@@ -12118,5 +13100,15 @@ main() {
 
     [[ $failed -eq 0 ]] && exit 0 || exit 1
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wire in the e2e-hardening test files (sourced LAST, after every helper AND the
+# run_e2e_tests stub above, so e2e_tests.sh's run_e2e_tests + spawn_real_claude
+# override the stub and mock_tests.sh's run_mock_tests becomes available). Both
+# files are self-contained and never redefine test.sh's own helpers.
+# ─────────────────────────────────────────────────────────────────────────────
+for f in "$SCRIPT_DIR"/tests/mock_tests.sh "$SCRIPT_DIR"/tests/e2e_tests.sh; do
+    [[ -f "$f" ]] && source "$f"
+done
 
 main "$@"

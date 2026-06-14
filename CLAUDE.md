@@ -84,7 +84,8 @@ The project is **uv-managed**. `pyproject.toml` declares deps (`markdown-it-py` 
 | `hooks/on-tool-failure.sh` | PostToolUseFailure hook (POISONED detection) |
 | `team_memory/` | `/memory` stack + search (graceful, empty until an index is built) |
 | `pyproject.toml` / `uv.lock` | uv dependency + interpreter management, ruff config |
-| `test.sh` | Automated acceptance tests |
+| `test.sh` | Automated acceptance tests (sources `tests/mock_tests.sh` + `tests/e2e_tests.sh`) |
+| `tests/` | Mock-Telegram e2e harness (v1.3.5): `mock_telegram.py` (recording fake Bot API), `mock_tests.sh` (DEFAULT-mode seam tests via the `TELEGRAM_API_BASE` egress seam), `e2e_tests.sh` (`E2E=1` real-claude flow). `jq` required. |
 | `.claude/skills/bridge-ops/` | Node operations skill: `restart-node.sh` (PID-kill + setsid relaunch), `poll-forwarder.sh` (getUpdates delivery), `verify-node.sh` (health check), `check-versions.sh` (release gate). **Use these instead of hand-typed ops commands.** |
 | `.claude/skills/test-triage/` | test.sh failure triage skill: filtered repro → known-environmental list → worktree control experiment → instrumentation. **Use it before blaming any change for a red test.** |
 | `CLAUDE.md` | Project instructions + operational learnings (AGENTS.md symlink) |
@@ -98,6 +99,10 @@ Workflow rules:
 - Write tests alongside features; focus on e2e behavior (not scaffolding).
 - Treat tests as usage examples; prefer real Telegram flows (開話題 → 選資料夾 → send → reply) and keep them deterministic.
 - When adding tests, follow `TEST.md`.
+- For wire-level behavior (what actually reached Telegram), prefer the v1.3.5 mock harness:
+  point the bridge at `tests/mock_telegram.py` via the `TELEGRAM_API_BASE` seam and assert the
+  recorded `/_recorded` calls (`tests/mock_tests.sh`), not log lines. `run_mock_tests` self-gates
+  on `wait_for_port` (skips loudly if the bridge is down). `jq` is required.
 - See `TEST.md` for mode definitions, env vars, isolation details, inventories, and manual/CI instructions.
 
 ### TDD Workflow: Red-Green-Refactor

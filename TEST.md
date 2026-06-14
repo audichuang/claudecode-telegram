@@ -57,16 +57,38 @@ FAST=1 TEST_BOT_TOKEN='1234567890:TEST-dummy-token-for-unit-suite' ./test.sh
 - Everything in default mode, plus Cloudflare tunnel startup and Telegram webhook
   configuration.
 
+**Mock-Telegram harness (v1.3.5, DEFAULT mode):**
+- `tests/mock_tests.sh` (sourced into `test.sh`; `run_mock_tests`) drives the bridge
+  against `tests/mock_telegram.py`, a recording fake of the Telegram Bot API. The
+  bridge is pointed at it via the `TELEGRAM_API_BASE` env seam (prod is byte-identical
+  when the var is unset); `start_mock_telegram` sets `MOCK_TG_ACTIVE=1`,
+  `TELEGRAM_API_BASE=http://127.0.0.1:$MOCKPORT`. Assertions read the recorded SEND
+  wire calls (`/_recorded`), so they prove real `sendMessage`/`sendPhoto`/`sendAnimation`/
+  `sendDocument`/`sendVoice` egress, not log lines. (`getFile` is a QUERY: the mock
+  handles the two-step file download but does NOT add it to `/_recorded` — media tests
+  assert the downloaded bytes landed in the inbox instead.) `run_mock_tests` self-gates
+  on `wait_for_port "$PORT"` — it SKIPS LOUDLY (never red) if the bridge isn't listening
+  (e.g. under `TEST_FILTER`).
+- **`jq` is a prerequisite** for the mock/e2e suites.
+
+**E2E mode (`E2E=1`, real Claude Code):**
+- `tests/e2e_tests.sh` drives the full forum-topic → folder-picker callback →
+  `create_session` → real claude turn → real Stop hook → `/response` path with a
+  dedicated bridge (pinned Stop-hook settings + `TOPIC_ROOT`). Self-skips when the
+  `claude` binary is absent. The DEFAULT-mode analog (no real claude, deterministic
+  fake-claude) is `test_topic_happy_path_real_pane_fakeclaude` in `mock_tests.sh`.
+
 ## Current Test Count
 
-As of v1.1.3:
+As of v1.3.5:
 
 | Scope | Count |
 |-------|-------|
-| Test functions defined in `test.sh` | 273 |
-| FAST invocations (`run_unit_tests` + `run_cli_tests`) | 230 |
-| Default invocations | 272 |
-| FULL invocations | 273, including `test_with_tunnel` |
+| Test functions defined in `test.sh` | 287 |
+| FAST invocations (`run_unit_tests` + `run_cli_tests`) | 244 |
+| Default invocations | + ~25 mock-harness tests from `tests/mock_tests.sh` |
+| FULL invocations | default + `test_with_tunnel` |
+| E2E (`E2E=1`) | 5 real-claude tests in `tests/e2e_tests.sh` (self-skip if no claude) |
 
 `test_workers_endpoint_removed` intentionally runs in both FAST and integration
 mode because it checks both pure routing behavior and the live bridge endpoint.

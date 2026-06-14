@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 1.1.2
+> Version: 1.3.5
 
 ## Current Philosophy (Summary)
 
@@ -292,6 +292,42 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.3.5 - Fusion: e2e mock-Telegram harness + launcher/voice/pr-review hardening
+
+**What:** Fuses the two divergent lineages onto the deep-cleaned topic-only `main`
+base — forward-porting v1.3.1's recording mock-Telegram e2e harness while keeping
+v1.0.0's pure topic-only model (no `/pilot`, connectors, or multi-backend). The
+`1.2.x`–`1.3.4` numbers are intentionally skipped (owner decision) to land at 1.3.5.
+
+Every change ships with a falsifiable (RED-before / GREEN-after) test.
+
+- **(Task 4) Mock-Telegram e2e harness** — a `TELEGRAM_API_BASE` egress seam (env-overridable,
+  prod byte-identical when unset) lets `tests/mock_telegram.py` record every wire call. New
+  DEFAULT-mode `tests/mock_tests.sh` (SEAM-02/03/07/08/09/10 + media: sendPhoto/sendAnimation/
+  document/voice) and an `E2E=1` real-claude suite `tests/e2e_tests.sh` (self-skips when claude
+  is absent). `jq` is now a test prerequisite.
+- **(Task 5a) Launcher hardening** — the bridge is launched setsid/nohup-detached with a child-pid
+  readback (PPID drifts to 1 so a closing terminal can't SIGHUP it — the 07:47 silent-death
+  lesson), and the EXIT trap is split so a dead bridge exits NON-ZERO (fail loudly) while an
+  intentional Ctrl+C / host teardown stays clean.
+- **(Task 5b/5c) Voice off by default** — `STT_ENDPOINT`/`TTS_ENDPOINT` default to empty (no
+  hardcoded private IP; voice OFF unless configured), and the auto-TTS gate's key-absent default
+  is `False`, aligned with `DEFAULT_STATE` (was a silently-divergent `True`).
+- **(Task 1) `set -e` suite-killers** — `((x++))` postfix increments that return 1 (aborting the
+  launcher under `set -euo pipefail`) became `((++x))`; webhook-failure cleanup kills are `|| true`
+  guarded; the `run_mock_tests` suite gates on `wait_for_port` so it skips loudly (never red)
+  against a dead bridge.
+- **(Task 6) C8 pr-review fix** — the per-PR HTML cache is keyed by owner/repo/pr_num with a
+  sha256 digest (two repos' PR #N no longer collide; `pr-review.py` gained `--out`), and the four
+  PR endpoints (comment/merge/general-comment/file-content) take owner/repo/pr_num from the
+  authoritative token, never the request body/query.
+- **(Task 8) Full happy-path e2e** — one DEFAULT-mode test walks 建話題→folder-pick→born→message
+  →reply with a LIVE pane and a deterministic fake-claude that replies through the REAL Stop hook.
+- **(PR-review routing) Topic-only** — the PR-comment handlers no longer parse `@mention`s to route
+  a reply into a Claude session; that was the last vestige of the deleted multi-worker addressing
+  model. PR comments are surfaced topic-only (regression: `test_pr_comment_does_not_route_to_session`).
+  `parse_at_mentions` is retained (defined + tested) but has no production caller.
 
 ### v1.1.3 - Test hardening wave 2 + in-place restart readiness gate
 
@@ -682,6 +718,11 @@ just forum groups.
 
 **New feature: optional voice mode for the bridge.**
 
+> **v1.3.5 update:** the endpoints and timeouts in this (historical) entry were the
+> ORIGINAL private-Mac-Mini defaults. As of v1.3.5, `STT_ENDPOINT`/`TTS_ENDPOINT`
+> default to EMPTY (voice OFF unless explicitly configured — no hardcoded private IP),
+> and `STT_TIMEOUT`/`TTS_TIMEOUT` default to 10s/60s. See the v1.3.5 changelog above.
+
 **STT (incoming voice → text):**
 - Manager voice messages are auto-transcribed via Cohere Transcribe API (Mac Mini :10110)
 - Transcript included in worker prompt: `Manager sent voice message (auto-transcribed, 5s): Transcript: ... Audio: /path`
@@ -695,10 +736,10 @@ just forum groups.
 - Fail-open — if TTS unavailable, text still sent normally
 
 **Configuration (env vars):**
-- `STT_ENDPOINT` — STT API URL (default: Cohere on Mac Mini)
-- `TTS_ENDPOINT` — TTS API URL (default: Qwen3 on Mac Mini)
+- `STT_ENDPOINT` — STT API URL (default: **empty** as of v1.3.5 — voice STT is OFF unless explicitly set; no hardcoded private IP. Pre-v1.3.5 this defaulted to a Cohere endpoint on a private Mac Mini.)
+- `TTS_ENDPOINT` — TTS API URL (default: **empty** as of v1.3.5 — voice TTS is OFF unless explicitly set. Pre-v1.3.5 this defaulted to a Qwen3 endpoint on a private Mac Mini.)
 - `TTS_VOICE` — voice preset (default: Serena)
-- `STT_TIMEOUT` / `TTS_TIMEOUT` — fail-open timeouts (5s / 30s)
+- `STT_TIMEOUT` / `TTS_TIMEOUT` — fail-open timeouts (10s / 60s as of v1.3.5; were 5s / 30s)
 
 **Architecture (Codex-reviewed):**
 - Thin provider functions (`transcribe_voice`, `synthesize_speech`) — no class hierarchy

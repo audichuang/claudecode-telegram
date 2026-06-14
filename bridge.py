@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code <-> Telegram Bridge - Multi-Session Control Panel"""
 
-VERSION = "1.1.3"
+VERSION = "1.3.5"
 
 import os
 import json
@@ -36,6 +36,9 @@ class ReuseAddrServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+# Telegram Bot API base. Overridable (e.g. a mock server in tests); `.rstrip("/")`
+# keeps prod behaviour byte-identical when the env var is unset.
+TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 
 # Node-derived config: NODE_NAME drives defaults for PORT, TMUX_PREFIX, SESSIONS_DIR.
 # Explicit env vars always override. No NODE_NAME = original defaults.
@@ -91,8 +94,10 @@ PERSISTENCE_NOTE = "They'll stay on your team."
 # Voice mode: STT (speech-to-text) and TTS (text-to-speech) endpoints
 # STT: transcribe incoming voice messages so workers can read them
 # TTS: generate voice from worker text responses (explicit [[speak]] tag)
-STT_ENDPOINT = os.environ.get("STT_ENDPOINT", "http://100.126.187.125:10110/transcribe")
-TTS_ENDPOINT = os.environ.get("TTS_ENDPOINT", "http://100.126.187.125:10111/synthesize")
+# Default empty so voice is OFF unless explicitly configured — no hardcoded private
+# IP. transcribe_voice/synthesize_speech fail-open on "" (they `if not *_ENDPOINT: return`).
+STT_ENDPOINT = os.environ.get("STT_ENDPOINT", "")
+TTS_ENDPOINT = os.environ.get("TTS_ENDPOINT", "")
 TTS_VOICE = os.environ.get("TTS_VOICE", "Serena")
 STT_TIMEOUT = int(os.environ.get("STT_TIMEOUT", "10"))  # seconds, fail-open
 TTS_TIMEOUT = int(os.environ.get("TTS_TIMEOUT", "60"))  # seconds, TTS runs in background thread
@@ -527,6 +532,30 @@ REWIND_TOKENS = {}
 PR_REVIEW_TOKENS = {}
 REWIND_TIMEOUT = 5 * 60  # 5 minutes
 
+
+def _pr_cache_path(owner, repo, pr_num):
+    """Cache filename for a generated PR review, keyed by owner/repo/pr_num.
+
+    The output is a single flat filename under /tmp: the sanitizer maps '/' to
+    '_' so no path separator survives, hence a hostile owner/repo cannot escape
+    /tmp (traversal is structurally impossible, not merely because '..' is
+    stripped — it is not). Collision across two different repos' PR #N is closed
+    by the trailing digest below (C8). The SAME function is used by the producer
+    (cmd_pr_review) and the server (handle_pr_review_endpoint) so they always
+    agree on the path.
+    """
+    def safe(v):
+        return re.sub(r'[^A-Za-z0-9_.-]', '_', str(v))
+    # A digest over the RAW (owner, repo, pr_num) tuple keeps the path injective
+    # even when the sanitizer or the '-' field separator would otherwise alias two
+    # distinct repos (e.g. alpha/repo-A#5 vs alpha-repo/A#5 both flatten to
+    # ...-alpha-repo-A-5...). The readable prefix is kept for debuggability; the
+    # digest is what actually prevents the collision.
+    digest = hashlib.sha256(
+        json.dumps([str(owner), str(repo), str(pr_num)], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"/tmp/pr-review-{safe(owner)}-{safe(repo)}-{safe(pr_num)}-{digest}.html"
+
 # --- Extension seams (v1.1.0) ---------------------------------------
 # Satellites register here instead of editing the router/Handler.
 # EXTRA_COMMANDS: "/cmd" -> fn(router, arg, chat_id) -> True if handled
@@ -788,7 +817,7 @@ class TelegramAPI:
         if not self.token:
             return None
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{self.token}/{method}",
+            f"{TELEGRAM_API_BASE}/bot{self.token}/{method}",
             data=json.dumps(data).encode(),
             headers={"Content-Type": "application/json"}
         )
@@ -895,7 +924,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendPhoto",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -946,7 +975,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendAnimation",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendAnimation",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -997,7 +1026,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendDocument",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -1043,7 +1072,7 @@ class TelegramTransport(MessageTransport):
         body = b"\r\n".join(body_parts)
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/{api_method}",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/{api_method}",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
@@ -1110,7 +1139,7 @@ class TelegramTransport(MessageTransport):
             return None
         try:
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/getFile",
                 data=json.dumps({"file_id": file_id}).encode(),
                 headers={"Content-Type": "application/json"}
             )
@@ -1131,7 +1160,7 @@ class TelegramTransport(MessageTransport):
         if file_size > MAX_FILE_SIZE:
             print(f"File too large: {file_size} > {MAX_FILE_SIZE}")
             return None
-        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        download_url = f"{TELEGRAM_API_BASE}/file/bot{BOT_TOKEN}/{file_path}"
         inbox = ensure_inbox_dir(session_name)
         ext = Path(file_path).suffix or ""
         local_filename = f"{uuid.uuid4().hex}{ext}"
@@ -4652,7 +4681,7 @@ def send_response_to_telegram(name: str, text: str, chat_id: int, log_prefix: st
 
     # Auto-TTS: synthesize voice for every response when enabled (/voice on|off)
     # Use explicit [[speak:text]] if provided, otherwise use the clean response text
-    if speak_text is None and TTS_ENDPOINT and state.get("tts_enabled", True):
+    if speak_text is None and TTS_ENDPOINT and state.get("tts_enabled", False):
         speak_text = clean_text  # raw text before HTML conversion
 
     clean_text = markdown_to_telegram_html(clean_text)
@@ -5488,10 +5517,11 @@ class CommandRouter:
 
         # Run pr-review.py — pass full URL (with fragment) so it can highlight linked comment
         script_path = Path(__file__).parent / "pr-review.py"
-        out_path = f"/tmp/pr-review-{pr_num}.html"
+        # Key the cache file by owner/repo/pr_num so two repos' PR #N never collide (C8).
+        out_path = _pr_cache_path(owner, repo, pr_num)
         try:
             r = subprocess.run(
-                [sys.executable, str(script_path), arg, "--no-serve"],
+                [sys.executable, str(script_path), arg, "--no-serve", "--out", out_path],
                 capture_output=True, text=True, timeout=300)
             if r.returncode != 0 or not os.path.exists(out_path):
                 self.reply(chat_id, f"Failed to generate PR review:\n{r.stderr[:500]}", outcome="Needs decision")
@@ -6308,8 +6338,11 @@ class Handler(BaseHTTPRequestHandler):
 
         PR_REVIEW_TOKENS[token]["expires_at"] = now + 300
 
-        owner = params.get("owner", [None])[0]
-        repo = params.get("repo", [None])[0]
+        # owner/repo are authoritative from the token, never the query string (C8) —
+        # prevents reading files from an arbitrary repo via the bridge's gh token.
+        info = PR_REVIEW_TOKENS[token]
+        owner = info["owner"]
+        repo = info["repo"]
         path = params.get("path", [None])[0]
         ref = params.get("ref", [None])[0]
 
@@ -6376,9 +6409,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         PR_REVIEW_TOKENS[token]["expires_at"] = now + 300
 
-        owner = data.get("owner", "")
-        repo = data.get("repo", "")
-        pr_num = data.get("pr_num", 0)
+        # owner/repo/pr_num are authoritative from the token, never the request body (C8).
+        info = PR_REVIEW_TOKENS[token]
+        owner = info["owner"]
+        repo = info["repo"]
+        pr_num = info["pr_num"]
         comment_body = data.get("body", "").strip()
         if not all([owner, repo, pr_num, comment_body]):
             self.send_response(400)
@@ -6414,15 +6449,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-        # Route to workers via @mentions
-        targets, _ = command_router.parse_at_mentions(comment_body)
-        if targets:
-            worker_msg = (
-                f"manager: PR #{pr_num} review comment\n\n"
-                f"{comment_body}"
-            )
-            for t in targets:
-                send_to_session(t, worker_msg)
+        # Topic-only model (v1.0.0+): addressing is the Telegram forum 話題 you type
+        # in — NOT a name/@mention. A PR-review-page comment is not inside a topic, so
+        # an `@name` in it must NOT be routed into a session (that legacy @mention
+        # protocol would bypass topic addressing). The comment is posted to GitHub and
+        # mirrored to Telegram above; routing to a worker is intentionally not done here.
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -6449,9 +6480,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         PR_REVIEW_TOKENS[token]["expires_at"] = now + 300
 
-        owner = data.get("owner", "")
-        repo = data.get("repo", "")
-        pr_num = data.get("pr_num", 0)
+        # owner/repo/pr_num are authoritative from the token, never the request body (C8).
+        info = PR_REVIEW_TOKENS[token]
+        owner = info["owner"]
+        repo = info["repo"]
+        pr_num = info["pr_num"]
         merge_method = data.get("merge_method", "merge")
         if merge_method not in ("merge", "squash", "rebase"):
             merge_method = "merge"
@@ -6521,7 +6554,7 @@ class Handler(BaseHTTPRequestHandler):
 
         info = PR_REVIEW_TOKENS[token]
         pr_num = info["pr_num"]
-        html_path = f"/tmp/pr-review-{pr_num}.html"
+        html_path = _pr_cache_path(info["owner"], info["repo"], pr_num)
 
         if not os.path.exists(html_path):
             self.send_response(404)
@@ -6558,9 +6591,11 @@ class Handler(BaseHTTPRequestHandler):
         # Extend token expiry on use
         PR_REVIEW_TOKENS[token]["expires_at"] = now + 300
 
-        owner = data.get("owner", "")
-        repo = data.get("repo", "")
-        pr_num = data.get("pr_num", 0)
+        # owner/repo/pr_num are authoritative from the token, never the request body (C8).
+        info = PR_REVIEW_TOKENS[token]
+        owner = info["owner"]
+        repo = info["repo"]
+        pr_num = info["pr_num"]
         path = data.get("path", "")
         line = data.get("line", 0)
         side = data.get("side", "RIGHT")
@@ -6608,15 +6643,11 @@ class Handler(BaseHTTPRequestHandler):
             )
             transport.send_text(admin_chat_id, tg_text)
 
-        # Route to workers via @mentions (same rule as Telegram messages)
-        targets, _ = command_router.parse_at_mentions(comment_body)
-        if targets:
-            worker_msg = (
-                f"manager: PR #{pr_num} review comment on {path}:{line}\n\n"
-                f"{comment_body}"
-            )
-            for t in targets:
-                send_to_session(t, worker_msg)
+        # Topic-only model (v1.0.0+): addressing is the Telegram forum 話題, NOT an
+        # @mention. A PR-review-page comment is not inside a topic, so an `@name` in it
+        # must NOT be routed into a session (the legacy @mention protocol would bypass
+        # topic addressing). The comment is posted to GitHub + mirrored to Telegram
+        # above; routing to a worker is intentionally not done here.
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

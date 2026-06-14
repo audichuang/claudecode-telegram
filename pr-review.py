@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate a self-contained HTML PR review page from GitHub API data."""
 
+import argparse
 import json
 import html
 import sys
@@ -1759,12 +1760,25 @@ async function doMerge() {{
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        stream = sys.stdout if len(sys.argv) >= 2 else sys.stderr
-        print(f"Usage: {sys.argv[0]} <pr_url_or_number> [--fresh]", file=stream)
-        sys.exit(0 if len(sys.argv) >= 2 else 1)
+    parser = argparse.ArgumentParser(
+        prog=sys.argv[0],
+        usage="%(prog)s <pr_url_or_number> [--fresh] [--out PATH]",
+        description="Generate a self-contained HTML PR review page.")
+    parser.add_argument("pr_input", nargs="?", help="PR URL or number")
+    parser.add_argument("--fresh", action="store_true",
+                        help="ignore the cache and re-fetch")
+    parser.add_argument("--out", metavar="PATH",
+                        help="write the HTML to PATH (default: /tmp/pr-review-<num>.html)")
+    # Accepted for backward compatibility with bridge.py callers; this build
+    # always writes a file rather than serving, so the flag is a no-op.
+    parser.add_argument("--no-serve", action="store_true", help=argparse.SUPPRESS)
+    cli = parser.parse_args()
 
-    pr_input = sys.argv[1]
+    if not cli.pr_input:
+        parser.print_usage(sys.stderr)
+        sys.exit(1)
+
+    pr_input = cli.pr_input
 
     # Parse PR URL or number (supports #issuecomment-XXXXX fragments)
     highlight_comment_id = None
@@ -1781,7 +1795,7 @@ def main():
         # Assume BasedHardware/omi
         owner, repo, pr_num = 'BasedHardware', 'omi', int(clean_url)
 
-    fresh = '--fresh' in sys.argv
+    fresh = cli.fresh
     cache = PRCache()
     print(f"Fetching PR #{pr_num} from {owner}/{repo}..." + (" (fresh)" if fresh else ""))
     meta, files, comments, reviews, commits, user_profiles = fetch_pr_cached(
@@ -1796,7 +1810,7 @@ def main():
                                  highlight_comment_id=highlight_comment_id,
                                  commits=commits)
 
-    out_path = f'/tmp/pr-review-{pr_num}.html'
+    out_path = cli.out if cli.out else f'/tmp/pr-review-{pr_num}.html'
     with open(out_path, 'w') as f:
         f.write(html_content)
     print(f"Written to {out_path}")
