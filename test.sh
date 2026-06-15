@@ -2267,8 +2267,19 @@ snap = {'updated_at': '2026-06-10T12:00:00+00:00',
         'five_hour': {'used_percentage': 31, 'resets_at': '2026-06-10T14:00:00+00:00'},
         'seven_day': {'used_percentage': 82, 'resets_at': '2026-06-12T00:00:00+00:00'}}
 out = bridge.format_quota(snap)
-assert '5h' in out and '31%' in out, out
-assert '7d' in out and '82%' in out, out
+# Candidate C: Telegram-native colour heat bars, NOT terminal █░
+assert '額度' in out, out
+assert '5 小時' in out and '31%' in out, out
+assert '本週' in out and '82%' in out, out
+assert '🟩' in out, out
+assert '█' not in out and '░' not in out, ('terminal bar chars leaked', out)
+# heat zones: low usage stays green; near-full crosses into red
+low = bridge._quota_heat_bar(30)
+assert '🟩' in low and '🟨' not in low and '🟥' not in low, low
+assert '🟥' in bridge._quota_heat_bar(95), bridge._quota_heat_bar(95)
+# a small non-zero usage still lights at least one cell (not a confusingly empty bar)
+assert bridge._quota_heat_bar(3).count('🟩') == 1, bridge._quota_heat_bar(3)
+assert bridge._quota_heat_bar(0).count('🟩') == 0, bridge._quota_heat_bar(0)
 # fallback when no data
 none_out = bridge.format_quota(None)
 assert 'unavailable' in none_out.lower() or '無' in none_out, none_out
@@ -2281,6 +2292,59 @@ print('OK')
         success "/quota render works"
     else
         fail "/quota render test failed"
+    fi
+}
+
+test_quota_api_fallback() {
+    info "Testing /quota hybrid resolve: snapshot fast-path → live OAuth-API fallback..."
+    if python3 -c "
+import bridge
+
+# 1) fresh snapshot wins — API must NOT be called (fast path)
+bridge.read_usage_snapshot = lambda: {'updated_at': 'x',
+    'five_hour': {'used_percentage': 10, 'resets_at': None},
+    'seven_day': {'used_percentage': 20, 'resets_at': None}}
+called = {'api': False}
+def _boom():
+    called['api'] = True
+    return None
+bridge.fetch_usage_from_api = _boom
+r = bridge.resolve_usage()
+assert r['five_hour']['used_percentage'] == 10, r
+assert called['api'] is False, 'API called despite fresh snapshot'
+
+# 2) snapshot missing/stale → fall back to API
+bridge.read_usage_snapshot = lambda: None
+bridge.fetch_usage_from_api = lambda: {'updated_at': 'x',
+    'five_hour': {'used_percentage': 20, 'resets_at': None},
+    'seven_day': {'used_percentage': 29, 'resets_at': None}}
+r2 = bridge.resolve_usage()
+assert r2 is not None and r2['five_hour']['used_percentage'] == 20, r2
+
+# 3) both unavailable → None → format_quota shows the unavailable fallback
+bridge.fetch_usage_from_api = lambda: None
+assert bridge.resolve_usage() is None
+assert 'unavailable' in bridge.format_quota(bridge.resolve_usage()).lower()
+
+# 4) _map_oauth_usage maps API 'utilization' → 'used_percentage' (rounded), keeps resets_at,
+#    ignores extra windows, stamps the given updated_at
+m = bridge._map_oauth_usage({
+    'five_hour': {'utilization': 20.0, 'resets_at': '2026-06-15T04:30:00Z'},
+    'seven_day': {'utilization': 29.4, 'resets_at': None},
+    'seven_day_sonnet': {'utilization': 2.0}}, now='2026-06-15T01:00:00+00:00')
+assert m['five_hour']['used_percentage'] == 20, m
+assert m['seven_day']['used_percentage'] == 29, m
+assert m['five_hour']['resets_at'] == '2026-06-15T04:30:00Z', m
+assert m['updated_at'] == '2026-06-15T01:00:00+00:00', m
+
+# 5) no windows with a percentage → None (so the bridge won't render an empty snapshot)
+assert bridge._map_oauth_usage({'extra_usage': {}}) is None
+assert bridge._map_oauth_usage('nonsense') is None
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        success "/quota API fallback works"
+    else
+        fail "/quota API fallback test failed"
     fi
 }
 
@@ -12495,6 +12559,7 @@ run_unit_tests() {
     run_test test_topic_typing_targets_thread
     run_test test_hook_reply_targets_thread
     run_test test_quota_render
+    run_test test_quota_api_fallback
     run_test test_message_splitting
     run_test test_sandbox_docker_cmd
     # Unit tests - Markdown conversion

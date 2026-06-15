@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 1.3.5
+> Version: 1.4.0
 
 ## Current Philosophy (Summary)
 
@@ -292,6 +292,25 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.4.0 - /quota hybrid resolve + Telegram-native heat-bar display
+
+**What:** `/quota` now always works from Telegram and reads nicely on a phone.
+Two changes, each with a falsifiable (RED-before / GREEN-after) test.
+
+- **Live API fallback (hybrid resolve)** — `/quota` reads claude-hud's external snapshot
+  (`~/.claude/cc-usage.json`) as a fast path, and when it is missing or stale (>10 min) falls
+  back to fetching `GET https://api.anthropic.com/api/oauth/usage` directly with Claude Code's
+  own OAuth token (`~/.claude/.credentials.json`; honours `CLAUDE_CONFIG_DIR`). Best-effort: a
+  missing/expired credential, non-200, or network error returns `None` → the unavailable message.
+  The Telegram bot token is never involved. New helpers `_read_oauth_access_token`,
+  `_map_oauth_usage` (pure `utilization`→`used_percentage` mapper), `fetch_usage_from_api`, and
+  `resolve_usage` (snapshot-then-API). Test: `test_quota_api_fallback`.
+- **Telegram-native heat-bar display** — replaces the terminal `█░` bar with a colour heat bar
+  (🟩 ≤50% / 🟨 ≤80% / 🟥 beyond, ⬜ empty), so the fuller/redder the bar, the closer to the limit
+  at a glance. Plain text (command replies carry no `parse_mode`, so colour comes from emoji not
+  HTML); any non-zero usage lights ≥1 cell. Localised labels (`5 小時` / `本週`) and reset phrases
+  (`N 小時後重置`). Test: `test_quota_render` (rewritten from the old terminal-bar assertions).
 
 ### v1.3.5 - Fusion: e2e mock-Telegram harness + launcher/voice/pr-review hardening
 
