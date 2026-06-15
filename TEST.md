@@ -155,7 +155,7 @@ assert that:
 
 ## Complete Inventory By Runner Group
 
-Keep this section grouped by runner rather than listing all 273 names. The
+Keep this section grouped by runner rather than listing all 274 names. The
 source of truth for exact names is the `run_test ...` calls inside `test.sh`.
 
 ### Unit Tests (FAST)
@@ -166,6 +166,7 @@ source of truth for exact names is the `run_test ...` calls inside `test.sh`.
 | Topic command surface | legacy command rejection, global command delegation, slim command menu |
 | Extension seam | `EXTRA_COMMANDS` dispatch and no leak to Claude when handled |
 | Formatting/media | response formatting, Telegram HTML, message splitting, media tags, file validation, inbound media typing |
+| Quota (`/quota`) | Telegram-native colour heat-bar rendering + null-window/unavailable fallback (`test_quota_render`); snapshot-then-OAuth-API hybrid resolve, incl. fresh-snapshot fast path and `utilization`→`used_percentage` mapping (`test_quota_api_fallback`) |
 | Voice | STT/TTS success/failure/timeout, auto-TTS, speak tags, `/voice` toggle |
 | Claude/tmux helpers | Claude start command, tmux send locks, bracketed paste, flock isolation, concurrent-send baseline |
 | Launch confirmation | `send_pane_start_cmd` sentinel resend when an rc eats the launch line (`test_pane_start_cmd_survives_stdin_eating_rc`), no junk resend into a backend that already exec'd (`test_pane_start_cmd_no_resend_into_running_backend`), revive uses the readiness gate (`test_revive_waits_for_pane_shell_ready`), **in-place restart also waits** before sending the launch line (`test_restart_inplace_waits_for_pane_shell_ready`), readiness heuristic sensitivity incl. missing pane → False (`test_wait_for_pane_shell_ready_paths`), launch fails open when the pane never readies (`test_create_fail_open_when_wait_returns_false`) |

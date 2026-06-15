@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code <-> Telegram Bridge - Multi-Session Control Panel"""
 
-VERSION = "1.3.5"
+VERSION = "1.4.0"
 
 import os
 import json
@@ -2473,18 +2473,129 @@ def read_usage_snapshot():
     return snap
 
 
-def _quota_bar(pct):
-    """Render a 10-char usage bar for an integer percent (0-100)."""
+# Live fallback: when claude-hud's snapshot is missing/stale (e.g. no desktop
+# statusline has rendered recently), fetch subscriber usage straight from the
+# Anthropic OAuth endpoint — the same call claude-hud makes. Uses Claude Code's
+# own OAuth token from its credentials file; NEVER the Telegram bot token.
+OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def _claude_credentials_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"
+    return os.path.join(os.path.expanduser(base), ".credentials.json")
+
+
+def _read_oauth_access_token(now_ms=None):
+    """Read claudeAiOauth.accessToken from Claude Code's credentials file.
+
+    Returns None if the file is missing/unreadable, has no token, or the token
+    is expired (``expiresAt`` is a Unix ms timestamp).
+    """
+    try:
+        with open(_claude_credentials_path()) as f:
+            oauth = (json.load(f) or {}).get("claudeAiOauth") or {}
+    except Exception:
+        return None
+    token = oauth.get("accessToken")
+    if not token:
+        return None
+    expires_at = oauth.get("expiresAt")
+    if expires_at is not None:
+        now_ms = now_ms if now_ms is not None else time.time() * 1000
+        if now_ms >= expires_at:
+            return None
+    return token
+
+
+def _map_oauth_usage(data, now=None):
+    """Map an ``/api/oauth/usage`` response to the cc-usage snapshot shape.
+
+    Pure (no I/O). The API returns ``utilization`` per window; the bridge's
+    renderer expects ``used_percentage``. Returns None if neither the 5h nor 7d
+    window carries a percentage (so we never render an empty snapshot).
+    """
+    if not isinstance(data, dict):
+        return None
+
+    def _win(w):
+        w = w or {}
+        util = w.get("utilization")
+        pct = None if util is None else max(0, min(100, round(util)))
+        return {"used_percentage": pct, "resets_at": w.get("resets_at")}
+
+    five_hour = _win(data.get("five_hour"))
+    seven_day = _win(data.get("seven_day"))
+    if five_hour["used_percentage"] is None and seven_day["used_percentage"] is None:
+        return None
+    if now is None:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+    return {"updated_at": now, "five_hour": five_hour, "seven_day": seven_day}
+
+
+def fetch_usage_from_api():
+    """Best-effort live fetch of subscriber usage from the Anthropic OAuth API.
+
+    Returns a cc-usage snapshot dict, or None on missing/expired credentials,
+    network error, non-200, or a response with no usable windows.
+    """
+    token = _read_oauth_access_token()
+    if not token:
+        return None
+    try:
+        req = urllib.request.Request(
+            OAUTH_USAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-beta": "oauth-2025-04-20",
+                "User-Agent": f"claudecode-telegram/{VERSION}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    return _map_oauth_usage(data)
+
+
+def resolve_usage():
+    """Resolve subscriber usage: claude-hud snapshot fast-path, then live API."""
+    return read_usage_snapshot() or fetch_usage_from_api()
+
+
+def _quota_heat_bar(pct, segments=10):
+    """Colour heat bar for /quota: filled cells are coloured by zone (green
+    ≤50%, yellow ≤80%, red beyond) and empty cells are ⬜. Telegram renders
+    these in colour — unlike terminal █░ — so the fuller/redder the bar, the
+    closer to the limit at a glance. Returns "" on a non-numeric percent.
+    """
     try:
         p = max(0, min(100, int(pct)))
     except Exception:
-        return "n/a"
-    filled = round(p / 10)
-    return "█" * filled + "░" * (10 - filled)
+        return ""
+    filled = round(p * segments / 100)
+    if p > 0:
+        filled = max(1, filled)  # any real usage lights ≥1 cell, never a blank bar
+    cells = []
+    for i in range(1, segments + 1):
+        if i > filled:
+            cells.append("⬜")
+            continue
+        frac = i * 100 / segments
+        if frac <= 50:
+            cells.append("🟩")
+        elif frac <= 80:
+            cells.append("🟨")
+        else:
+            cells.append("🟥")
+    return "".join(cells)
 
 
-def _quota_reset_label(resets_at):
-    """Relative reset label (e.g. ``重置 in 2h`` ), best-effort; never raises."""
+def _quota_reset_zh(resets_at):
+    """Relative reset phrase in Chinese (e.g. ``2 小時後重置``). Best-effort;
+    never raises and returns "" when the timestamp is absent/unparseable."""
     if not resets_at:
         return ""
     try:
@@ -2494,54 +2605,54 @@ def _quota_reset_label(resets_at):
             ts = ts.replace(tzinfo=timezone.utc)
         delta = (ts - datetime.now(timezone.utc)).total_seconds()
         if delta <= 0:
-            return "重置 soon"
+            return "即將重置"
         if delta < 3600:
-            return f"重置 in {int(delta // 60)}m"
+            return f"{int(delta // 60)} 分鐘後重置"
         if delta < 86400:
-            return f"重置 in {int(delta // 3600)}h"
-        return f"重置 in {int(delta // 86400)}d"
+            return f"{int(delta // 3600)} 小時後重置"
+        return f"{int(delta // 86400)} 天後重置"
     except Exception:
         return ""
 
 
-def _quota_window_line(label, window):
-    """Render one window line: ``<label> <bar> <remaining>% (used <used>%) <reset>``.
+def _quota_window_block(label, window):
+    """Render one window (Candidate C): ``<label>　<used>%`` / heat bar / reset.
 
-    A null/absent ``used_percentage`` renders as ``n/a``.
+    A null/absent ``used_percentage`` collapses to a single ``<label>　n/a``
+    line (no bar). Returns a list of lines.
     """
     window = window or {}
     used = window.get("used_percentage")
     if used is None:
-        return f"{label} n/a"
-    bar = _quota_bar(used)
-    try:
-        remaining = 100 - int(used)
-    except Exception:
-        remaining = "n/a"
-    reset = _quota_reset_label(window.get("resets_at"))
-    line = f"{label} {bar} {used}% used, {remaining}% left"
+        return [f"{label}　n/a"]
+    block = [f"{label}　{used}%", _quota_heat_bar(used)]
+    reset = _quota_reset_zh(window.get("resets_at"))
     if reset:
-        line += f" · {reset}"
-    return line
+        block.append(reset)
+    return block
 
 
 def format_quota(snap):
-    """Render the usage snapshot for /quota.
+    """Render the usage snapshot for /quota as Telegram-native colour heat bars.
 
-    None → clear unavailable fallback. Otherwise render 5h / 7d windows
-    (null window → ``n/a``) plus best-effort context. Does not depend on the
-    wall clock for the percent/label values it asserts on.
+    None → clear unavailable fallback. Otherwise render the 5h / weekly windows
+    (null window → ``n/a``) plus best-effort context. Command replies are sent
+    as plain text (no parse_mode), so this uses colour emoji rather than HTML —
+    and does not depend on the wall clock for the percent values it asserts on.
     """
     if not snap:
         return "usage unavailable — no subscriber rate-limit data"
-    lines = ["📊 用量"]
-    lines.append(_quota_window_line("5h", snap.get("five_hour")))
-    lines.append(_quota_window_line("7d", snap.get("seven_day")))
+    lines = ["📊 額度用量"]
+    for label, key in (("5 小時", "five_hour"), ("本週", "seven_day")):
+        lines.append("")
+        lines.extend(_quota_window_block(label, snap.get(key)))
     ctx = snap.get("context")
     if isinstance(ctx, dict):
         cused = ctx.get("used_percentage")
         if cused is not None:
-            lines.append(f"context {_quota_bar(cused)} {cused}% used")
+            lines.append("")
+            lines.append(f"context　{cused}%")
+            lines.append(_quota_heat_bar(cused))
     return "\n".join(lines)
 
 
@@ -5316,7 +5427,7 @@ class CommandRouter:
 
         # /quota — show subscriber usage; works with or without a thread session.
         if cmd == "/quota":
-            self.reply(chat_id, format_quota(read_usage_snapshot()))
+            self.reply(chat_id, format_quota(resolve_usage()))
             return
 
         # /close — end this thread's session (same lifecycle path as the
@@ -5470,8 +5581,8 @@ class CommandRouter:
         return False
 
     def cmd_quota(self, chat_id):
-        """Show subscriber usage (5h/7d) from claude-hud's external snapshot."""
-        self.reply(chat_id, format_quota(read_usage_snapshot()))
+        """Show subscriber usage (5h/7d): claude-hud snapshot, then live API."""
+        self.reply(chat_id, format_quota(resolve_usage()))
         return True
 
     def cmd_rewind(self, name, chat_id):
