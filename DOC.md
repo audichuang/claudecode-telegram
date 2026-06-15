@@ -1,6 +1,6 @@
 # Design Philosophy
 
-> Version: 1.4.0
+> Version: 1.5.0
 
 ## Current Philosophy (Summary)
 
@@ -292,6 +292,43 @@ This prevents other users on multi-user systems from reading chat IDs or session
 ---
 
 ## Changelog
+
+### v1.5.0 - Trust-prompt fix (the "stopped unexpectedly" root cause) + watchdog self-heal
+
+**Root cause fixed (critical).** Topic sessions silently died at launch: the
+folder-trust dialog auto-answer sent `"2"`, which is **"No, exit"** on the
+current Claude TUI, so `claude` exited itself the moment it opened in an
+untrusted folder. The pane shell survived, so the watchdog reported `DEAD`
+("🔴 … stopped unexpectedly") and re-alerted every 180 s forever. Sessions in
+already-trusted folders survived (no prompt), which masked the bug.
+
+- **`_accept_trust_prompt(tmux_name)`** replaces the blind `send-keys "2"` in all
+  three launch paths (`open_session`, in-pane `restart()`, `_restart_dead_worker`
+  — the latter two previously had *no* trust handling at all). It reuses the
+  interactive-prompt parser to navigate to the affirmative ("trust"/"yes") option
+  and confirm with Enter, never typing a digit; if it can't parse the prompt it
+  leaves it for the user rather than guessing. It polls ~4 s for a late-rendering
+  prompt.
+- **Bounded watchdog re-alerts.** `DEAD`/`OFFLINE`/`EXITED` now alert at most
+  `1 + MAX_DEAD_REALERTS` times (real sends only — `_send_watchdog_alert` returns
+  whether it actually sent, so cooldown-suppressed attempts don't burn the
+  budget), then go silent until the session recovers or is closed. The alert
+  budget resets on recovery so a later genuine death alerts again.
+- **Auto-reap of registry-only sessions.** A session whose tmux is gone but whose
+  topic still exists (e.g. a manual `tmux kill-session` without `/close`) is now
+  removed from `workers.json` after `REAP_EXITED_AFTER` (600 s) of continuous
+  `EXITED`, instead of nagging forever. ("tmux IS persistence": no tmux ⇒ no
+  session; the topic recreates it on the next message.)
+- **`/cd` honest failure.** The `/cd` handler now checks `restart()`'s
+  `(ok, err)` return and reports failure instead of always replying success.
+- **Refactor:** `watchdog_loop` body extracted into `_run_watchdog_once(now)` so
+  the watchdog is unit-testable (closes the long-standing untestable-`while True`
+  gap).
+- **Out of scope:** sandbox (`SANDBOX_ENABLED`) launch paths still don't handle
+  the trust prompt — dev/prod run `--no-sandbox`; documented follow-up.
+- Tests: `_accept_trust_prompt` navigation, all-three-paths trust acceptance,
+  `/cd` failure reply, bounded re-alert (real-cooldown fake-clock), recovery
+  reset, EXITED reap (helper + watchdog-tick integration).
 
 ### v1.4.0 - /quota hybrid resolve + Telegram-native heat-bar display
 
