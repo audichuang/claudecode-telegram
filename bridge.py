@@ -4203,14 +4203,10 @@ class SessionManager:
             print(f"Started worker '{name}' in sandbox mode")
         else:
             send_pane_start_cmd(tmux_name, backend_obj.start_cmd(), startup_cwd)
-            # Answer Claude's "Do you trust the files in this folder?" dialog,
-            # but only if it actually appears.
-            time.sleep(1.5)
-            pane = _capture_pane_text(tmux_name, lines=20).lower()
-            if any(m in pane for m in ("do you trust", "trust the files", "trust this folder")):
-                subprocess.run(["tmux", "send-keys", "-t", tmux_name, "2"])
-                time.sleep(0.3)
-                subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+            # Accept Claude's folder-trust dialog if it appears (navigate to the
+            # "Yes, I trust" option — never blind-send a digit; "2" is "No, exit").
+            # The helper polls for a late-rendering prompt itself.
+            _accept_trust_prompt(tmux_name)
 
         time.sleep(2.0 if not SANDBOX_ENABLED else 5.0)
 
@@ -4341,6 +4337,10 @@ class SessionManager:
             # handle any transient delay via its sentinel/bounded-resend logic.
             wait_for_pane_shell_ready(tmux_name)
             send_pane_start_cmd(tmux_name, backend.start_cmd(resume_id), startup_cwd)
+            # A relaunch in the existing pane re-triggers the folder-trust dialog
+            # whenever the cwd is untrusted; accept it before sending welcome.
+            # The helper polls for a late-rendering prompt itself.
+            _accept_trust_prompt(tmux_name)
 
         # Re-send welcome/instructions so worker gets fresh context after restart
         welcome = self._build_welcome(name, backend)
@@ -4398,10 +4398,8 @@ class SessionManager:
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, docker_cmd, "Enter"])
         else:
             send_pane_start_cmd(tmux_name, backend.start_cmd(resume_id), startup_cwd)
-            time.sleep(1.5)
-            subprocess.run(["tmux", "send-keys", "-t", tmux_name, "2"])
-            time.sleep(0.3)
-            subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+            # The helper polls for a late-rendering prompt itself.
+            _accept_trust_prompt(tmux_name)
 
         welcome = self._build_welcome(name, backend)
         time.sleep(2.0 if not SANDBOX_ENABLED else 5.0)

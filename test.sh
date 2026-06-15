@@ -1587,8 +1587,8 @@ print('OK')
     fi
 }
 
-test_topic_hire_skips_trust_2_without_prompt() {
-    info "Testing open_session only answers the trust dialog when it actually appears (no stray '2')..."
+test_topic_hire_accepts_trust_prompt() {
+    info "Testing open_session accepts the trust dialog (Yes) only when present, never sends a bare '2'..."
     if python3 -c "
 import tempfile, subprocess
 import bridge
@@ -1603,9 +1603,9 @@ bridge.export_hook_env = lambda *a, **k: None
 bridge.ensure_session_dir = lambda n: None
 bridge.time.sleep = lambda *a, **k: None
 bridge.wait_for_pane_shell_ready = lambda *a, **k: True
+bridge.send_pane_start_cmd = lambda *a, **k: True
 wm._build_welcome = lambda n, b: 'hi'
 wm.send = lambda *a, **k: True
-bridge.set_focus = lambda n: None
 sk = []
 class R:
     returncode = 0; stdout = ''; stderr = b''
@@ -1615,27 +1615,83 @@ def fake_run(cmd, *a, **k):
     return R()
 subprocess.run = fake_run
 
-# Case A: no trust dialog on screen -> the stray '2' must NOT be sent.
-bridge._capture_pane_text = lambda t, lines=50: 'Claude Code v2\n> '
+# Case A: no trust dialog -> no trust keystrokes at all.
+bridge._capture_pane_text = lambda t, lines=30: 'Claude Code v2\n> '
 try:
     wm.open_session('tA', chat_id=11)
 except Exception:
     pass
-assert '2' not in sk, ('must not send a bare 2 when no trust dialog:', sk)
+assert '2' not in sk and 'Enter' not in sk, ('no keystrokes when no dialog:', sk)
 
-# Case B: a real trust dialog -> '2' IS sent to answer it.
+# Case B: a real trust dialog (current wording) -> accept by navigating to Yes, NEVER '2'.
 sk.clear()
-bridge._capture_pane_text = lambda t, lines=50: 'Do you trust the files in this folder?\n1. Yes\n2. No'
+bridge._capture_pane_text = lambda t, lines=30: (
+    'Quick safety check: Is this a project you created or one you trust?\n'
+    '❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm')
 try:
     wm.open_session('tB', chat_id=11)
 except Exception:
     pass
-assert '2' in sk, ('should answer a real trust dialog with 2:', sk)
+assert '2' not in sk, ('must never answer trust with a bare 2:', sk)
+assert 'Enter' in sk, ('must confirm the trust dialog:', sk)
 print('OK')
 " 2>/dev/null | grep -q "OK"; then
-        success "open_session answers trust dialog only when present (no stray 2)"
+        success "open_session accepts trust dialog (Yes) without sending a bare 2"
     else
-        fail "open_session trust-2 guard test failed"
+        fail "open_session trust-accept test failed"
+    fi
+}
+
+test_restart_paths_accept_trust() {
+    info "Testing restart() in-pane and _restart_dead_worker both accept the trust prompt (never send 2)..."
+    if python3 -c "
+import tempfile, subprocess
+import bridge
+wm = bridge.session_manager
+wm._sync_paths = lambda: None
+bridge._which_binary = lambda b: '/usr/bin/true'
+bridge.export_hook_env = lambda *a, **k: None
+bridge.ensure_session_dir = lambda n: None
+bridge.time.sleep = lambda *a, **k: None
+bridge.wait_for_pane_shell_ready = lambda *a, **k: True
+bridge.send_pane_start_cmd = lambda *a, **k: True
+bridge.is_claude_running = lambda t: False
+bridge.clear_pending = lambda n: None
+bridge._clear_hook_failures = lambda n: None
+bridge.save_claude_session_cwd = lambda n, c: None
+wm._get_startup_cwd = lambda name, fallback_cwd='': tempfile.mkdtemp()
+wm._build_welcome = lambda n, b: 'hi'
+wm.send = lambda *a, **k: True
+bridge._capture_pane_text = lambda t, lines=30: (
+    'Quick safety check: Is this a project you created or one you trust?\n'
+    '❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm')
+sk = []
+class R:
+    returncode = 0; stdout = ''; stderr = b''
+def fake_run(cmd, *a, **k):
+    if isinstance(cmd, list) and 'send-keys' in cmd:
+        sk.append(cmd[4] if len(cmd) > 4 else '')
+    return R()
+subprocess.run = fake_run
+
+# In-pane restart path: tmux alive, claude not running.
+bridge.tmux_exists = lambda t: True
+wm.get_registered_sessions = lambda registered=None: {'tR': {'tmux': 'claude-test-tR', 'backend': 'claude'}}
+sk.clear()
+wm.restart('tR')
+assert '2' not in sk and 'Enter' in sk, ('in-pane restart must accept trust, not send 2:', sk)
+
+# Dead-worker path: tmux gone -> _restart_dead_worker (new-session succeeds via fake_run rc=0).
+bridge.tmux_exists = lambda t: False
+wm.get_registered_sessions = lambda registered=None: {'tD': {'backend': 'claude'}}
+sk.clear()
+wm.restart('tD')
+assert '2' not in sk and 'Enter' in sk, ('dead-worker restart must accept trust, not send 2:', sk)
+print('OK')
+" 2>/dev/null | grep -q OK; then
+        success "restart() and _restart_dead_worker accept trust (never send 2)"
+    else
+        fail "restart-paths trust-accept test failed"
     fi
 }
 
@@ -12586,7 +12642,8 @@ run_unit_tests() {
     run_test test_topic_name_falls_back_for_nonascii
     run_test test_topic_hire_starts_pane_in_picked_cwd
     run_test test_accept_trust_prompt_picks_yes
-run_test test_topic_hire_skips_trust_2_without_prompt
+run_test test_topic_hire_accepts_trust_prompt
+run_test test_restart_paths_accept_trust
     run_test test_topic_typed_reply_during_pick_not_routed
     run_test test_topic_cd_rejects_bad_path
     run_test test_topic_legacy_command_rejected
