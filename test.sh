@@ -1532,6 +1532,61 @@ print('OK')
     fi
 }
 
+test_accept_trust_prompt_picks_yes() {
+    info "Testing _accept_trust_prompt navigates to the Yes/trust option and never confirms No,exit..."
+    if python3 -c "
+import bridge, subprocess
+sk = []
+class R:
+    returncode = 0; stdout = ''; stderr = b''
+def fake_run(cmd, *a, **k):
+    if isinstance(cmd, list) and 'send-keys' in cmd:
+        sk.append(cmd[4] if len(cmd) > 4 else '')
+    return R()
+subprocess.run = fake_run
+bridge.time.sleep = lambda *a, **k: None
+
+# Case A: no trust prompt -> send nothing
+bridge._capture_pane_text = lambda t, lines=30: 'Claude Code v2\n> '
+sk.clear()
+assert bridge._accept_trust_prompt('sA') == 'no-prompt', 'A'
+assert sk == [], ('must send nothing when no prompt:', sk)
+
+# Case B: current wording, Yes is option 1 and already selected -> Enter only, never '2'
+sk.clear()
+bridge._capture_pane_text = lambda t, lines=30: (
+    'Quick safety check: Is this a project you created or one you trust?\n'
+    '❯ 1. Yes, I trust this folder\n'
+    '  2. No, exit\n'
+    'Enter to confirm')
+assert bridge._accept_trust_prompt('sB') == 'accepted', 'B'
+assert '2' not in sk, ('must never send literal 2:', sk)
+assert 'Enter' in sk, ('must confirm with Enter:', sk)
+assert 'Down' not in sk and 'Up' not in sk, ('Yes already selected, no nav needed:', sk)
+
+# Case C: order flipped, Yes is option 2 (not default) -> navigate Down then Enter
+sk.clear()
+bridge._capture_pane_text = lambda t, lines=30: (
+    'Do you trust the files in this folder?\n'
+    '❯ 1. No, exit\n'
+    '  2. Yes, I trust this folder\n'
+    'Enter to confirm')
+assert bridge._accept_trust_prompt('sC') == 'accepted', 'C'
+assert sk == ['Down', 'Enter'], ('must navigate to Yes (down) then confirm:', sk)
+
+# Case D: prompt text present but options unparseable -> do not guess
+sk.clear()
+bridge._capture_pane_text = lambda t, lines=30: 'Is this a project you created or one you trust?\nEnter to confirm\n(garbled, no options)'
+assert bridge._accept_trust_prompt('sD') == 'unparsed', 'D'
+assert sk == [], ('must not guess when unparseable:', sk)
+print('OK')
+" 2>/dev/null | grep -q OK; then
+        success "_accept_trust_prompt picks Yes/trust, never No,exit"
+    else
+        fail "_accept_trust_prompt test failed"
+    fi
+}
+
 test_topic_hire_skips_trust_2_without_prompt() {
     info "Testing open_session only answers the trust dialog when it actually appears (no stray '2')..."
     if python3 -c "
@@ -12530,7 +12585,8 @@ run_unit_tests() {
     run_test test_topic_route_tracks_request
     run_test test_topic_name_falls_back_for_nonascii
     run_test test_topic_hire_starts_pane_in_picked_cwd
-    run_test test_topic_hire_skips_trust_2_without_prompt
+    run_test test_accept_trust_prompt_picks_yes
+run_test test_topic_hire_skips_trust_2_without_prompt
     run_test test_topic_typed_reply_during_pick_not_routed
     run_test test_topic_cd_rejects_bad_path
     run_test test_topic_legacy_command_rejected

@@ -3932,6 +3932,64 @@ def _send_interactive_reply(tmux_name: str, reply: str, details: dict) -> bool:
     return False
 
 
+# Folder-trust prompt: substrings that identify Claude's "do you trust this
+# folder?" dialog across versions (current wording is "Quick safety check…").
+_TRUST_PROMPT_MARKERS = (
+    "do you trust",
+    "trust the files",
+    "trust this folder",
+    "trust the authors",
+    "is this a project you created or one you trust",
+)
+_TRUST_NEGATIVE_KEYWORDS = ("no, exit", "no,", "do not trust", "don't trust", "exit")
+_TRUST_AFFIRMATIVE_KEYWORDS = ("trust", "yes")
+
+
+def _accept_trust_prompt(tmux_name: str) -> str:
+    """If Claude is showing a folder-trust prompt, accept it robustly.
+
+    Reuses the interactive-prompt parser to find the affirmative ("trust"/"yes")
+    option, navigates the TUI selection to it (Up/Down) and confirms with Enter.
+    Never blindly types a digit: the old code sent "2", which is "No, exit" on
+    the current Claude TUI and silently killed the session at launch.
+
+    Returns "accepted", "no-prompt", or "unparsed" (logged, left for the user).
+
+    Polls up to ~4s (the TUI may render the prompt after send_pane_start_cmd
+    returns — its sentinel fires before `exec`, not when Claude is up), returning
+    as soon as the prompt is found.
+    """
+    pane = ""
+    for _ in range(8):  # ~4s at 0.5s/poll; break as soon as the prompt shows
+        pane = _capture_pane_text(tmux_name, lines=30)
+        if pane and any(m in pane.lower() for m in _TRUST_PROMPT_MARKERS):
+            break
+        time.sleep(0.5)
+    else:
+        return "no-prompt"
+
+    details = _extract_question_details(pane.splitlines())
+    if not details or not details.get("options"):
+        print(f"[trust] {tmux_name}: trust prompt detected but options unparsed; leaving for user")
+        return "unparsed"
+
+    target = None
+    for o in details["options"]:
+        label = o["label"].lower()
+        if any(k in label for k in _TRUST_NEGATIVE_KEYWORDS):
+            continue
+        if any(k in label for k in _TRUST_AFFIRMATIVE_KEYWORDS):
+            target = o
+            break
+    if target is None:
+        labels = [o["label"] for o in details["options"]]
+        print(f"[trust] {tmux_name}: no affirmative trust option in {labels}; leaving for user")
+        return "unparsed"
+
+    _send_interactive_reply(tmux_name, str(target["num"]), details)
+    return "accepted"
+
+
 def get_worker_backend(name: str, session: Optional[dict] = None) -> str:
     """Get backend for a worker.
 
