@@ -3195,205 +3195,207 @@ def _record_worker_state(name: str, state: str, reason: str, now: float) -> floa
 def watchdog_loop():
     while True:
         try:
-            now = time.time()
-            registered = get_registered_sessions()
-            pane_pids = _tmux_pane_pids()
-
-            registered_names = set(registered.keys())
-            probe_failed = bool(registered_names) and not pane_pids
-            if probe_failed:
-                for name in registered_names:
-                    _consecutive_probe_failures[name] = _consecutive_probe_failures.get(name, 0) + 1
-            else:
-                for name in registered_names:
-                    _consecutive_probe_failures[name] = 0
-
-            claude_pids = {}
-            tmux_present = {}
-            for name, session in registered.items():
-                tmux_name = session.get("tmux", f"{TMUX_PREFIX}{name}")
-                pane_pid = pane_pids.get(tmux_name)
-                tmux_exists = bool(pane_pid)
-                tmux_present[name] = tmux_exists
-
-                if not tmux_exists:
-                    continue
-
-                claude_pid = _get_claude_pid(pane_pid)
-                if claude_pid:
-                    claude_pids[name] = claude_pid
-                    with _watchdog_lock:
-                        _last_seen_claude[name] = now
-                else:
-                    with _watchdog_lock:
-                        if name not in _last_seen_claude:
-                            _last_seen_claude[name] = now
-
-            stats = _ps_stats(claude_pids.values())
-
-            for name, session in registered.items():
-                tmux_name = session.get("tmux", f"{TMUX_PREFIX}{name}")
-                tmux_exists = tmux_present.get(name, False)
-
-                # Registry-only worker (tmux gone): mark EXITED directly
-                if not tmux_exists and "tmux" not in session:
-                    since = _record_worker_state(name, "EXITED", "session gone", now)
-                    _handle_watchdog_transition(name, "EXITED", "session gone", since, now=now)
-                    continue
-
-                if probe_failed and not tmux_exists and _consecutive_probe_failures.get(name, 0) < 3:
-                    continue
-
-                claude_pid = claude_pids.get(name)
-                cpu = 0.0
-                if claude_pid and claude_pid in stats:
-                    cpu = stats[claude_pid].get("cpu", 0.0)
-
-                children_total = _child_count(claude_pid) if claude_pid else 0
-
-                # Dynamic baseline: MCP servers are persistent children.
-                # Track idle child count so only EXTRA children count as work.
-                pending_ts = _pending_timestamp(name)
-                pending = pending_ts is not None
-                if claude_pid:
-                    with _watchdog_lock:
-                        baseline = _idle_child_baseline.get(name)
-                        if baseline is None:
-                            # First observation — assume current count is baseline
-                            _idle_child_baseline[name] = children_total
-                            baseline = children_total
-                        elif not pending:
-                            # When idle, learn the true floor (MCP servers may start late)
-                            baseline = min(baseline, children_total)
-                            _idle_child_baseline[name] = baseline
-                    children = max(0, children_total - baseline)
-                else:
-                    children = children_total
-
-                if children > 0:
-                    with _watchdog_lock:
-                        _last_child_ts[name] = now
-
-                # Activity detection: if children count increased or CPU is active,
-                # worker is doing something. Reset the stale-pending timer so
-                # long autonomous work doesn't trigger false STUCK alerts.
-                # Only increases count — background sleep cycling (exit+restart)
-                # causes ±1 flicker that shouldn't reset the timer.
-                with _watchdog_lock:
-                    prev_children = _prev_children.get(name)
-                    activity_increased = (prev_children is not None and children > prev_children)
-                    if activity_increased or cpu >= CPU_ACTIVE:
-                        _last_activity_ts[name] = now
-                    _prev_children[name] = children
-                    last_activity = _last_activity_ts.get(name, 0.0)
-
-                # pending_age counts from the LATER of: message arrival or last activity
-                if pending_ts:
-                    effective_start = max(pending_ts, last_activity) if last_activity > pending_ts else pending_ts
-                    pending_age = now - effective_start
-                else:
-                    pending_age = 0.0
-                with _watchdog_lock:
-                    last_child_ts = _last_child_ts.get(name, 0.0)
-                    last_hook_ts = _last_hook_ts.get(name)
-                    last_seen_claude = _last_seen_claude.get(name)
-
-                state_args = dict(
-                    tmux_exists=tmux_exists,
-                    claude_pid=claude_pid,
-                    pending=pending,
-                    pending_ts=pending_ts,
-                    pending_age=pending_age,
-                    children=children,
-                    last_child_ts=last_child_ts,
-                    cpu=cpu,
-                    last_hook_ts=last_hook_ts,
-                    last_seen_claude=last_seen_claude,
-                    now=now,
-                )
-                state, reason = compute_state(**state_args)
-
-                if state == "STUCK":
-                    _idle_streak[name] = _idle_streak.get(name, 0) + 1
-                    streak = _idle_streak[name]
-                    if streak < IDLE_STREAK_STUCK:
-                        state = "WAITING"
-                    else:
-                        poisoned_reason = _detect_poisoned(name, tmux_name)
-                        state, reason = compute_state(
-                            **state_args,
-                            poisoned_reason=poisoned_reason
-                        )
-                    reason = f"{reason} streak={streak}/{IDLE_STREAK_STUCK}"
-                elif state == "POISONED":
-                    streak = _idle_streak.get(name, 0)
-                    if streak:
-                        reason = f"{reason} streak={streak}/{IDLE_STREAK_STUCK}"
-                else:
-                    _idle_streak[name] = 0
-
-                # Detect interactive prompt (WAITING_INPUT): worker is READY
-                # but TUI is at a selection/question prompt needing manager action
-                if state == "READY":
-                    pane_text = _capture_pane_text(tmux_name, lines=30)
-                    if pane_text:
-                        pane_lines = pane_text.splitlines()
-                        details = _extract_question_details(pane_lines)
-                        if details:
-                            # Store details for the alert message
-                            with _watchdog_lock:
-                                _waiting_input_details[name] = details
-                            state = "WAITING_INPUT"
-                            header = details.get("header", "")
-                            reason = f"question={header}" if header else "interactive prompt"
-
-                since = _record_worker_state(name, state, reason, now)
-                _handle_watchdog_transition(name, state, reason, since, now=now)
-                # Surface live state to the topic user as an evolving reaction
-                # (✍ working / 😴 stalled) on their in-flight message.
-                _update_topic_reaction(name, state)
-
-            with _watchdog_lock:
-                for name in list(_session_states.keys()):
-                    if name not in registered_names:
-                        _session_states.pop(name, None)
-                for name in list(_last_child_ts.keys()):
-                    if name not in registered_names:
-                        _last_child_ts.pop(name, None)
-                for name in list(_last_seen_claude.keys()):
-                    if name not in registered_names:
-                        _last_seen_claude.pop(name, None)
-                for name in list(_last_hook_ts.keys()):
-                    if name not in registered_names:
-                        _last_hook_ts.pop(name, None)
-                for name in list(_prev_session_states.keys()):
-                    if name not in registered_names:
-                        _prev_session_states.pop(name, None)
-                for name in list(_last_alert_ts.keys()):
-                    if name not in registered_names:
-                        _last_alert_ts.pop(name, None)
-                for name in list(_idle_streak.keys()):
-                    if name not in registered_names:
-                        _idle_streak.pop(name, None)
-                for name in list(_idle_child_baseline.keys()):
-                    if name not in registered_names:
-                        _idle_child_baseline.pop(name, None)
-                for name in list(_prev_children.keys()):
-                    if name not in registered_names:
-                        _prev_children.pop(name, None)
-                for name in list(_last_activity_ts.keys()):
-                    if name not in registered_names:
-                        _last_activity_ts.pop(name, None)
-                for name in list(_bad_state_alert_count.keys()):
-                    if name not in registered_names:
-                        _bad_state_alert_count.pop(name, None)
-            for name in list(_consecutive_probe_failures.keys()):
-                if name not in registered_names:
-                    _consecutive_probe_failures.pop(name, None)
+            _run_watchdog_once(time.time())
         except Exception as e:
             print(f"Watchdog error: {e}")
-
         time.sleep(WATCHDOG_INTERVAL)
+
+
+def _run_watchdog_once(now):
+    registered = get_registered_sessions()
+    pane_pids = _tmux_pane_pids()
+
+    registered_names = set(registered.keys())
+    probe_failed = bool(registered_names) and not pane_pids
+    if probe_failed:
+        for name in registered_names:
+            _consecutive_probe_failures[name] = _consecutive_probe_failures.get(name, 0) + 1
+    else:
+        for name in registered_names:
+            _consecutive_probe_failures[name] = 0
+
+    claude_pids = {}
+    tmux_present = {}
+    for name, session in registered.items():
+        tmux_name = session.get("tmux", f"{TMUX_PREFIX}{name}")
+        pane_pid = pane_pids.get(tmux_name)
+        tmux_exists = bool(pane_pid)
+        tmux_present[name] = tmux_exists
+
+        if not tmux_exists:
+            continue
+
+        claude_pid = _get_claude_pid(pane_pid)
+        if claude_pid:
+            claude_pids[name] = claude_pid
+            with _watchdog_lock:
+                _last_seen_claude[name] = now
+        else:
+            with _watchdog_lock:
+                if name not in _last_seen_claude:
+                    _last_seen_claude[name] = now
+
+    stats = _ps_stats(claude_pids.values())
+
+    for name, session in registered.items():
+        tmux_name = session.get("tmux", f"{TMUX_PREFIX}{name}")
+        tmux_exists = tmux_present.get(name, False)
+
+        # Registry-only worker (tmux gone): mark EXITED directly
+        if not tmux_exists and "tmux" not in session:
+            since = _record_worker_state(name, "EXITED", "session gone", now)
+            _handle_watchdog_transition(name, "EXITED", "session gone", since, now=now)
+            continue
+
+        if probe_failed and not tmux_exists and _consecutive_probe_failures.get(name, 0) < 3:
+            continue
+
+        claude_pid = claude_pids.get(name)
+        cpu = 0.0
+        if claude_pid and claude_pid in stats:
+            cpu = stats[claude_pid].get("cpu", 0.0)
+
+        children_total = _child_count(claude_pid) if claude_pid else 0
+
+        # Dynamic baseline: MCP servers are persistent children.
+        # Track idle child count so only EXTRA children count as work.
+        pending_ts = _pending_timestamp(name)
+        pending = pending_ts is not None
+        if claude_pid:
+            with _watchdog_lock:
+                baseline = _idle_child_baseline.get(name)
+                if baseline is None:
+                    # First observation — assume current count is baseline
+                    _idle_child_baseline[name] = children_total
+                    baseline = children_total
+                elif not pending:
+                    # When idle, learn the true floor (MCP servers may start late)
+                    baseline = min(baseline, children_total)
+                    _idle_child_baseline[name] = baseline
+            children = max(0, children_total - baseline)
+        else:
+            children = children_total
+
+        if children > 0:
+            with _watchdog_lock:
+                _last_child_ts[name] = now
+
+        # Activity detection: if children count increased or CPU is active,
+        # worker is doing something. Reset the stale-pending timer so
+        # long autonomous work doesn't trigger false STUCK alerts.
+        # Only increases count — background sleep cycling (exit+restart)
+        # causes ±1 flicker that shouldn't reset the timer.
+        with _watchdog_lock:
+            prev_children = _prev_children.get(name)
+            activity_increased = (prev_children is not None and children > prev_children)
+            if activity_increased or cpu >= CPU_ACTIVE:
+                _last_activity_ts[name] = now
+            _prev_children[name] = children
+            last_activity = _last_activity_ts.get(name, 0.0)
+
+        # pending_age counts from the LATER of: message arrival or last activity
+        if pending_ts:
+            effective_start = max(pending_ts, last_activity) if last_activity > pending_ts else pending_ts
+            pending_age = now - effective_start
+        else:
+            pending_age = 0.0
+        with _watchdog_lock:
+            last_child_ts = _last_child_ts.get(name, 0.0)
+            last_hook_ts = _last_hook_ts.get(name)
+            last_seen_claude = _last_seen_claude.get(name)
+
+        state_args = dict(
+            tmux_exists=tmux_exists,
+            claude_pid=claude_pid,
+            pending=pending,
+            pending_ts=pending_ts,
+            pending_age=pending_age,
+            children=children,
+            last_child_ts=last_child_ts,
+            cpu=cpu,
+            last_hook_ts=last_hook_ts,
+            last_seen_claude=last_seen_claude,
+            now=now,
+        )
+        state, reason = compute_state(**state_args)
+
+        if state == "STUCK":
+            _idle_streak[name] = _idle_streak.get(name, 0) + 1
+            streak = _idle_streak[name]
+            if streak < IDLE_STREAK_STUCK:
+                state = "WAITING"
+            else:
+                poisoned_reason = _detect_poisoned(name, tmux_name)
+                state, reason = compute_state(
+                    **state_args,
+                    poisoned_reason=poisoned_reason
+                )
+            reason = f"{reason} streak={streak}/{IDLE_STREAK_STUCK}"
+        elif state == "POISONED":
+            streak = _idle_streak.get(name, 0)
+            if streak:
+                reason = f"{reason} streak={streak}/{IDLE_STREAK_STUCK}"
+        else:
+            _idle_streak[name] = 0
+
+        # Detect interactive prompt (WAITING_INPUT): worker is READY
+        # but TUI is at a selection/question prompt needing manager action
+        if state == "READY":
+            pane_text = _capture_pane_text(tmux_name, lines=30)
+            if pane_text:
+                pane_lines = pane_text.splitlines()
+                details = _extract_question_details(pane_lines)
+                if details:
+                    # Store details for the alert message
+                    with _watchdog_lock:
+                        _waiting_input_details[name] = details
+                    state = "WAITING_INPUT"
+                    header = details.get("header", "")
+                    reason = f"question={header}" if header else "interactive prompt"
+
+        since = _record_worker_state(name, state, reason, now)
+        _handle_watchdog_transition(name, state, reason, since, now=now)
+        # Surface live state to the topic user as an evolving reaction
+        # (✍ working / 😴 stalled) on their in-flight message.
+        _update_topic_reaction(name, state)
+
+    with _watchdog_lock:
+        for name in list(_session_states.keys()):
+            if name not in registered_names:
+                _session_states.pop(name, None)
+        for name in list(_last_child_ts.keys()):
+            if name not in registered_names:
+                _last_child_ts.pop(name, None)
+        for name in list(_last_seen_claude.keys()):
+            if name not in registered_names:
+                _last_seen_claude.pop(name, None)
+        for name in list(_last_hook_ts.keys()):
+            if name not in registered_names:
+                _last_hook_ts.pop(name, None)
+        for name in list(_prev_session_states.keys()):
+            if name not in registered_names:
+                _prev_session_states.pop(name, None)
+        for name in list(_last_alert_ts.keys()):
+            if name not in registered_names:
+                _last_alert_ts.pop(name, None)
+        for name in list(_idle_streak.keys()):
+            if name not in registered_names:
+                _idle_streak.pop(name, None)
+        for name in list(_idle_child_baseline.keys()):
+            if name not in registered_names:
+                _idle_child_baseline.pop(name, None)
+        for name in list(_prev_children.keys()):
+            if name not in registered_names:
+                _prev_children.pop(name, None)
+        for name in list(_last_activity_ts.keys()):
+            if name not in registered_names:
+                _last_activity_ts.pop(name, None)
+        for name in list(_bad_state_alert_count.keys()):
+            if name not in registered_names:
+                _bad_state_alert_count.pop(name, None)
+    for name in list(_consecutive_probe_failures.keys()):
+        if name not in registered_names:
+            _consecutive_probe_failures.pop(name, None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
