@@ -1236,6 +1236,66 @@ print('OK')
     fi
 }
 
+test_dead_realert_is_bounded() {
+    info "Testing a sustained DEAD session stops after exactly 1+MAX_DEAD_REALERTS REAL sends (real cooldown path)..."
+    if python3 -c "
+import bridge
+clock = [1000.0]
+bridge.time.time = lambda: clock[0]
+bridge.time.sleep = lambda *a, **k: None
+bridge.admin_chat_id = 999
+sends = []
+bridge.transport.send_text = lambda cid, text, **k: (sends.append(text) or {'ok': True, 'result': {'message_id': 1}})
+for d in (bridge._prev_session_states, bridge._bad_state_alert_count, bridge._last_alert_ts, bridge._session_states):
+    d.clear()
+since = clock[0] - 10_000  # DEAD since long ago -> eligible_for_alert() True
+for _ in range(120):       # ~480s of 4s probes -> spans >2 ALERT_COOLDOWN windows
+    bridge._handle_watchdog_transition('tX', 'DEAD', 'claude missing', since, now=clock[0])
+    clock[0] += bridge.WATCHDOG_INTERVAL
+n = len(sends)
+assert n == 1 + bridge.MAX_DEAD_REALERTS, ('expected exactly 1+MAX real sends, got', n)
+print('OK', n)
+" 2>/dev/null | grep -q OK; then
+        success "DEAD re-alert bounded to 1+MAX_DEAD_REALERTS real sends"
+    else
+        fail "bounded DEAD re-alert test failed"
+    fi
+}
+
+test_dead_realert_resets_after_recovery() {
+    info "Testing recovery clears the alert budget so a later death alerts again..."
+    if python3 -c "
+import bridge
+clock = [2000.0]
+bridge.time.time = lambda: clock[0]
+bridge.time.sleep = lambda *a, **k: None
+bridge.admin_chat_id = 999
+sends = []
+bridge.transport.send_text = lambda cid, text, **k: (sends.append(text) or {'ok': True, 'result': {'message_id': 7}})
+bridge._send_resolved_alert = lambda *a, **k: None  # isolate: don't count the resolved message
+for d in (bridge._prev_session_states, bridge._bad_state_alert_count, bridge._last_alert_ts,
+          bridge._session_states, bridge._consecutive_good_probes):
+    d.clear()
+# 1) DEAD -> first real alert
+bridge._handle_watchdog_transition('tY', 'DEAD', 'm', clock[0]-10_000, now=clock[0])
+assert len(sends) == 1, ('first death should alert:', sends)
+# 2) recover: GOOD_PROBE_THRESHOLD (3) good probes must clear the budget
+for _ in range(3):
+    clock[0] += 4
+    bridge._handle_watchdog_transition('tY', 'READY', 'idle', clock[0]-10_000, now=clock[0])
+assert bridge._bad_state_alert_count.get('tY') is None, ('budget must reset on recovery:', bridge._bad_state_alert_count)
+# 3) dies again much later (past cooldown) -> must alert again
+clock[0] += 10_000
+bridge._handle_watchdog_transition('tY', 'DEAD', 'm', clock[0]-100, now=clock[0])
+assert len(sends) == 2, ('a later death must alert again:', sends)
+print('OK')
+" 2>/dev/null | grep -q OK; then
+        success "alert budget resets on recovery; later death re-alerts"
+    else
+        fail "recovery-reset test failed"
+    fi
+}
+
 test_topic_non_forum_fallback() {
     info "Testing non-forum (no thread) → single default session..."
     if python3 -c "
@@ -12666,6 +12726,8 @@ run_unit_tests() {
     run_test test_topic_routing_known_and_unknown
     run_test test_topic_close_and_cd
     run_test test_cd_reports_restart_failure
+    run_test test_dead_realert_is_bounded
+    run_test test_dead_realert_resets_after_recovery
     run_test test_topic_non_forum_fallback
     run_test test_topic_title_naming
     run_test test_topic_reaction_mapping

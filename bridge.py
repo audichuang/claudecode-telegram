@@ -164,6 +164,9 @@ CPU_ACTIVE = 15.0
 CPU_IDLE = 7.0
 IDLE_STREAK_STUCK = 3
 ALERT_COOLDOWN = 180
+MAX_DEAD_REALERTS = 1  # after the first alert, re-alert at most this many times for a
+                       # sustained DEAD/OFFLINE/EXITED state, then go silent until it
+                       # recovers or is closed (stops the every-180s nag)
 
 
 # ============================================================
@@ -508,6 +511,7 @@ _prev_children = {}  # name -> int (previous active children count, for activity
 _last_activity_ts = {}  # name -> float (last time children count changed)
 _worker_cwds = {}  # name -> cwd (RAM-only startup cwd hints)
 _recent_restarts = {}  # name -> timestamp (suppress watchdog resolved alert after restart)
+_bad_state_alert_count = {}  # name -> how many REAL alerts sent for the current bad-state streak
 RESTART_COOLDOWN = 60  # seconds: reject checkin-triggered restarts within this window
 _restart_in_progress = {}  # name -> timestamp: set BEFORE restart, cleared after completion
 _restart_lock = threading.Lock()  # protects _restart_in_progress
@@ -3007,16 +3011,16 @@ def _detect_poisoned(name: str, tmux_name: str) -> Optional[str]:
     return None
 
 
-def _send_watchdog_alert(name: str, state: str, reason: str) -> None:
+def _send_watchdog_alert(name: str, state: str, reason: str) -> bool:
     if admin_chat_id is None:
-        return
+        return False
 
     now = time.time()
     with _watchdog_lock:
         last = _last_alert_ts.get(name)
     if last and (now - last) < ALERT_COOLDOWN:
         print(f"[watchdog] Alert suppressed for {name} ({state}): cooldown {now - last:.0f}s < {ALERT_COOLDOWN}s")
-        return
+        return False
 
     # Human-friendly alert messages for manager
     if state == "WAITING_INPUT":
@@ -3059,10 +3063,13 @@ def _send_watchdog_alert(name: str, state: str, reason: str) -> None:
                 _last_alert_ts[name] = now
                 if msg_id:
                     _alert_msg_ids[name] = (msg_id, text)
+            return True
         else:
             print(f"[watchdog] Alert FAILED for {name} ({state}): {result}")
+            return False
     except Exception as e:
         print(f"Watchdog alert error: {e}")
+        return False
 
 
 _last_resolved_ts: dict[str, float] = {}  # Per-worker resolved alert cooldown
@@ -3141,9 +3148,17 @@ def _handle_watchdog_transition(
         if state_changed or prev_state is None:
             if eligible_for_alert():
                 print(f"[watchdog] State change {name}: {prev_state} -> {state} ({reason}), sending alert")
-                _send_watchdog_alert(name, state, reason)
+                if _send_watchdog_alert(name, state, reason):
+                    with _watchdog_lock:
+                        _bad_state_alert_count[name] = 1
         elif state in {"OFFLINE", "DEAD", "EXITED"} and eligible_for_alert():
-            _send_watchdog_alert(name, state, reason)
+            with _watchdog_lock:
+                count = _bad_state_alert_count.get(name, 0)
+            if count <= MAX_DEAD_REALERTS:
+                if _send_watchdog_alert(name, state, reason):
+                    with _watchdog_lock:
+                        _bad_state_alert_count[name] = count + 1
+            # else: budget spent — stay silent until recovery (good state) or close
         with _watchdog_lock:
             _prev_session_states[name] = state
         return
@@ -3157,6 +3172,7 @@ def _handle_watchdog_transition(
             with _watchdog_lock:
                 _consecutive_good_probes[name] = 0
                 _prev_session_states[name] = state
+                _bad_state_alert_count.pop(name, None)
         return
 
     with _watchdog_lock:
@@ -3368,6 +3384,9 @@ def watchdog_loop():
                 for name in list(_last_activity_ts.keys()):
                     if name not in registered_names:
                         _last_activity_ts.pop(name, None)
+                for name in list(_bad_state_alert_count.keys()):
+                    if name not in registered_names:
+                        _bad_state_alert_count.pop(name, None)
             for name in list(_consecutive_probe_failures.keys()):
                 if name not in registered_names:
                     _consecutive_probe_failures.pop(name, None)
