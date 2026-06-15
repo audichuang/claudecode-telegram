@@ -5510,8 +5510,11 @@ class CommandRouter:
                 name = find_topic_session(chat_id, thread_id, registered)
                 if name:
                     _set_worker_cwd(name, clamped)
-                    self.workers.restart(name)
-                    self.reply(chat_id, f"已切換資料夾並重啟：{clamped}")
+                    ok, err = self.workers.restart(name)
+                    if ok:
+                        self.reply(chat_id, f"已切換資料夾並重啟：{clamped}")
+                    else:
+                        self.reply(chat_id, f"切換資料夾後重啟失敗：{err}\n請再試一次 /cd {clamped}，或 /close 後重開話題。")
                 else:
                     self.open_topic_session(chat_id, thread_id, cwd=clamped)
             else:

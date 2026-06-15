@@ -1203,6 +1203,39 @@ print('OK')
     fi
 }
 
+test_cd_reports_restart_failure() {
+    info "Testing /cd surfaces restart() failure instead of a false success reply..."
+    if python3 -c "
+import tempfile
+from pathlib import Path
+import bridge
+tmp = Path(tempfile.mkdtemp())
+bridge.SESSIONS_DIR = tmp; bridge.session_manager.sessions_dir = tmp
+bridge.TOPIC_MODE = True; bridge.TOPIC_ROOT = str(tmp)
+proj = tmp / 'proj'; proj.mkdir(parents=True, exist_ok=True)
+bridge.save_topic_meta('t77', 555, 77)
+bridge.session_manager.get_registered_sessions = lambda registered=None: {'t77': {}}
+bridge._set_worker_cwd = lambda n, c: None
+# Force restart to fail (valid path, so the handler reaches restart()).
+bridge.session_manager.restart = lambda name, mode='relaunch': (False, \"'claude' not found in PATH. Install it first.\")
+replies = []
+cr = bridge.command_router
+cr.reply = lambda chat_id, text, **k: replies.append(text)
+cr.transport = bridge.transport
+def msg(tid, text):
+    return {'message': {'text': text, 'chat': {'id': 555}, 'message_id': 1, 'message_thread_id': tid}}
+cr.handle_message(msg(77, '/cd ' + str(proj)))
+joined = ' '.join(replies)
+assert '重啟失敗' in joined, ('must surface restart failure:', replies)
+assert '已切換資料夾並重啟' not in joined, ('must NOT claim success on failure:', replies)
+print('OK')
+" 2>/dev/null | grep -q OK; then
+        success "/cd surfaces restart failure (no false success)"
+    else
+        fail "cd restart-failure test failed"
+    fi
+}
+
 test_topic_non_forum_fallback() {
     info "Testing non-forum (no thread) → single default session..."
     if python3 -c "
@@ -12632,6 +12665,7 @@ run_unit_tests() {
     run_test test_open_topic_session_spawns_in_cwd
     run_test test_topic_routing_known_and_unknown
     run_test test_topic_close_and_cd
+    run_test test_cd_reports_restart_failure
     run_test test_topic_non_forum_fallback
     run_test test_topic_title_naming
     run_test test_topic_reaction_mapping
