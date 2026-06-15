@@ -1296,6 +1296,56 @@ print('OK')
     fi
 }
 
+test_exited_session_is_reaped() {
+    info "Testing a registry-only EXITED session is auto-removed from the registry after the reap window..."
+    if python3 -c "
+import bridge
+removed = []
+bridge._registry_remove = lambda name: removed.append(name)
+bridge._exited_since.clear()
+now = 5000.0
+bridge._maybe_reap_exited('tZ', now)
+assert removed == [], ('must not reap immediately:', removed)
+bridge._maybe_reap_exited('tZ', now + bridge.REAP_EXITED_AFTER + 1)
+assert removed == ['tZ'], ('must reap after window:', removed)
+print('OK')
+" 2>/dev/null | grep -q OK; then
+        success "EXITED registry-only session is reaped after the window"
+    else
+        fail "EXITED reap test failed"
+    fi
+}
+
+test_watchdog_reaps_exited_via_loop() {
+    info "Testing one watchdog tick reaps a registry-only EXITED session after the window..."
+    if python3 -c "
+import bridge
+reaped = []
+bridge._registry_remove = lambda name: reaped.append(name)
+bridge.admin_chat_id = None  # silence alerts
+clock = [5000.0]
+bridge.time.time = lambda: clock[0]
+bridge.time.sleep = lambda *a, **k: None
+bridge.get_registered_sessions = lambda: {'tG': {'backend': 'claude'}}
+bridge.session_manager.get_registered_sessions = lambda registered=None: {'tG': {'backend': 'claude'}}
+bridge._tmux_pane_pids = lambda: {}      # tmux gone -> registry-only branch fires
+for d in (bridge._exited_since, bridge._session_states, bridge._prev_session_states,
+          bridge._consecutive_probe_failures):
+    d.clear()
+bridge._run_watchdog_once(clock[0])
+assert reaped == [], ('must not reap on first sighting:', reaped)
+assert 'tG' in bridge._exited_since, ('must record exited_since:', bridge._exited_since)
+clock[0] += bridge.REAP_EXITED_AFTER + 1
+bridge._run_watchdog_once(clock[0])
+assert reaped == ['tG'], ('must reap after the window:', reaped)
+print('OK')
+" 2>/dev/null | grep -q OK; then
+        success "watchdog tick reaps registry-only EXITED after the window"
+    else
+        fail "watchdog reap-integration test failed"
+    fi
+}
+
 test_topic_non_forum_fallback() {
     info "Testing non-forum (no thread) → single default session..."
     if python3 -c "
@@ -12728,6 +12778,8 @@ run_unit_tests() {
     run_test test_cd_reports_restart_failure
     run_test test_dead_realert_is_bounded
     run_test test_dead_realert_resets_after_recovery
+    run_test test_exited_session_is_reaped
+    run_test test_watchdog_reaps_exited_via_loop
     run_test test_topic_non_forum_fallback
     run_test test_topic_title_naming
     run_test test_topic_reaction_mapping

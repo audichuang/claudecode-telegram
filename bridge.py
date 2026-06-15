@@ -167,6 +167,8 @@ ALERT_COOLDOWN = 180
 MAX_DEAD_REALERTS = 1  # after the first alert, re-alert at most this many times for a
                        # sustained DEAD/OFFLINE/EXITED state, then go silent until it
                        # recovers or is closed (stops the every-180s nag)
+REAP_EXITED_AFTER = 600  # seconds: a registry-only session (tmux gone) EXITED this long
+                         # is removed from workers.json (manual kill / crashed pane self-cleans)
 
 
 # ============================================================
@@ -512,6 +514,7 @@ _last_activity_ts = {}  # name -> float (last time children count changed)
 _worker_cwds = {}  # name -> cwd (RAM-only startup cwd hints)
 _recent_restarts = {}  # name -> timestamp (suppress watchdog resolved alert after restart)
 _bad_state_alert_count = {}  # name -> how many REAL alerts sent for the current bad-state streak
+_exited_since = {}  # name -> first time observed EXITED & registry-only (for reaping)
 RESTART_COOLDOWN = 60  # seconds: reject checkin-triggered restarts within this window
 _restart_in_progress = {}  # name -> timestamp: set BEFORE restart, cleared after completion
 _restart_lock = threading.Lock()  # protects _restart_in_progress
@@ -3192,6 +3195,29 @@ def _record_worker_state(name: str, state: str, reason: str, now: float) -> floa
     return since
 
 
+def _maybe_reap_exited(name: str, now: float) -> bool:
+    """Remove a registry-only EXITED session from the persistent registry once it
+    has been gone for REAP_EXITED_AFTER seconds. Returns True if reaped.
+
+    The Telegram topic still exists, so the next message there recreates the
+    session; this only stops an orphaned tmux-less entry from nagging forever
+    (e.g. after a manual `tmux kill-session` with no /close).
+    """
+    with _watchdog_lock:
+        first = _exited_since.get(name)
+        if first is None:
+            _exited_since[name] = now
+            return False
+        age = now - first
+    if age < REAP_EXITED_AFTER:
+        return False
+    print(f"[watchdog] reaping registry-only EXITED session {name} (gone {int(age)}s)")
+    _registry_remove(name)
+    with _watchdog_lock:
+        _exited_since.pop(name, None)
+    return True
+
+
 def watchdog_loop():
     while True:
         try:
@@ -3221,6 +3247,9 @@ def _run_watchdog_once(now):
         pane_pid = pane_pids.get(tmux_name)
         tmux_exists = bool(pane_pid)
         tmux_present[name] = tmux_exists
+        if tmux_exists:
+            with _watchdog_lock:
+                _exited_since.pop(name, None)
 
         if not tmux_exists:
             continue
@@ -3241,10 +3270,11 @@ def _run_watchdog_once(now):
         tmux_name = session.get("tmux", f"{TMUX_PREFIX}{name}")
         tmux_exists = tmux_present.get(name, False)
 
-        # Registry-only worker (tmux gone): mark EXITED directly
+        # Registry-only worker (tmux gone): mark EXITED, then reap after a window.
         if not tmux_exists and "tmux" not in session:
             since = _record_worker_state(name, "EXITED", "session gone", now)
             _handle_watchdog_transition(name, "EXITED", "session gone", since, now=now)
+            _maybe_reap_exited(name, now)
             continue
 
         if probe_failed and not tmux_exists and _consecutive_probe_failures.get(name, 0) < 3:
@@ -3393,6 +3423,9 @@ def _run_watchdog_once(now):
         for name in list(_bad_state_alert_count.keys()):
             if name not in registered_names:
                 _bad_state_alert_count.pop(name, None)
+        for name in list(_exited_since.keys()):
+            if name not in registered_names:
+                _exited_since.pop(name, None)
     for name in list(_consecutive_probe_failures.keys()):
         if name not in registered_names:
             _consecutive_probe_failures.pop(name, None)
